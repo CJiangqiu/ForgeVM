@@ -15,6 +15,8 @@ typedef int(__cdecl* BootstrapTargetFn)(unsigned long long);
 typedef unsigned long long(__cdecl* StructMapCountFn)();
 typedef int(__cdecl* PutFieldFn)(unsigned long long, const char*, const char*, const unsigned char*, unsigned long long);
 typedef int(__cdecl* PutFieldBatchFn)(const unsigned long long*, unsigned long long, const char*, const char*, const unsigned char*, unsigned long long);
+typedef int(__cdecl* TransformLoadFn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*);
+typedef int(__cdecl* TransformUnloadFn)(const char*, const char*, const char*);
 
 namespace {
 struct NativeApi {
@@ -33,6 +35,8 @@ struct NativeApi {
     PutFieldFn putRefField = NULL;
     PutFieldBatchFn putRefFieldBatch = NULL;
     ProbeFn dumpCardStructs = NULL;
+    TransformLoadFn transformLoad = NULL;
+    TransformUnloadFn transformUnload = NULL;
 };
 
 struct AgentLockState {
@@ -294,6 +298,8 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->putRefField     = reinterpret_cast<PutFieldFn>(GetProcAddress(module, "forgevm_put_ref_field"));
     api->putRefFieldBatch = reinterpret_cast<PutFieldBatchFn>(GetProcAddress(module, "forgevm_put_ref_field_batch"));
     api->dumpCardStructs = reinterpret_cast<ProbeFn>(GetProcAddress(module, "forgevm_dump_card_structs"));
+    api->transformLoad   = reinterpret_cast<TransformLoadFn>(GetProcAddress(module, "forgevm_transform_load"));
+    api->transformUnload = reinterpret_cast<TransformUnloadFn>(GetProcAddress(module, "forgevm_transform_unload"));
 
     if (api->probe == NULL || api->init == NULL) { *reason = "missing_export"; return false; }
     return true;
@@ -543,6 +549,61 @@ void handlePutRefFieldBatch(const NativeApi& api, const std::string& line, const
     }
 }
 
+void handleTransformLoad(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    if (api.transformLoad == NULL) {
+        printResult("fallback", "JVM_FALLBACK", dllPath, "transform_load_not_exported");
+        return;
+    }
+    std::string targetClass  = getJsonStringField(line, "targetClass");
+    std::string targetMethod = getJsonStringField(line, "targetMethod");
+    std::string targetParamDesc = getJsonStringField(line, "targetParamDesc");
+    std::string injectAt     = getJsonStringField(line, "injectAt");
+    std::string hookClass    = getJsonStringField(line, "hookClass");
+    std::string hookMethod   = getJsonStringField(line, "hookMethod");
+    std::string hookDesc     = getJsonStringField(line, "hookDesc");
+
+    if (targetClass.empty() || targetMethod.empty() || injectAt.empty() ||
+        hookClass.empty() || hookMethod.empty() || hookDesc.empty()) {
+        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_transform_load_params");
+        return;
+    }
+
+    int result = api.transformLoad(
+        targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
+        injectAt.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str());
+
+    std::string reason = copyReason(api, result == 1 ? "ok" : "transform_load_failed");
+    if (result == 1) {
+        printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
+    } else {
+        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+    }
+}
+
+void handleTransformUnload(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    if (api.transformUnload == NULL) {
+        printResult("fallback", "JVM_FALLBACK", dllPath, "transform_unload_not_exported");
+        return;
+    }
+    std::string targetClass  = getJsonStringField(line, "targetClass");
+    std::string targetMethod = getJsonStringField(line, "targetMethod");
+    std::string targetParamDesc = getJsonStringField(line, "targetParamDesc");
+
+    if (targetClass.empty() || targetMethod.empty()) {
+        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_transform_unload_params");
+        return;
+    }
+
+    int result = api.transformUnload(targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str());
+
+    std::string reason = copyReason(api, result == 1 ? "ok" : "transform_unload_failed");
+    if (result == 1) {
+        printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
+    } else {
+        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -606,6 +667,10 @@ int main(int argc, char** argv) {
             handlePutRefField(api, line, dllPath);
         } else if (cmd == "put_ref_field_batch") {
             handlePutRefFieldBatch(api, line, dllPath);
+        } else if (cmd == "transform_load") {
+            handleTransformLoad(api, line, dllPath);
+        } else if (cmd == "transform_unload") {
+            handleTransformUnload(api, line, dllPath);
         } else if (cmd == "dump_card_structs") {
             if (api.dumpCardStructs != NULL) {
                 api.dumpCardStructs();

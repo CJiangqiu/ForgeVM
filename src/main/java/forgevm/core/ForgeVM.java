@@ -2,6 +2,7 @@ package forgevm.core;
 
 import forgevm.jvm.JvmControl;
 import forgevm.memory.MemoryUtil;
+import forgevm.transform.TransformManager;
 import forgevm.util.FvmLog;
 import forgevm.util.JsonUtils;
 
@@ -40,6 +41,7 @@ public final class ForgeVM {
     private static volatile JvmControl.AgentLockController agentLockController;
 
     private static volatile MemoryUtil FIELD_MEMORY;
+    private static volatile TransformManager TRANSFORM_MANAGER;
 
     public static final LaunchPermissionPolicy SILENT = LaunchPermissionPolicy.SILENT;
     public static final LaunchPermissionPolicy PROMPT = LaunchPermissionPolicy.PROMPT;
@@ -100,6 +102,17 @@ public final class ForgeVM {
         if (m == null) {
             m = new MemoryUtil();
             FIELD_MEMORY = m;
+        }
+        return m;
+    }
+
+    // -- transform API --
+
+    public static TransformManager transformer() {
+        TransformManager m = TRANSFORM_MANAGER;
+        if (m == null) {
+            m = new TransformManager();
+            TRANSFORM_MANAGER = m;
         }
         return m;
     }

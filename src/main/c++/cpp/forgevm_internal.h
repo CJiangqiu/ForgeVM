@@ -189,3 +189,51 @@ bool parsePEExport(HANDLE proc, uint64_t moduleBase, const char* symbolName, uin
 // ============================================================
 
 void extractCompressionParams();
+
+// ============================================================
+// Transform: bytecode rewriting (out-of-process)
+// ============================================================
+
+struct TransformBackup {
+    std::string key;                    // "className#methodName#paramDesc"
+    uint64_t methodAddr;                // Method* address in target
+    uint64_t origConstMethodAddr;       // original ConstMethod* value
+    uint64_t origConstPoolAddr;         // original ConstantPool* value
+    uint64_t allocatedConstMethod;      // VirtualAllocEx'd new ConstMethod
+    uint64_t allocatedConstPool;        // VirtualAllocEx'd new ConstantPool
+    size_t allocatedConstMethodSize;
+    size_t allocatedConstPoolSize;
+};
+
+extern std::unordered_map<std::string, TransformBackup> g_transformBackups;
+
+// Locate a Java Method* by class name, method name, and param descriptor
+// Walks SystemDictionary -> InstanceKlass -> methods array
+bool findJavaMethod(const char* className, const char* methodName,
+                    const char* paramDesc, uint64_t* outMethodAddr);
+
+// Read ConstMethod bytecode region
+bool readConstMethodBytecode(uint64_t constMethodAddr, std::vector<uint8_t>* bytecodeOut,
+                             uint64_t* bytecodeStartAddr, uint32_t* codeSizeOut);
+
+// Read ConstantPool entries
+bool readConstantPool(uint64_t constPoolAddr, std::vector<uint8_t>* poolBytesOut,
+                      uint32_t* poolLengthOut, size_t* poolByteSizeOut);
+
+// Build new constant pool with appended MethodRef for hook
+bool buildExpandedConstPool(const std::vector<uint8_t>& origPoolBytes, uint32_t origLength,
+                            size_t origByteSize, const char* hookClass, const char* hookMethod,
+                            const char* hookDesc, std::vector<uint8_t>* newPoolBytesOut,
+                            uint16_t* newMethodRefIndex);
+
+// Build new bytecode with injected invokestatic at given point
+bool buildInjectedBytecode(const std::vector<uint8_t>& origBytecode, const char* injectAt,
+                           uint16_t hookMethodRefIndex, std::vector<uint8_t>* newBytecodeOut);
+
+// Apply transform: allocate in target, write new constpool + bytecode, swap pointers
+int applyTransform(const char* className, const char* methodName, const char* paramDesc,
+                   const char* injectAt, const char* hookClass, const char* hookMethod,
+                   const char* hookDesc);
+
+// Restore original method
+int restoreTransform(const char* className, const char* methodName, const char* paramDesc);

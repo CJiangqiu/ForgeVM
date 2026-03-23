@@ -18,7 +18,7 @@ import java.util.List;
  * via the native agent, bypassing JVM reflection and access restrictions.
  *
  * <p>Field descriptor format: {@code "fully.qualified.ClassName.fieldName"}
- * Example: {@code "net.minecraft.entity.LivingEntity.dead"}
+ * Example: {@code "com.example.app.UserService.active"}
  */
 public final class MemoryUtil {
 

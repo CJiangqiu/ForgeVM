@@ -1,6 +1,6 @@
 # ForgeVM
 
-Welcome to ForgeVM (FVM) — a Java library that provides convenient low-level operation APIs.
+ForgeVM is a JVM runtime manipulation library that operates **entirely out-of-process**. Instead of relying on JVMTI, JNI, or other official JVM APIs, ForgeVM uses an external native Agent to read and write JVM memory directly through OS-level `ReadProcessMemory` / `WriteProcessMemory`. This makes it resistant to in-process hook interception and JDK version changes.
 
 ## Architecture
 
@@ -20,8 +20,6 @@ forgevm_native.dll  ──  C++, Win32 ReadProcessMemory / WriteProcessMemory
 Target JVM Heap  ──  HotSpot object memory
 ```
 
-ForgeVM operates through an **out-of-process Agent** that loads the native DLL. All memory writes go through OS-level `WriteProcessMemory` — not JVMTI, not JNI, not `sun.misc.Unsafe`. Field layout is resolved at runtime from HotSpot's self-describing structure tables (`gHotSpotVMStructs`), making it JDK-version-independent.
-
 If the Agent or DLL is unavailable, ForgeVM reports `JVM_FALLBACK` — no crash, no exception from launch. The Agent includes a **parent-process watchdog** that automatically exits when the JVM process dies, preventing orphaned processes.
 
 ## Requirements
@@ -34,85 +32,25 @@ If the Agent or DLL is unavailable, ForgeVM reports `JVM_FALLBACK` — no crash,
 
 ## Quick Start
 
-### 1. Launch
-
-```java
-import forgevm.core.ForgeVM;
-import forgevm.core.ForgeVM.LaunchResult;
-
-// Silent launch (default) — no elevation prompt
-LaunchResult result = ForgeVM.launch();
-
-// Or with elevation prompt
-LaunchResult result = ForgeVM.launchPrompt();
-
-System.out.println(result.capabilityLevel()); // NATIVE_FULL / NATIVE_RESTRICTED / JVM_FALLBACK
-System.out.println(result.nativeDllActive()); // true if native path is active
-System.out.println(result.reason());          // diagnostic string
-```
-
-`ForgeVM.launch()` is the only required call. No `-D` flags, no environment variables, no manual path configuration.
-
-### 2. Field Memory Write — Single Instance
-
 ```java
 import forgevm.core.ForgeVM;
 
-// Ensure agent is active
+// One call to start everything. No -D flags, no env vars, no manual config.
 ForgeVM.launch();
-
-// Get a live object reference (from your business logic, game, etc.)
-LivingEntity entity = getEntity();
-
-// Write a field value directly to JVM heap memory
-ForgeVM.memory().putBooleanField(entity, "net.minecraft.entity.LivingEntity.dead", true);
-ForgeVM.memory().putFloatField(entity, "net.minecraft.entity.LivingEntity.health", 20.0f);
-
-// Object reference write (automatically updates GC card table)
-ForgeVM.memory().putObjectField(entity, "net.minecraft.entity.Entity.level", newLevel);
 ```
 
-The field descriptor format is `"fully.qualified.ClassName.fieldName"`. ForgeVM resolves the field offset by reading the object's klass pointer from its header, walking the inheritance chain, and matching the field name. The resolved offset is **cached** — subsequent writes to the same field skip resolution entirely.
+## Features
 
-### 3. Field Memory Write — Batch (Iterable)
+### 1. JVM Control
 
-```java
-import forgevm.core.ForgeVM;
-
-List<LivingEntity> entities = getAllEntities();
-
-// Write the same value to a field across ALL instances
-// All writes execute under a single thread-suspend window (SuspendThread / ResumeThread)
-ForgeVM.memory().putBooleanField(entities, "net.minecraft.entity.LivingEntity.dead", false);
-```
-
-Single instance writes skip thread suspension (acceptable GC race for one atomic write). Batch writes suspend all JVM threads via Win32 `SuspendThread`, execute all writes, then resume — **zero GC interference**.
-
-### 4. Supported Value Types
-
-| Java Type | Bytes Written | Example |
-|-----------|---------------|---------|
-| `boolean` | 1 | `true` / `false` |
-| `byte` | 1 | `(byte) 42` |
-| `short` | 2 | `(short) 1000` |
-| `char` | 2 | `'A'` |
-| `int` | 4 | `100` |
-| `float` | 4 | `20.0f` |
-| `long` | 8 | `999999L` |
-| `double` | 8 | `3.14` |
-
-| `Object` | 4 or 8 (CompressedOops) | any object reference |
-
-Object reference writes (`putObjectField`) are supported. The native DLL automatically updates the GC card table after writing the reference, preventing the garbage collector from missing the new reference.
-
-### 5. JVM Control
+Control the target JVM process through the Agent.
 
 ```java
-// Exit target JVM via Agent
+// Exit target JVM
 ForgeVM.exit(0);
 
 // Lock Agent to prevent rebind races (e.g., during Shadow JVM switch)
-ForgeVM.lockAgent(30); // lock for up to 30 seconds
+ForgeVM.lockAgent(30);
 ForgeVM.unlockAgent();
 
 // Rebind Agent to current JVM process
@@ -120,13 +58,158 @@ ForgeVM.lockAgent(10);
 ForgeVM.rebindAgentToCurrentJvm();
 ```
 
+### 2. Field Memory
+
+Write field values directly to JVM heap memory, bypassing all access restrictions. ForgeVM resolves field offsets at runtime from the object's klass pointer — no hardcoded offsets, works across JDK versions.
+
+**Single instance:**
+
+```java
+Object target = getTargetObject();
+
+ForgeVM.memory().putBooleanField(target, "com.example.Entity.active", true);
+ForgeVM.memory().putFloatField(target, "com.example.Entity.health", 20.0f);
+ForgeVM.memory().putIntField(target, "com.example.Entity.score", 9999);
+
+// Object reference write (automatically updates GC card table)
+ForgeVM.memory().putObjectField(target, "com.example.Entity.owner", newOwner);
+```
+
+**Batch (Iterable) — all writes under a single thread-suspend window:**
+
+```java
+List<Object> targets = getAllEntities();
+
+// One suspend → write all → resume. Zero GC interference.
+ForgeVM.memory().putBooleanField(targets, "com.example.Entity.active", false);
+```
+
+**Supported types:**
+
+| Type | Bytes | Type | Bytes |
+|------|-------|------|-------|
+| `boolean` | 1 | `int` | 4 |
+| `byte` | 1 | `float` | 4 |
+| `short` | 2 | `long` | 8 |
+| `char` | 2 | `double` | 8 |
+| `Object` | 4 or 8 (CompressedOops) | | |
+
+Field descriptor format: `"fully.qualified.ClassName.fieldName"`. Resolved offsets are **cached** — subsequent writes skip resolution entirely.
+
+### 3. Transformer
+
+Inject custom logic into any loaded class's methods at runtime. ForgeVM rewrites bytecode in-memory through the Agent — no `java.lang.instrument`, no Instrumentation API.
+
+**Define a transformer:**
+
+```java
+import forgevm.transform.FvmTransformer;
+import forgevm.transform.FvmCallback;
+
+// Simplest form — target class + method name
+public class TickLogger extends FvmTransformer {
+    public TickLogger() {
+        super("com.example.Entity", "tick");
+    }
+
+    public void onTick(FvmCallback callback) {
+        System.out.println("tick was called!");
+        // not calling callback methods → original method runs normally
+    }
+}
+```
+
+**Override a return value:**
+
+```java
+public class HealthOverride extends FvmTransformer {
+    public HealthOverride() {
+        super("com.example.Entity", new String[]{"getHealth", "m1234"});
+    }
+
+    public void onGetHealth(FvmCallback callback) {
+        callback.setReturnValue(20.0f);  // original method is skipped
+    }
+}
+```
+
+**Conditional logic based on target instance:**
+
+```java
+public class PlayerHealthOnly extends FvmTransformer {
+    public PlayerHealthOnly() {
+        super("com.example.Entity", new String[]{"getHealth", "m1234"});
+    }
+
+    public void onGetHealth(FvmCallback callback) {
+        Object target = callback.getInstance();
+        if (target instanceof Player) {
+            callback.setReturnValue(20.0f);  // only Players get 20 HP
+        }
+        // non-Player entities → original method runs normally
+    }
+}
+```
+
+**Conditionally cancel a method:**
+
+```java
+public class TickGuard extends FvmTransformer {
+    public TickGuard() {
+        super("com.example.Entity", "tick", InjectPoint.HEAD);
+    }
+
+    public void onTick(FvmCallback callback) {
+        if (shouldBlock()) {
+            callback.cancel();  // original method is skipped (void)
+        }
+        // not cancelled → original method runs normally
+    }
+}
+```
+
+**Load and unload at runtime:**
+
+```java
+// Apply
+ForgeVM.transformer().load(new HealthOverride());
+
+// Remove (restores original bytecode)
+ForgeVM.transformer().unload(HealthOverride.class);
+```
+
+**Constructor variants — use only what you need:**
+
+```java
+// Single method, no-arg, HEAD (simplest)
+super("com.example.Entity", "tick");
+
+// Multiple candidate names (obfuscation support)
+super("com.example.Entity", new String[]{"getHealth", "m1234"});
+
+// Specify inject point
+super("com.example.Entity", "tick", InjectPoint.RETURN);
+
+// With parameter types (to distinguish overloads)
+super("com.example.Entity", "damage", new Class<?>[]{float.class}, InjectPoint.HEAD);
+```
+
+**FvmCallback methods:**
+
+| Method | Effect |
+|--------|--------|
+| `callback.getInstance()` | Get the target object (`this` of the hooked method) |
+| `callback.setReturnValue(value)` | Skip original method, return the given value |
+| `callback.cancel()` | Skip original method (for void methods) |
+| *(neither called)* | Original method executes normally |
+
 ## Capability Levels
 
 | Level | Meaning |
 |-------|---------|
 | `NATIVE_FULL` | Agent + DLL active, admin + SeDebugPrivilege |
 | `NATIVE_RESTRICTED` | Agent + DLL active, debug privilege only |
-| `JVM_FALLBACK` | Agent/DLL unavailable — `putField` will throw `ForgeVMException` |
+| `JVM_FALLBACK` | Agent/DLL unavailable — memory and transform operations will fail |
 
 ## How It Works
 
@@ -134,46 +217,47 @@ ForgeVM.rebindAgentToCurrentJvm();
 
 `ForgeVM.launch()` starts `forgevm_agent.exe` as a child process, which loads `forgevm_native.dll`. The DLL opens a handle to the calling JVM process and reads HotSpot's exported self-describing tables:
 
-- `gHotSpotVMStructs` — C++ struct field offsets (e.g., `InstanceKlass::_fields`, `Klass::_super`)
+- `gHotSpotVMStructs` — C++ struct field offsets
 - `gHotSpotVMTypes` — type sizes
-- `gHotSpotVMIntConstants` / `gHotSpotVMLongConstants` — runtime flags (`UseCompressedOops`, etc.)
+- `gHotSpotVMIntConstants` / `gHotSpotVMLongConstants` — runtime flags
 
 These tables make ForgeVM work across JDK versions without hardcoded offsets.
 
 ### putField Execution Chain
 
 ```
-Java:  ForgeVM.memory().putXxxField(entity, "ClassName.field", value)
+Java:  ForgeVM.memory().putXxxField(target, "ClassName.field", value)
   │
-  ├── Unsafe extracts raw OOP from object (narrow or full, depending on CompressedOops)
+  ├── Unsafe extracts raw OOP address
   ├── Value encoded to little-endian bytes
-  ├── JSON IPC: {"cmd":"put_field","oop":...,"fieldName":"...","className":"...","valueHex":"..."}
-  │
-  ▼
-Agent:  handlePutField() → calls forgevm_native.dll::forgevm_put_field()
+  ├── JSON IPC → Agent
   │
   ▼
 Native DLL:
-  ├── decodeRawOop(oop) → object address in target JVM heap
-  ├── readKlass(objAddr + 8) → klass pointer from object header
-  ├── Walk Klass._super chain → resolveFieldInKlass() → field offset
-  ├── Cache field offset by "className#fieldName"
-  └── WriteProcessMemory(objAddr + offset, valueBytes, size)
+  ├── decodeRawOop → object address
+  ├── readKlass → klass pointer from object header
+  ├── Walk Klass._super chain → resolve field offset (cached)
+  └── WriteProcessMemory(objAddr + offset, valueBytes)
 ```
 
-### Batch (Iterable) Execution Chain
+### Transformer Execution Chain
 
 ```
-Java:  ForgeVM.memory().putXxxField(entities, "ClassName.field", value)
+Java:  ForgeVM.transformer().load(new MyPatch())
   │
-  ├── Unsafe extracts OOP for each instance
-  ├── JSON IPC: {"cmd":"put_field_batch","oops":[...],...}
+  ├── Reflect to find hook method name and FvmCallback parameter
+  ├── JSON IPC → Agent
   │
   ▼
 Native DLL:
-  ├── Resolve field offset from first OOP (cached)
-  ├── SuspendThread on all target JVM threads  ← freezes GC
-  ├── For each OOP: WriteProcessMemory(objAddr + offset, valueBytes)
-  └── ResumeThread on all threads
+  ├── ClassLoaderDataGraph → find target InstanceKlass
+  ├── InstanceKlass._methods → find target Method*
+  ├── Read ConstMethod bytecode + ConstantPool
+  ├── VirtualAllocEx → allocate new ConstMethod + expanded ConstantPool
+  ├── Build new bytecode:
+  │     new FvmCallback → invokestatic hook(FvmCallback)
+  │     → isCancelled? → yes: getReturnValue + return
+  │                     → no:  original method body
+  ├── SuspendThread → swap ConstMethod pointer + clear JIT → ResumeThread
+  └── Backup original pointers for restore
 ```
-
