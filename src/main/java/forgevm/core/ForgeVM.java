@@ -1,0 +1,520 @@
+package forgevm.core;
+
+import forgevm.jvm.JvmControl;
+import forgevm.memory.MemoryUtil;
+import forgevm.util.FvmLog;
+import forgevm.util.JsonUtils;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.Map;
+import java.util.StringJoiner;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+public final class ForgeVM {
+    private static final String ENV_AGENT_EXE_PATH = "FORGEVM_AGENT_EXE_PATH";
+    private static final String PROP_AGENT_EXE_PATH = "forgevm.agent.exe.path";
+    private static final String ENV_NATIVE_DLL_PATH = "FORGEVM_NATIVE_DLL_PATH";
+    private static final String PROP_NATIVE_DLL_PATH = "forgevm.native.dll.path";
+
+    private static final String AGENT_EXE_FILE = "forgevm_agent.exe";
+    private static final String DLL_FILE = "forgevm_native.dll";
+    private static final String FORGEVM_RUNTIME_DIR = "ForgeVM";
+    private static final String RESOURCE_AGENT_PATH = "/native/win-x64/forgevm_agent.exe";
+    private static final String RESOURCE_DLL_PATH = "/native/win-x64/forgevm_native.dll";
+    private static final long AGENT_IO_TIMEOUT_SECONDS = 120L;
+
+    private static volatile LaunchResult state;
+    private static volatile AgentSession agentSession;
+    private static volatile JvmControl.ExitCommandSender agentExitSender;
+    private static volatile JvmControl.AgentLockController agentLockController;
+
+    private static volatile MemoryUtil FIELD_MEMORY;
+
+    public static final LaunchPermissionPolicy SILENT = LaunchPermissionPolicy.SILENT;
+    public static final LaunchPermissionPolicy PROMPT = LaunchPermissionPolicy.PROMPT;
+
+    private ForgeVM() {
+    }
+
+    // -- version --
+
+    public static String version() {
+        return "0.1.0-SNAPSHOT";
+    }
+
+    // -- launch --
+
+    public static LaunchResult launch() {
+        return launch(LaunchPermissionPolicy.SILENT);
+    }
+
+    public static LaunchResult launchPrompt() {
+        return launch(LaunchPermissionPolicy.PROMPT);
+    }
+
+    public static synchronized LaunchResult launch(LaunchPermissionPolicy policy) {
+        LaunchPermissionPolicy effectivePolicy = policy == null ? LaunchPermissionPolicy.SILENT : policy;
+
+        AgentSession currentSession = agentSession;
+        if (currentSession != null && !currentSession.process().isAlive()) {
+            clearAgentExitSender();
+            clearAgentLockController();
+            closeAgentSession(currentSession);
+            agentSession = null;
+        }
+
+        if (state != null) {
+            if (state.nativeDllActive() && agentSession != null && agentSession.process().isAlive()) {
+                return state;
+            }
+            if (effectivePolicy == LaunchPermissionPolicy.SILENT) {
+                return state;
+            }
+        }
+
+        LaunchResult result = launchInternal(effectivePolicy);
+        state = result;
+        return result;
+    }
+
+    public static boolean isAgentActive() {
+        AgentSession session = agentSession;
+        return session != null && session.process().isAlive();
+    }
+
+    // -- memory API --
+
+    public static MemoryUtil memory() {
+        MemoryUtil m = FIELD_MEMORY;
+        if (m == null) {
+            m = new MemoryUtil();
+            FIELD_MEMORY = m;
+        }
+        return m;
+    }
+
+    // -- jvm control --
+
+    public static void exit() {
+        JvmControl.exitJvm();
+    }
+
+    public static void exit(int exitCode) {
+        JvmControl.exitJvm(exitCode);
+    }
+
+    public static boolean lockAgent(int ttlSeconds) {
+        return JvmControl.lockAgent(ttlSeconds);
+    }
+
+    public static boolean unlockAgent() {
+        return JvmControl.unlockAgent();
+    }
+
+    public static boolean rebindAgentToCurrentJvm() {
+        return JvmControl.rebindAgentToCurrentJvm();
+    }
+
+    // -- launch internals --
+
+    private static LaunchResult launchInternal(LaunchPermissionPolicy policy) {
+        Path dllPath = resolveNativeDllPath();
+        if (dllPath == null || !Files.exists(dllPath)) {
+            clearAgentExitSender();
+            clearAgentLockController();
+            return agentUnavailable("native_dll_not_found", "");
+        }
+
+        Path agentPath = resolveAgentExePath();
+        if (agentPath == null || !Files.exists(agentPath)) {
+            clearAgentExitSender();
+            clearAgentLockController();
+            return agentUnavailable("agent_exe_not_found", "");
+        }
+
+        try {
+            Process process = new ProcessBuilder(
+                    agentPath.toAbsolutePath().toString(),
+                    "--serve",
+                    "--policy=" + policy.name().toLowerCase(),
+                    "--dll=" + dllPath.toAbsolutePath()
+            ).redirectErrorStream(true).start();
+
+            AgentSession session = new AgentSession(
+                    process,
+                    new BufferedReader(new InputStreamReader(process.getInputStream())),
+                    new BufferedWriter(new OutputStreamWriter(process.getOutputStream()))
+            );
+
+            String responseLine = sendCommand(session,
+                    "{\"cmd\":\"bootstrap\",\"pid\":" + ProcessHandle.current().pid() + "}");
+            if (responseLine == null || responseLine.isBlank()) {
+                closeAgentSession(session);
+                clearAgentExitSender();
+                clearAgentLockController();
+                return agentUnavailable("agent_empty_response", dllPath.toAbsolutePath().toString());
+            }
+
+            LaunchResult result = parseAgentResponse(responseLine, dllPath);
+            if (result.capabilityLevel() != CapabilityLevel.JVM_FALLBACK) {
+                agentSession = session;
+                registerAgentExitSender(session);
+                registerAgentLockController(session);
+                return result;
+            }
+
+            closeAgentSession(session);
+            clearAgentExitSender();
+            clearAgentLockController();
+            return result;
+        } catch (Throwable ex) {
+            clearAgentExitSender();
+            clearAgentLockController();
+            return agentUnavailable("agent_exception:" + ex.getClass().getSimpleName(), "");
+        }
+    }
+
+    // -- agent session lifecycle --
+
+    private static void registerAgentExitSender(AgentSession session) {
+        clearAgentExitSender();
+
+        JvmControl.ExitCommandSender sender = new JvmControl.ExitCommandSender() {
+            @Override
+            public boolean isAvailable() {
+                return session.process().isAlive();
+            }
+
+            @Override
+            public void sendExitCommand(int exitCode) throws Exception {
+                long pid = ProcessHandle.current().pid();
+                String command = "{\"cmd\":\"exit_jvm\",\"pid\":" + pid + ",\"code\":" + exitCode + "}";
+                sendCommand(session, command);
+                session.process().waitFor(500, TimeUnit.MILLISECONDS);
+            }
+        };
+
+        agentExitSender = sender;
+        JvmControl.registerExitSender(sender);
+    }
+
+    private static void clearAgentExitSender() {
+        JvmControl.ExitCommandSender sender = agentExitSender;
+        if (sender != null) {
+            JvmControl.unregisterExitSender(sender);
+            agentExitSender = null;
+        }
+    }
+
+    private static void registerAgentLockController(AgentSession session) {
+        clearAgentLockController();
+
+        JvmControl.AgentLockController controller = new JvmControl.AgentLockController() {
+            @Override
+            public boolean isAvailable() {
+                return session.process().isAlive();
+            }
+
+            @Override
+            public boolean lockAgent(int ttlSeconds) throws Exception {
+                int safeTtl = Math.max(1, ttlSeconds);
+                String response = sendCommand(session, "{\"cmd\":\"lock_agent\",\"ttlSec\":" + safeTtl + "}");
+                return isOkResponse(response);
+            }
+
+            @Override
+            public boolean unlockAgent() throws Exception {
+                String response = sendCommand(session, "{\"cmd\":\"unlock_agent\"}");
+                return isOkResponse(response);
+            }
+
+            @Override
+            public boolean rebindAgent(long pid) throws Exception {
+                String response = sendCommand(session, "{\"cmd\":\"rebind_jvm\",\"pid\":" + pid + "}");
+                return isOkResponse(response);
+            }
+        };
+
+        agentLockController = controller;
+        JvmControl.registerAgentLockController(controller);
+    }
+
+    private static void clearAgentLockController() {
+        JvmControl.AgentLockController controller = agentLockController;
+        if (controller != null) {
+            JvmControl.unregisterAgentLockController(controller);
+            agentLockController = null;
+        }
+    }
+
+    // -- agent communication --
+
+    public static String agentSend(String commandJson) {
+        AgentSession session = agentSession;
+        if (session == null || !session.process().isAlive()) {
+            throw new IllegalStateException("agent_not_active");
+        }
+        try {
+            return sendCommand(session, commandJson);
+        } catch (Exception e) {
+            throw new IllegalStateException("agent_send_failed:" + e.getMessage(), e);
+        }
+    }
+
+    static String buildCommand(String cmd, Map<String, String> fields) {
+        StringJoiner joiner = new StringJoiner(",", "{", "}");
+        joiner.add("\"cmd\":\"" + escapeJson(cmd) + "\"");
+        if (fields != null) {
+            for (Map.Entry<String, String> entry : fields.entrySet()) {
+                String key = entry.getKey();
+                String value = entry.getValue();
+                joiner.add("\"" + escapeJson(key) + "\":\"" + escapeJson(value == null ? "" : value) + "\"");
+            }
+        }
+        return joiner.toString();
+    }
+
+    public static String escapeJson(String value) {
+        return value
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
+    }
+
+    private static boolean isOkResponse(String responseLine) {
+        if (responseLine == null || responseLine.isBlank()) {
+            return false;
+        }
+        Map<String, String> fields = JsonUtils.parseFlatJsonObject(responseLine);
+        String status = fields.getOrDefault("status", "fallback");
+        return "ok".equalsIgnoreCase(status);
+    }
+
+    private static String sendCommand(AgentSession session, String commandJson) throws Exception {
+        session.ioLock().lock();
+        try {
+            session.writer().write(commandJson);
+            session.writer().newLine();
+            session.writer().flush();
+
+            CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return session.reader().readLine();
+                } catch (IOException e) {
+                    return null;
+                }
+            });
+            return future.get(AGENT_IO_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } finally {
+            session.ioLock().unlock();
+        }
+    }
+
+    // -- agent response parsing --
+
+    private static LaunchResult parseAgentResponse(String responseLine, Path dllPath) {
+        Map<String, String> fields = JsonUtils.parseFlatJsonObject(responseLine);
+        String status = fields.getOrDefault("status", "fallback");
+        String capability = fields.getOrDefault("capability", "JVM_FALLBACK");
+        String reason = normalizeReason(fields.getOrDefault("reason", "unknown"));
+        String activePath = fields.getOrDefault("dllPath", dllPath.toAbsolutePath().toString());
+
+        CapabilityLevel level = parseCapability(capability);
+        if (!"ok".equalsIgnoreCase(status) || level == CapabilityLevel.JVM_FALLBACK) {
+            return agentUnavailable("agent_reported_fallback:" + reason, activePath);
+        }
+
+        String structMapReady = fields.getOrDefault("structMapReady", "false");
+        if (!"true".equalsIgnoreCase(structMapReady)) {
+            return agentUnavailable("agent_structmap_not_ready:" + reason, activePath);
+        }
+
+        return new LaunchResult(level, true, activePath, reason);
+    }
+
+    // -- path resolution --
+
+    private static Path resolveNativeDllPath() {
+        Path fromResource = extractBundledBinary(RESOURCE_DLL_PATH, DLL_FILE);
+        if (fromResource != null) return fromResource;
+
+        String fromProperty = System.getProperty(PROP_NATIVE_DLL_PATH);
+        if (fromProperty != null && !fromProperty.isBlank()) return Paths.get(fromProperty);
+
+        String fromEnv = System.getenv(ENV_NATIVE_DLL_PATH);
+        if (fromEnv != null && !fromEnv.isBlank()) return Paths.get(fromEnv);
+
+        Path fromKnownPaths = lookupKnownLocalDllPaths();
+        if (fromKnownPaths != null) return fromKnownPaths;
+
+        return null;
+    }
+
+    private static Path resolveAgentExePath() {
+        Path fromResource = extractBundledBinary(RESOURCE_AGENT_PATH, AGENT_EXE_FILE);
+        if (fromResource != null) return fromResource;
+
+        String fromProperty = System.getProperty(PROP_AGENT_EXE_PATH);
+        if (fromProperty != null && !fromProperty.isBlank()) return Paths.get(fromProperty);
+
+        String fromEnv = System.getenv(ENV_AGENT_EXE_PATH);
+        if (fromEnv != null && !fromEnv.isBlank()) return Paths.get(fromEnv);
+
+        Path fromKnownPaths = lookupKnownLocalAgentPaths();
+        if (fromKnownPaths != null) return fromKnownPaths;
+
+        return null;
+    }
+
+    private static Path lookupKnownLocalDllPaths() {
+        for (Path candidate : new Path[]{
+                Paths.get("native", "win-x64", DLL_FILE),
+                Paths.get(DLL_FILE)
+        }) {
+            Path absolute = candidate.toAbsolutePath();
+            if (Files.exists(absolute)) return absolute;
+        }
+        return null;
+    }
+
+    private static Path lookupKnownLocalAgentPaths() {
+        for (Path candidate : new Path[]{
+                Paths.get("native", "win-x64", AGENT_EXE_FILE),
+                Paths.get(AGENT_EXE_FILE)
+        }) {
+            Path absolute = candidate.toAbsolutePath();
+            if (Files.exists(absolute)) return absolute;
+        }
+        return null;
+    }
+
+    private static Path extractBundledBinary(String resourcePath, String targetFileName) {
+        try (InputStream input = ForgeVM.class.getResourceAsStream(resourcePath)) {
+            if (input == null) return null;
+            Path runtimeDir = resolveRuntimeDir();
+            Files.createDirectories(runtimeDir);
+            Path target = runtimeDir.resolve(targetFileName);
+            try {
+                Files.copy(input, target, StandardCopyOption.REPLACE_EXISTING);
+            } catch (java.nio.file.AccessDeniedException ignored) {
+                // File is locked by a running agent process — reuse it as-is
+                if (Files.exists(target)) return target;
+                return null;
+            }
+            return target;
+        } catch (IOException ex) {
+            FvmLog.warn("extract bundled binary failed: " + targetFileName + ", reason=" + ex.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    private static Path resolveRuntimeDir() {
+        Path projectRuntime = Paths.get(System.getProperty("user.dir"), FORGEVM_RUNTIME_DIR, "runtime", "win-x64");
+        if (isWritableDirectory(projectRuntime.getParent())) return projectRuntime;
+
+        String localAppData = System.getenv("LOCALAPPDATA");
+        if (localAppData != null && !localAppData.isBlank()) {
+            return Paths.get(localAppData, "ForgeVM", "runtime", "win-x64");
+        }
+        return Paths.get(System.getProperty("user.home"), ".forgevm", "runtime", "win-x64");
+    }
+
+    private static boolean isWritableDirectory(Path dir) {
+        if (dir == null) return false;
+        try {
+            Files.createDirectories(dir);
+            return Files.isDirectory(dir) && Files.isWritable(dir);
+        } catch (IOException ignored) {
+            return false;
+        }
+    }
+
+    private static CapabilityLevel parseCapability(String value) {
+        if ("NATIVE_FULL".equalsIgnoreCase(value)) return CapabilityLevel.NATIVE_FULL;
+        if ("NATIVE_RESTRICTED".equalsIgnoreCase(value)) return CapabilityLevel.NATIVE_RESTRICTED;
+        return CapabilityLevel.JVM_FALLBACK;
+    }
+
+    private static LaunchResult agentUnavailable(String reason, String dllPath) {
+        String normalized = normalizeReason(reason);
+        FvmLog.error("launch failed: " + normalized);
+        return new LaunchResult(CapabilityLevel.JVM_FALLBACK, false, dllPath, normalized);
+    }
+
+    private static String normalizeReason(String reason) {
+        if (reason == null || reason.isBlank()) return "unknown";
+        return reason
+                .replace("assifned", "assigned")
+                .replace("assinged", "assigned")
+                .replace("CreateProcess error=5", "agent_process_access_denied");
+    }
+
+    // -- agent session close --
+
+    private static void closeAgentSession(AgentSession session) {
+        try {
+            try {
+                session.ioLock().lock();
+                try {
+                    session.writer().write("{\"cmd\":\"shutdown\"}");
+                    session.writer().newLine();
+                    session.writer().flush();
+                } finally {
+                    session.ioLock().unlock();
+                }
+            } catch (Throwable ignored) {
+            }
+            try { session.writer().close(); } catch (Throwable ignored) {}
+            try { session.reader().close(); } catch (Throwable ignored) {}
+            try { if (session.process().isAlive()) session.process().destroy(); } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private record AgentSession(
+            Process process,
+            BufferedReader reader,
+            BufferedWriter writer,
+            ReentrantLock ioLock
+    ) {
+        private AgentSession(Process process, BufferedReader reader, BufferedWriter writer) {
+            this(process, reader, writer, new ReentrantLock());
+        }
+    }
+
+    public enum CapabilityLevel {
+        /** Native backend is active with full capability. */
+        NATIVE_FULL,
+        /** Native backend is active with restricted capability. */
+        NATIVE_RESTRICTED,
+        /** Native backend is unavailable; agent not active. */
+        JVM_FALLBACK
+    }
+
+    public enum LaunchPermissionPolicy {
+        /** Silent probe path without proactive elevation prompt. */
+        SILENT,
+        /** Prompt-capable probe path that may request elevated permission. */
+        PROMPT
+    }
+
+    public record LaunchResult(
+            CapabilityLevel capabilityLevel,
+            boolean nativeDllActive,
+            String nativeDllPath,
+            String reason
+    ) {}
+}
