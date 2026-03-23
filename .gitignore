@@ -1,0 +1,22 @@
+# Build
+.gradle/
+build/
+**/build/
+
+# IDE
+*.iml
+.idea/
+.vscode/
+
+# Claude
+.claude/
+CLAUDE.md
+
+# Native binaries (distribute via GitHub Releases, not repo)
+ForgeVM/
+*.exe
+*.dll
+
+# OS
+Thumbs.db
+Desktop.ini

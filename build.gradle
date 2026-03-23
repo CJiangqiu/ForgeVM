@@ -1,0 +1,92 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+
+group = 'io.github.forgevm'
+version = '0.1.0'
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+    withSourcesJar()
+    withJavadocJar()
+}
+
+dependencies {
+    testImplementation platform('org.junit:junit-bom:5.12.1')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+tasks.named('test', Test) {
+    useJUnitPlatform()
+}
+
+tasks.named('jar', Jar) {
+    manifest {
+        attributes(
+            'Implementation-Title': 'forgevm',
+            'Implementation-Version': project.version
+        )
+    }
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+
+            pom {
+                name = 'ForgeVM'
+                description = 'Low-level JVM operation library that bypasses official JVM APIs via out-of-process native memory access'
+                url = 'https://github.com/YOUR_USERNAME/ForgeVM'
+
+                licenses {
+                    license {
+                        name = 'MIT License'
+                        url = 'https://opensource.org/licenses/MIT'
+                    }
+                }
+
+                developers {
+                    developer {
+                        id = 'forgevm'
+                        name = 'ForgeVM Authors'
+                    }
+                }
+
+                scm {
+                    url = 'https://github.com/YOUR_USERNAME/ForgeVM'
+                }
+            }
+        }
+    }
+
+    repositories {
+        maven {
+            name = 'GitHubPackages'
+            url = uri('https://maven.pkg.github.com/YOUR_USERNAME/ForgeVM')
+            credentials {
+                username = project.findProperty('gpr.user') ?: System.getenv('GITHUB_ACTOR')
+                password = project.findProperty('gpr.key') ?: System.getenv('GITHUB_TOKEN')
+            }
+        }
+    }
+}
+
+tasks.register('checkForgeVMLaunch', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'forgevm.dev.ForgeVMLaunchCheck'
+    javaLauncher = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
