@@ -1,265 +1,353 @@
 # ForgeVM
 
-ForgeVM is a JVM runtime manipulation library that operates **entirely out-of-process**. Instead of relying on JVMTI, JNI, or other official JVM APIs, ForgeVM uses an external native Agent to read and write JVM memory directly through OS-level `ReadProcessMemory` / `WriteProcessMemory`. This makes it resistant to in-process hook interception and JDK version changes.
+[English](#english) | [中文](#中文)
 
-## Architecture
+---
+
+## English
+
+ForgeVM is a Java library for low-level JVM manipulation through an out-of-process native agent. Instead of relying on standard JVM APIs (JVMTI, `java.lang.instrument`, Reflection), ForgeVM spawns a separate native process that directly reads and writes target JVM memory via OS-level primitives (e.g. `WriteProcessMemory` on Windows).
+
+### Architecture
 
 ```
-Your Java Code
-     │
-     ▼
-ForgeVM.launch()  ──  Java orchestrator
-     │
-     ▼
-forgevm_agent.exe  ──  independent process, stdin/stdout JSON IPC
-     │
-     ▼
-forgevm_native.dll  ──  C++, Win32 ReadProcessMemory / WriteProcessMemory
-     │
-     ▼
-Target JVM Heap  ──  HotSpot object memory
+┌─────────────────────────────────┐
+│         Your Application        │
+│    ForgeVM.launch() / memory()  │
+│         / transformer()         │
+└────────────┬────────────────────┘
+             │ stdin/stdout JSON IPC
+             ▼
+┌─────────────────────────────────┐
+│      forgevm_agent.exe          │
+│   (separate native process)     │
+│                                 │
+│  ┌───────────────────────────┐  │
+│  │   forgevm_native.dll      │  │
+│  │  - memory read/write      │  │
+│  │  - thread suspend/resume  │  │
+│  │  - bytecode rewriting     │  │
+│  └───────────────────────────┘  │
+└────────────┬────────────────────┘
+             │ Win32 API
+             │ (ReadProcessMemory,
+             │  WriteProcessMemory,
+             │  NtSuspendThread ...)
+             ▼
+┌─────────────────────────────────┐
+│        Target JVM Process       │
+└─────────────────────────────────┘
 ```
 
-If the Agent or DLL is unavailable, ForgeVM reports `JVM_FALLBACK` — no crash, no exception from launch. The Agent includes a **parent-process watchdog** that automatically exits when the JVM process dies, preventing orphaned processes.
+The Java library communicates with the agent over stdin/stdout using a line-delimited JSON protocol. The agent performs all privileged operations externally, which avoids the constraints and interception risks of in-process JVM tooling.
 
-## Requirements
+### Capability Levels
 
-- Java 17+
-- Windows x64
-- HotSpot JVM (OpenJDK / Oracle JDK)
-- `forgevm_agent.exe` + `forgevm_native.dll` (auto-extracted from bundled resources, or placed in `native/win-x64/`)
-- Administrator or SeDebugPrivilege for `NATIVE_FULL`; debug privilege only for `NATIVE_RESTRICTED`
+On launch, ForgeVM probes the environment and reports one of three capability levels:
 
-## Quick Start
+| Level | Meaning |
+|---|---|
+| `NATIVE_FULL` | Agent process started, native DLL loaded, struct map ready. All APIs operational. |
+| `NATIVE_RESTRICTED` | Agent started but with limited capability (e.g. partial permission). |
+| `JVM_FALLBACK` | Agent unavailable. Automatic fallback — the application continues running. |
+
+### Modules
+
+```
+forgevm.core       — Lifecycle, launch orchestration, agent session management
+forgevm.memory     — Field-level memory write API (MemoryUtil)
+forgevm.transform  — Runtime bytecode transformation (FvmTransformer, TransformManager)
+forgevm.jvm        — JVM control: process exit, agent lock/unlock, rebind
+forgevm.util       — Logging (FvmLog), JSON parsing (JsonUtils)
+```
+
+### API
+
+#### Launch
 
 ```java
-import forgevm.core.ForgeVM;
+// Default: silent permission policy
+ForgeVM.LaunchResult result = ForgeVM.launch();
 
-// One call to start everything. No -D flags, no env vars, no manual config.
-ForgeVM.launch();
+// Or with UAC-style elevation prompt
+ForgeVM.LaunchResult result = ForgeVM.launch(ForgeVM.PROMPT);
+
+// Check result
+result.capabilityLevel();  // NATIVE_FULL, NATIVE_RESTRICTED, or JVM_FALLBACK
+result.nativeDllActive();  // true if native backend is active
 ```
 
-## Features
+No JVM flags, no `-D` parameters, no manual path configuration required. The native binaries are extracted from the JAR at runtime and placed in a local runtime directory.
 
-### 1. JVM Control
+#### Field Memory Write
 
-Control the target JVM process through the Agent.
+Write to object fields by descriptor, bypassing access modifiers and JVM restrictions. The agent resolves field offsets from object headers and writes directly into heap memory.
 
 ```java
-// Exit target JVM
-ForgeVM.exit(0);
+MemoryUtil mem = ForgeVM.memory();
 
-// Lock Agent to prevent rebind races (e.g., during Shadow JVM switch)
-ForgeVM.lockAgent(30);
-ForgeVM.unlockAgent();
+// Single instance — all primitive types supported
+mem.putBooleanField(entity, "com.example.entity.LivingEntity.dead", true);
+mem.putIntField(entity, "com.example.entity.LivingEntity.health", 20);
+mem.putFloatField(entity, "com.example.entity.LivingEntity.speed", 0.3f);
 
-// Rebind Agent to current JVM process
-ForgeVM.lockAgent(10);
-ForgeVM.rebindAgentToCurrentJvm();
+// Object reference (updates GC card table)
+mem.putObjectField(entity, "com.example.entity.Entity.level", newLevel);
+
+// Batch — operates on any Iterable, single suspend/resume cycle
+List<LivingEntity> entities = getAllEntities();
+mem.putBooleanField(entities, "com.example.entity.LivingEntity.dead", false);
 ```
 
-### 2. Field Memory
+Batch operations suspend all target JVM threads once, perform all writes, then resume — the caller does not manage synchronization.
 
-Write field values directly to JVM heap memory, bypassing all access restrictions. ForgeVM resolves field offsets at runtime from the object's klass pointer — no hardcoded offsets, works across JDK versions.
+#### Bytecode Transformation
 
-**Single instance:**
-
-```java
-Object target = getTargetObject();
-
-ForgeVM.memory().putBooleanField(target, "com.example.Entity.active", true);
-ForgeVM.memory().putFloatField(target, "com.example.Entity.health", 20.0f);
-ForgeVM.memory().putIntField(target, "com.example.Entity.score", 9999);
-
-// Object reference write (automatically updates GC card table)
-ForgeVM.memory().putObjectField(target, "com.example.Entity.owner", newOwner);
-```
-
-**Batch (Iterable) — all writes under a single thread-suspend window:**
+Rewrite method bytecode at runtime without `java.lang.instrument` or JVMTI. The agent patches compiled method code directly in memory.
 
 ```java
-List<Object> targets = getAllEntities();
-
-// One suspend → write all → resume. Zero GC interference.
-ForgeVM.memory().putBooleanField(targets, "com.example.Entity.active", false);
-```
-
-**Supported types:**
-
-| Type | Bytes | Type | Bytes |
-|------|-------|------|-------|
-| `boolean` | 1 | `int` | 4 |
-| `byte` | 1 | `float` | 4 |
-| `short` | 2 | `long` | 8 |
-| `char` | 2 | `double` | 8 |
-| `Object` | 4 or 8 (CompressedOops) | | |
-
-Field descriptor format: `"fully.qualified.ClassName.fieldName"`. Resolved offsets are **cached** — subsequent writes skip resolution entirely.
-
-### 3. Transformer
-
-Inject custom logic into any loaded class's methods at runtime. ForgeVM rewrites bytecode in-memory through the Agent — no `java.lang.instrument`, no Instrumentation API.
-
-#### Define a transformer
-
-Extend `FvmTransformer`, declare the target in the constructor, and write a `public static` hook method that takes `FvmCallback`:
-
-```java
-import forgevm.transform.FvmTransformer;
-import forgevm.transform.FvmCallback;
-
+// 1. Define a transformer
 public class TickLogger extends FvmTransformer {
     public TickLogger() {
         super("com.example.engine.GameLoop", "tick");
     }
 
-    // Must be public static — ForgeVM injects an invokestatic call to this method.
     public static void onTick(FvmCallback callback) {
         System.out.println("tick called on: " + callback.getInstance());
-        // not calling cancel/setReturnValue → original method runs normally
+        // Not calling cancel() or setReturnValue() → original method runs normally
     }
 }
+
+// 2. Load it
+ForgeVM.transformer().load(new TickLogger());
+
+// 3. Unload to restore original bytecode
+ForgeVM.transformer().unload(TickLogger.class);
 ```
 
-#### Override a return value
+Transformers support:
+- Multiple method name candidates (for obfuscated targets): `new String[]{"tick", "m_1234"}`
+- Parameter type matching to distinguish overloads: `new Class<?>[]{float.class}`
+- Injection at `HEAD` (before method body) or `RETURN` (before return instructions)
+- Return value override via `callback.setReturnValue(value)`
+- Method cancellation via `callback.cancel()` (void methods)
+
+#### JVM Control
 
 ```java
-public class HealthOverride extends FvmTransformer {
-    public HealthOverride() {
-        // Multiple candidates for obfuscated environments
-        super("com.example.entity.LivingEntity", new String[]{"getHealth", "m_1234"});
-    }
+// Terminate the JVM via the agent (sends exit command, then halts)
+ForgeVM.exit();
+ForgeVM.exit(1);
 
-    public static void onGetHealth(FvmCallback callback) {
-        callback.setReturnValue(20.0f);  // original method is skipped
-    }
-}
+// Lock the agent for exclusive access (TTL in seconds)
+ForgeVM.lockAgent(30);
+ForgeVM.unlockAgent();
+
+// Rebind agent to current JVM (for Shadow JVM switch scenarios)
+ForgeVM.rebindAgentToCurrentJvm();
 ```
 
-#### Conditional logic based on target instance
+### Thread Safety During Memory Operations
 
-```java
-public class SelectiveHealthPatch extends FvmTransformer {
-    public SelectiveHealthPatch() {
-        super("com.example.entity.LivingEntity", new String[]{"getHealth", "m_1234"});
-    }
+- **Single-instance writes** may skip thread suspension for minimal latency (~3ms saved), accepting a small GC window risk.
+- **Batch writes** (Iterable parameter) always suspend target threads for the duration of the write sequence using `NtSuspendThread` / `NtResumeThread` — kernel-level, not interceptable by in-process hooks.
 
-    public static void onGetHealth(FvmCallback callback) {
-        if (callback.getInstance() instanceof com.example.entity.Player) {
-            callback.setReturnValue(20.0f);  // only Player instances
-        }
-        // other instances → original method runs normally
-    }
-}
+### Native Binary Resolution Order
+
+1. Bundled resource inside the JAR (`/native/win-x64/`)
+2. System property (`-Dforgevm.native.dll.path=...`)
+3. Environment variable (`FORGEVM_NATIVE_DLL_PATH`)
+4. Known local paths (`./native/win-x64/`, `./`)
+
+The same order applies to the agent executable.
+
+### Requirements
+
+- Java 17+
+- Windows x64 (current native backend)
+- The agent process requires sufficient OS-level permission to read/write the target JVM's memory
+
+### Build
+
+```bash
+./gradlew build
 ```
 
-#### Cancel a void method
+### License
+
+[MIT](LICENSE.txt) — Copyright © 2026 CJiangqiu
+
+---
+
+## 中文
+
+ForgeVM 是一个通过外部进程原生代理实现 JVM 底层操作的 Java 库。它不依赖标准 JVM API（JVMTI、`java.lang.instrument`、反射），而是启动一个独立的原生进程，通过操作系统级原语（如 Windows 上的 `WriteProcessMemory`）直接读写目标 JVM 内存。
+
+### 架构
+
+```
+┌─────────────────────────────────┐
+│          你的应用程序             │
+│    ForgeVM.launch() / memory()  │
+│         / transformer()         │
+└────────────┬────────────────────┘
+             │ stdin/stdout JSON IPC
+             ▼
+┌─────────────────────────────────┐
+│      forgevm_agent.exe          │
+│      （独立原生进程）              │
+│                                 │
+│  ┌───────────────────────────┐  │
+│  │   forgevm_native.dll      │  │
+│  │  - 内存读写                │  │
+│  │  - 线程挂起/恢复           │  │
+│  │  - 字节码改写              │  │
+│  └───────────────────────────┘  │
+└────────────┬────────────────────┘
+             │ Win32 API
+             │ (ReadProcessMemory,
+             │  WriteProcessMemory,
+             │  NtSuspendThread ...)
+             ▼
+┌─────────────────────────────────┐
+│         目标 JVM 进程            │
+└─────────────────────────────────┘
+```
+
+Java 库通过 stdin/stdout 使用行分隔 JSON 协议与 Agent 通信。Agent 在进程外执行所有特权操作，避开了进程内 JVM 工具的限制和被拦截风险。
+
+### 能力等级
+
+启动时，ForgeVM 探测运行环境并报告以下三种能力等级之一：
+
+| 等级 | 含义 |
+|---|---|
+| `NATIVE_FULL` | Agent 进程已启动，原生 DLL 已加载，结构映射就绪。所有 API 可用。 |
+| `NATIVE_RESTRICTED` | Agent 已启动但能力受限（如部分权限不足）。 |
+| `JVM_FALLBACK` | Agent 不可用。自动回退——应用继续正常运行。 |
+
+### 模块
+
+```
+forgevm.core       — 生命周期、启动编排、Agent 会话管理
+forgevm.memory     — 字段级内存写入 API（MemoryUtil）
+forgevm.transform  — 运行时字节码改写（FvmTransformer、TransformManager）
+forgevm.jvm        — JVM 控制：进程退出、Agent 锁定/解锁、重绑定
+forgevm.util       — 日志（FvmLog）、JSON 解析（JsonUtils）
+```
+
+### API
+
+#### 启动
 
 ```java
-public class TickGuard extends FvmTransformer {
-    public TickGuard() {
-        super("com.example.engine.GameLoop", "tick", InjectPoint.HEAD);
+// 默认静默权限策略
+ForgeVM.LaunchResult result = ForgeVM.launch();
+
+// 带 UAC 式提权提示
+ForgeVM.LaunchResult result = ForgeVM.launch(ForgeVM.PROMPT);
+
+// 检查结果
+result.capabilityLevel();  // NATIVE_FULL、NATIVE_RESTRICTED 或 JVM_FALLBACK
+result.nativeDllActive();  // 原生后端是否激活
+```
+
+无需 JVM 启动参数，无需 `-D` 配置，无需手动指定路径。原生二进制文件在运行时从 JAR 中提取并放置到本地运行目录。
+
+#### 字段内存写入
+
+通过字段描述符写入对象字段，绕过访问修饰符和 JVM 限制。Agent 从对象头解析字段偏移量，直接写入堆内存。
+
+```java
+MemoryUtil mem = ForgeVM.memory();
+
+// 单实例——支持所有基本类型
+mem.putBooleanField(entity, "com.example.entity.LivingEntity.dead", true);
+mem.putIntField(entity, "com.example.entity.LivingEntity.health", 20);
+mem.putFloatField(entity, "com.example.entity.LivingEntity.speed", 0.3f);
+
+// 对象引用（自动更新 GC 卡表）
+mem.putObjectField(entity, "com.example.entity.Entity.level", newLevel);
+
+// 批量——接受任意 Iterable，单次挂起/恢复周期
+List<LivingEntity> entities = getAllEntities();
+mem.putBooleanField(entities, "com.example.entity.LivingEntity.dead", false);
+```
+
+批量操作将目标 JVM 所有线程挂起一次，执行全部写入后恢复——调用方无需管理同步。
+
+#### 字节码改写
+
+在运行时改写方法字节码，无需 `java.lang.instrument` 或 JVMTI。Agent 直接在内存中修改已编译的方法代码。
+
+```java
+// 1. 定义 Transformer
+public class TickLogger extends FvmTransformer {
+    public TickLogger() {
+        super("com.example.engine.GameLoop", "tick");
     }
 
     public static void onTick(FvmCallback callback) {
-        if (shouldBlock()) {
-            callback.cancel();  // original tick() is skipped
-        }
+        System.out.println("tick called on: " + callback.getInstance());
+        // 不调用 cancel() 或 setReturnValue() → 原方法正常执行
     }
 }
+
+// 2. 加载
+ForgeVM.transformer().load(new TickLogger());
+
+// 3. 卸载以恢复原始字节码
+ForgeVM.transformer().unload(TickLogger.class);
 ```
 
-#### Load and unload at runtime
+Transformer 支持：
+- 多方法名候选（用于混淆目标）：`new String[]{"tick", "m_1234"}`
+- 参数类型匹配以区分重载：`new Class<?>[]{float.class}`
+- 在 `HEAD`（方法体前）或 `RETURN`（return 指令前）注入
+- 通过 `callback.setReturnValue(value)` 覆盖返回值
+- 通过 `callback.cancel()` 取消方法执行（void 方法）
+
+#### JVM 控制
 
 ```java
-// Apply — bytecode is rewritten immediately
-ForgeVM.transformer().load(new HealthOverride());
+// 通过 Agent 终止 JVM（发送退出命令后 halt）
+ForgeVM.exit();
+ForgeVM.exit(1);
 
-// Remove — original bytecode is restored
-ForgeVM.transformer().unload(HealthOverride.class);
+// 锁定 Agent 独占访问（TTL 秒）
+ForgeVM.lockAgent(30);
+ForgeVM.unlockAgent();
+
+// 将 Agent 重绑定到当前 JVM（用于 Shadow JVM 切换场景）
+ForgeVM.rebindAgentToCurrentJvm();
 ```
 
-#### Constructor variants
+### 内存操作的线程安全
 
-```java
-// Single method, no-arg, HEAD (simplest)
-super("com.example.Foo", "bar");
+- **单实例写入**可跳过线程挂起以降低延迟（节省约 3ms），代价是极小的 GC 窗口风险。
+- **批量写入**（Iterable 参数）始终在整个写入序列期间挂起目标线程，使用 `NtSuspendThread` / `NtResumeThread`——内核级调用，不会被进程内 hook 拦截。
 
-// Multiple candidate names (obfuscation support)
-super("com.example.Foo", new String[]{"bar", "a_42"});
+### 原生二进制查找顺序
 
-// Specify inject point
-super("com.example.Foo", "bar", InjectPoint.RETURN);
+1. JAR 内置资源（`/native/win-x64/`）
+2. 系统属性（`-Dforgevm.native.dll.path=...`）
+3. 环境变量（`FORGEVM_NATIVE_DLL_PATH`）
+4. 已知本地路径（`./native/win-x64/`、`./`）
 
-// With parameter types (distinguish overloads)
-super("com.example.Foo", "bar", new Class<?>[]{float.class}, InjectPoint.HEAD);
+Agent 可执行文件的查找顺序相同。
+
+### 环境要求
+
+- Java 17+
+- Windows x64（当前原生后端）
+- Agent 进程需要足够的操作系统级权限来读写目标 JVM 内存
+
+### 构建
+
+```bash
+./gradlew build
 ```
 
-#### FvmCallback API
+### 许可证
 
-| Method | Effect |
-|--------|--------|
-| `callback.getInstance()` | Returns the target object (`this` of the hooked method) |
-| `callback.setReturnValue(value)` | Skip original method, return the given value (boxed primitives) |
-| `callback.cancel()` | Skip original method (for `void` methods) |
-| *(neither called)* | Original method executes normally |
-
-## Capability Levels
-
-| Level | Meaning |
-|-------|---------|
-| `NATIVE_FULL` | Agent + DLL active, admin + SeDebugPrivilege |
-| `NATIVE_RESTRICTED` | Agent + DLL active, debug privilege only |
-| `JVM_FALLBACK` | Agent/DLL unavailable — memory and transform operations will fail |
-
-## How It Works
-
-### Bootstrap
-
-`ForgeVM.launch()` starts `forgevm_agent.exe` as a child process, which loads `forgevm_native.dll`. The DLL opens a handle to the calling JVM process and reads HotSpot's exported self-describing tables:
-
-- `gHotSpotVMStructs` — C++ struct field offsets
-- `gHotSpotVMTypes` — type sizes
-- `gHotSpotVMIntConstants` / `gHotSpotVMLongConstants` — runtime flags
-
-These tables make ForgeVM work across JDK versions without hardcoded offsets.
-
-### putField Execution Chain
-
-```
-Java:  ForgeVM.memory().putXxxField(target, "ClassName.field", value)
-  │
-  ├── Unsafe extracts raw OOP address
-  ├── Value encoded to little-endian bytes
-  ├── JSON IPC → Agent
-  │
-  ▼
-Native DLL:
-  ├── decodeRawOop → object address
-  ├── readKlass → klass pointer from object header
-  ├── Walk Klass._super chain → resolve field offset (cached)
-  └── WriteProcessMemory(objAddr + offset, valueBytes)
-```
-
-### Transformer Execution Chain
-
-```
-Java:  ForgeVM.transformer().load(new MyPatch())
-  │
-  ├── Reflect to find public static hook method with FvmCallback parameter
-  ├── JSON IPC → Agent
-  │
-  ▼
-Native DLL:
-  ├── ClassLoaderDataGraph → find target InstanceKlass
-  ├── InstanceKlass._methods → find target Method*
-  ├── Read ConstMethod bytecode + ConstantPool
-  ├── Read existing interned Symbol* pointers from Klass/Method metadata
-  ├── VirtualAllocEx → allocate new ConstMethod + expanded ConstantPool + Cache
-  ├── Build new bytecode:
-  │     new FvmCallback(this) → invokestatic hook(FvmCallback)
-  │     → isCancelled? → yes: getReturnValue + unbox + return
-  │                     → no:  pop callback, execute original method body
-  ├── SuspendThread → swap ConstMethod pointer + clear JIT → ResumeThread
-  └── Backup original pointers for unload/restore
-```
+[MIT](LICENSE.txt) — Copyright © 2026 CJiangqiu
