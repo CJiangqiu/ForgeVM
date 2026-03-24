@@ -13,42 +13,7 @@ static std::string makeTransformKey(const char* className, const char* methodNam
     return std::string(className) + "#" + methodName + "#" + paramDesc;
 }
 
-// ============================================================
-// Thread suspend/resume (reuse existing infrastructure)
-// ============================================================
-
-bool suspendTargetThreads(DWORD pid, std::vector<DWORD>& threadIds) {
-    threadIds.clear();
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return false;
-
-    THREADENTRY32 te;
-    te.dwSize = sizeof(te);
-    if (Thread32First(snap, &te)) {
-        do {
-            if (te.th32OwnerProcessID == pid) {
-                HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
-                if (hThread != NULL) {
-                    SuspendThread(hThread);
-                    threadIds.push_back(te.th32ThreadID);
-                    CloseHandle(hThread);
-                }
-            }
-        } while (Thread32Next(snap, &te));
-    }
-    CloseHandle(snap);
-    return !threadIds.empty();
-}
-
-void resumeTargetThreads(const std::vector<DWORD>& threadIds) {
-    for (DWORD tid : threadIds) {
-        HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
-        if (hThread != NULL) {
-            ResumeThread(hThread);
-            CloseHandle(hThread);
-        }
-    }
-}
+// suspendTargetThreads / resumeTargetThreads — defined in forgevm_memory.cpp, declared in forgevm_internal.h
 
 // ============================================================
 // Locate Java Method* in target process
@@ -418,22 +383,103 @@ bool readConstantPool(uint64_t constPoolAddr, std::vector<uint8_t>* poolBytesOut
 // For an unresolved Methodref, HotSpot stores it as indices packed into a single slot.
 // We need to create entries that the interpreter can resolve.
 //
-// Simpler approach: we create Symbol* for hook class/method/desc in target process,
-// add them as Utf8 entries, then build Class + NameAndType + Methodref entries.
+// CRITICAL: HotSpot resolves methods by comparing Symbol* POINTERS, not string content.
+// We MUST use the JVM's existing interned Symbol* pointers, not freshly allocated ones.
+// Read them from the Klass/Method metadata that already exists in the target process.
 // ============================================================
 
-// Allocate a HotSpot Symbol in target process memory
+// Read the interned name Symbol* pointer from an InstanceKlass
+static uint64_t readKlassNameSymbol(uint64_t klassAddr) {
+    HANDLE proc = g_target.handle;
+    int64_t nameOff = structOffset("Klass", "_name");
+    if (nameOff < 0) nameOff = structOffset("InstanceKlass", "_name");
+    if (nameOff < 0) {
+        FVM_LOG("WARN: cannot find Klass::_name offset");
+        return 0;
+    }
+    uint64_t sym = 0;
+    if (!readRemotePointer(proc, klassAddr + (uint64_t)nameOff, &sym)) return 0;
+    return sym;
+}
+
+// Read the interned name and signature Symbol* pointers from a Method*
+static bool readMethodSymbols(uint64_t methodAddr, uint64_t* nameSymOut, uint64_t* sigSymOut) {
+    HANDLE proc = g_target.handle;
+
+    int64_t constMethodOff = structOffset("Method", "_constMethod");
+    if (constMethodOff < 0) constMethodOff = 8;
+
+    uint64_t constMethodAddr = 0;
+    if (!readRemotePointer(proc, methodAddr + (uint64_t)constMethodOff, &constMethodAddr) || constMethodAddr == 0)
+        return false;
+
+    // Try direct Symbol* approach (ConstMethod::_name / _signature in some JDK builds)
+    int64_t cmNameOff = structOffset("ConstMethod", "_name");
+    int64_t cmSigOff  = structOffset("ConstMethod", "_signature");
+
+    if (cmNameOff >= 0 && cmSigOff >= 0) {
+        uint64_t nameSym = 0, sigSym = 0;
+        if (readRemotePointer(proc, constMethodAddr + (uint64_t)cmNameOff, &nameSym) && nameSym != 0 &&
+            readRemotePointer(proc, constMethodAddr + (uint64_t)cmSigOff, &sigSym) && sigSym != 0) {
+            // Validate: check that these look like Symbol pointers (body offset check)
+            std::string test;
+            if (readSymbolBody(proc, nameSym, &test) && !test.empty()) {
+                *nameSymOut = nameSym;
+                *sigSymOut = sigSym;
+                return true;
+            }
+        }
+    }
+
+    // Fallback: read via ConstantPool + name_index/signature_index
+    int64_t cmConstsOff = structOffset("ConstMethod", "_constants");
+    if (cmConstsOff < 0) cmConstsOff = 8;
+    int64_t nameIdxOff = structOffset("ConstMethod", "_name_index");
+    int64_t sigIdxOff  = structOffset("ConstMethod", "_signature_index");
+    if (nameIdxOff < 0 || sigIdxOff < 0) return false;
+
+    uint64_t constPoolAddr = 0;
+    if (!readRemotePointer(proc, constMethodAddr + (uint64_t)cmConstsOff, &constPoolAddr) || constPoolAddr == 0)
+        return false;
+
+    uint16_t nameIndex = 0, sigIndex = 0;
+    if (!readRemoteU16(proc, constMethodAddr + (uint64_t)nameIdxOff, &nameIndex)) return false;
+    if (!readRemoteU16(proc, constMethodAddr + (uint64_t)sigIdxOff, &sigIndex)) return false;
+
+    int64_t cpHeaderSize = typeSize("ConstantPool");
+    if (cpHeaderSize < 0) cpHeaderSize = 0x138;
+
+    uint64_t nameSym = 0, sigSym = 0;
+    if (!readRemotePointer(proc, constPoolAddr + (uint64_t)cpHeaderSize + (uint64_t)nameIndex * 8, &nameSym) || nameSym == 0)
+        return false;
+    if (!readRemotePointer(proc, constPoolAddr + (uint64_t)cpHeaderSize + (uint64_t)sigIndex * 8, &sigSym) || sigSym == 0)
+        return false;
+
+    *nameSymOut = nameSym;
+    *sigSymOut = sigSym;
+    return true;
+}
+
+// Allocate a HotSpot Symbol in target process memory (ONLY for symbols not already interned)
 static uint64_t allocateSymbolInTarget(const std::string& str) {
     HANDLE proc = g_target.handle;
 
-    // Symbol layout: _hash (u4), _length (u2), _refcount (u2), _body[] (char)
-    // Total: 8 bytes header + body length
-    // But _hash_and_refcount may be combined. Let's use structMap.
+    // JDK 17 Symbol layout:
+    //   offset 0: _hash_and_refcount (u4) — bits 0-15 = refcount, bits 16-31 = hash
+    //   offset 4: _length (u2)
+    //   offset 6: _body[0] (u1[])  — VMStructs names it "_body[0]"
+    // Total: 6 bytes header + body length
 
-    int64_t symbolHeaderSize = typeSize("Symbol");
-    if (symbolHeaderSize < 0) symbolHeaderSize = 8; // common: hash(4) + length(2) + refcount(2)
+    // Resolve _length offset from VMStructs (should be 4)
+    int64_t lenOff = structOffset("Symbol", "_length");
+    if (lenOff < 0) lenOff = 4;
 
-    size_t totalSize = (size_t)symbolHeaderSize + str.size() + 1; // +1 for safety
+    // Resolve _body offset: VMStructs names it "_body[0]", not "_body"
+    int64_t bodyOff = structOffset("Symbol", "_body[0]");
+    if (bodyOff < 0) bodyOff = structOffset("Symbol", "_body");
+    if (bodyOff < 0) bodyOff = lenOff + 2;  // body always follows _length (u2)
+
+    size_t totalSize = (size_t)bodyOff + str.size() + 1; // +1 for safety
     // Align to 8
     totalSize = (totalSize + 7) & ~7;
 
@@ -444,22 +490,22 @@ static uint64_t allocateSymbolInTarget(const std::string& str) {
     // Write the symbol data
     std::vector<uint8_t> symData(totalSize, 0);
 
-    // _length at offset 4 (after _hash which is u4)
-    int64_t lenOff = structOffset("Symbol", "_length");
-    if (lenOff < 0) lenOff = 4;
+    // _hash_and_refcount at offset 0: set refcount=0x7FFF (prevent GC), hash=0
+    // In JDK 17, _refcount is not a separate field — it's packed into _hash_and_refcount
+    int64_t hashRefOff = structOffset("Symbol", "_hash_and_refcount");
+    if (hashRefOff < 0) hashRefOff = 0;
+    uint32_t hashAndRef = 0x7FFF; // low 16 bits = refcount, high 16 bits = hash (0)
+    memcpy(symData.data() + hashRefOff, &hashAndRef, 4);
+
+    // _length
     uint16_t len16 = (uint16_t)str.size();
     memcpy(symData.data() + lenOff, &len16, 2);
 
-    // _refcount - set high to prevent GC from collecting it
-    int64_t refOff = structOffset("Symbol", "_refcount");
-    if (refOff < 0) refOff = lenOff + 2;
-    uint16_t refCount = 0x7FFF;
-    memcpy(symData.data() + refOff, &refCount, 2);
-
-    // _body starts after header
-    int64_t bodyOff = structOffset("Symbol", "_body");
-    if (bodyOff < 0) bodyOff = symbolHeaderSize;
+    // _body
     memcpy(symData.data() + bodyOff, str.c_str(), str.size());
+
+    FVM_LOG("allocateSymbol: \"%s\" len=%u bodyOff=%lld totalSize=%zu addr=0x%llX",
+            str.c_str(), (unsigned)str.size(), (long long)bodyOff, totalSize, addr);
 
     if (!writeRemoteMem(proc, addr, symData.data(), totalSize)) {
         VirtualFreeEx(proc, (LPVOID)addr, 0, MEM_RELEASE);
@@ -479,6 +525,10 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     HANDLE proc = g_target.handle;
     std::string key = makeTransformKey(className, methodName, paramDesc);
 
+    FVM_LOG("=== TRANSFORM BEGIN ===");
+    FVM_LOG("target: %s.%s(%s) @ %s", className, methodName, paramDesc, injectAt);
+    FVM_LOG("hook:   %s.%s%s", hookClass, hookMethod, hookDesc);
+
     // Check if already transformed
     if (g_transformBackups.find(key) != g_transformBackups.end()) {
         setError("already_transformed:" + key);
@@ -488,8 +538,10 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     // 1. Find the target Method*
     uint64_t methodAddr = 0;
     if (!findJavaMethod(className, methodName, paramDesc, &methodAddr)) {
+        FVM_LOG("TRANSFORM FAILED: method not found");
         return 0;
     }
+    FVM_LOG("Method* = 0x%llX", (unsigned long long)methodAddr);
 
     // 2. Read Method -> ConstMethod*
     int64_t constMethodOff = structOffset("Method", "_constMethod");
@@ -500,6 +552,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         setError("cannot_read_constmethod_ptr");
         return 0;
     }
+    FVM_LOG("ConstMethod* = 0x%llX (offset %lld from Method)", (unsigned long long)origConstMethodAddr, (long long)constMethodOff);
 
     // 3. Read ConstMethod -> ConstantPool*
     int64_t cmConstsOff = structOffset("ConstMethod", "_constants");
@@ -510,22 +563,28 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         setError("cannot_read_constpool_ptr");
         return 0;
     }
+    FVM_LOG("ConstantPool* = 0x%llX", (unsigned long long)origConstPoolAddr);
 
     // 4. Read original bytecode
     std::vector<uint8_t> origBytecode;
     uint64_t bcStartAddr = 0;
     uint32_t codeSize = 0;
     if (!readConstMethodBytecode(origConstMethodAddr, &origBytecode, &bcStartAddr, &codeSize)) {
+        FVM_LOG("TRANSFORM FAILED: cannot read bytecode");
         return 0;
     }
+    FVM_LOG("original bytecode: %u bytes at 0x%llX", codeSize, (unsigned long long)bcStartAddr);
+    FVM_LOG_HEX("orig bytecode", origBytecode.data(), origBytecode.size());
 
     // 5. Read original constant pool
     std::vector<uint8_t> origPoolBytes;
     uint32_t poolLength = 0;
     size_t poolByteSize = 0;
     if (!readConstantPool(origConstPoolAddr, &origPoolBytes, &poolLength, &poolByteSize)) {
+        FVM_LOG("TRANSFORM FAILED: cannot read constpool");
         return 0;
     }
+    FVM_LOG("original constpool: length=%u, byteSize=%zu", poolLength, poolByteSize);
 
     // 6. Find the hook class's InstanceKlass to verify it exists
     std::string hookClassInternal = toInternalName(hookClass);
@@ -534,6 +593,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         setError("hook_class_not_loaded:" + hookClassInternal);
         return 0;
     }
+    FVM_LOG("hookKlass (%s) = 0x%llX", hookClassInternal.c_str(), (unsigned long long)hookKlassAddr);
 
     // Verify hook method exists
     uint64_t hookMethodAddr = 0;
@@ -541,55 +601,229 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         setError("hook_method_not_found:" + std::string(hookMethod));
         return 0;
     }
+    FVM_LOG("hookMethod (%s%s) = 0x%llX", hookMethod, hookDesc, (unsigned long long)hookMethodAddr);
 
-    // 7. Create Symbol* for hook class, method name, and descriptor in target process
-    uint64_t hookClassSymbol = allocateSymbolInTarget(hookClassInternal);
-    uint64_t hookMethodSymbol = allocateSymbolInTarget(std::string(hookMethod));
-    uint64_t hookDescSymbol = allocateSymbolInTarget(std::string(hookDesc));
-
-    if (hookClassSymbol == 0 || hookMethodSymbol == 0 || hookDescSymbol == 0) {
-        setError("failed_to_allocate_symbols_in_target");
-        return 0;
+    // 7. Read target method's return type from its signature descriptor
+    std::string targetReturnDesc = "V"; // default void
+    {
+        int64_t sigIdxOff = structOffset("ConstMethod", "_signature_index");
+        if (sigIdxOff >= 0) {
+            uint16_t sigIndex = 0;
+            if (readRemoteU16(proc, origConstMethodAddr + (uint64_t)sigIdxOff, &sigIndex) && sigIndex > 0) {
+                int64_t cpHdrSize0 = typeSize("ConstantPool");
+                if (cpHdrSize0 < 0) cpHdrSize0 = 0x138;
+                uint64_t sigEntryAddr = origConstPoolAddr + (uint64_t)cpHdrSize0 + (uint64_t)sigIndex * 8;
+                uint64_t sigSymbol = 0;
+                if (readRemotePointer(proc, sigEntryAddr, &sigSymbol) && sigSymbol != 0) {
+                    std::string fullSig;
+                    if (readSymbolBody(proc, sigSymbol, &fullSig)) {
+                        size_t closeParen = fullSig.find(')');
+                        if (closeParen != std::string::npos && closeParen + 1 < fullSig.size()) {
+                            targetReturnDesc = fullSig.substr(closeParen + 1);
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    // 8. Build expanded constant pool
-    //
-    // We need these additional entries for the FvmCallback flow:
-    //   +0  Utf8: hookClass name (Symbol*)
-    //   +1  Utf8: hookMethod name (Symbol*)
-    //   +2  Utf8: hookDesc (Symbol*)
-    //   +3  Class: hookKlass (resolved Klass*)
-    //   +4  NameAndType: hookMethod name + desc
-    //   +5  Methodref: hook method (resolved Method*)
-    //   +6  Class: FvmCallback (resolved Klass*)
-    //   +7  Methodref: FvmCallback.<init>()V (resolved Method*)
-    //   +8  Methodref: FvmCallback.isCancelled()Z (resolved Method*)
-    //   +9  Methodref: FvmCallback.getReturnValue()Ljava/lang/Object; (resolved Method*)
+    // Determine return type category and unboxing info
+    struct UnboxInfo {
+        bool needsUnbox;
+        std::string wrapperClass;
+        std::string unboxMethod;
+        std::string unboxDesc;
+        uint8_t returnOp;
+    };
+    UnboxInfo unbox = { false, "", "", "", 0xB0 };
 
-    // Find FvmCallback class and methods in target JVM
+    if (targetReturnDesc == "V") {
+        unbox.returnOp = 0xB1;
+    } else if (targetReturnDesc == "Z") {
+        unbox = { true, "java/lang/Boolean",   "booleanValue", "()Z", 0xAC };
+    } else if (targetReturnDesc == "B") {
+        unbox = { true, "java/lang/Byte",      "byteValue",    "()B", 0xAC };
+    } else if (targetReturnDesc == "C") {
+        unbox = { true, "java/lang/Character", "charValue",    "()C", 0xAC };
+    } else if (targetReturnDesc == "S") {
+        unbox = { true, "java/lang/Short",     "shortValue",   "()S", 0xAC };
+    } else if (targetReturnDesc == "I") {
+        unbox = { true, "java/lang/Integer",   "intValue",     "()I", 0xAC };
+    } else if (targetReturnDesc == "F") {
+        unbox = { true, "java/lang/Float",     "floatValue",   "()F", 0xAE };
+    } else if (targetReturnDesc == "J") {
+        unbox = { true, "java/lang/Long",      "longValue",    "()J", 0xAD };
+    } else if (targetReturnDesc == "D") {
+        unbox = { true, "java/lang/Double",    "doubleValue",  "()D", 0xAF };
+    } else {
+        unbox.returnOp = 0xB0; // areturn for Object/array
+    }
+
+    // Find unbox class + method if needed
+    uint64_t unboxKlassAddr = 0;
+    uint64_t unboxMethodAddr = 0;
+    if (unbox.needsUnbox) {
+        if (!findInstanceKlassByName(unbox.wrapperClass, &unboxKlassAddr)) {
+            setError("unbox_class_not_loaded:" + unbox.wrapperClass); return 0;
+        }
+        if (!findMethodInKlass(unboxKlassAddr, unbox.unboxMethod.c_str(),
+                               unbox.unboxDesc.c_str(), &unboxMethodAddr)) {
+            setError("unbox_method_not_found:" + unbox.unboxMethod); return 0;
+        }
+    }
+
+    FVM_LOG("targetReturnDesc=%s, needsUnbox=%d, returnOp=0x%02X",
+            targetReturnDesc.c_str(), (int)unbox.needsUnbox, unbox.returnOp);
+
+    // Find FvmCallback class and methods
     uint64_t cbKlassAddr = 0;
     if (!findInstanceKlassByName("forgevm/transform/FvmCallback", &cbKlassAddr)) {
-        setError("FvmCallback_class_not_loaded");
-        return 0;
+        setError("FvmCallback_class_not_loaded"); return 0;
     }
     uint64_t cbInitMethodAddr = 0;
     if (!findMethodInKlass(cbKlassAddr, "<init>", "(Ljava/lang/Object;)V", &cbInitMethodAddr)) {
-        setError("FvmCallback_init_not_found");
-        return 0;
+        setError("FvmCallback_init_not_found"); return 0;
     }
     uint64_t cbIsCancelledAddr = 0;
     if (!findMethodInKlass(cbKlassAddr, "isCancelled", "()Z", &cbIsCancelledAddr)) {
-        setError("FvmCallback_isCancelled_not_found");
-        return 0;
+        setError("FvmCallback_isCancelled_not_found"); return 0;
     }
     uint64_t cbGetReturnAddr = 0;
     if (!findMethodInKlass(cbKlassAddr, "getReturnValue", "()Ljava/lang/Object;", &cbGetReturnAddr)) {
-        setError("FvmCallback_getReturnValue_not_found");
-        return 0;
+        setError("FvmCallback_getReturnValue_not_found"); return 0;
     }
 
-    uint32_t newPoolLength = poolLength + 10;
-    size_t newPoolByteSize = poolByteSize + 10 * 8;
+    // 8. Read EXISTING interned Symbol* pointers from target JVM metadata
+    //
+    // CRITICAL: HotSpot resolves methods by comparing Symbol* POINTERS, not string content.
+    // We must use the same interned Symbol* that the JVM already has, NOT freshly allocated copies.
+    // Read them from the Klass/Method objects we already located.
+
+    // Hook class/method/descriptor symbols
+    uint64_t symHookClass = readKlassNameSymbol(hookKlassAddr);
+    uint64_t symHookMethod = 0, symHookDesc = 0;
+    if (!readMethodSymbols(hookMethodAddr, &symHookMethod, &symHookDesc)) {
+        setError("cannot_read_hook_method_symbols"); return 0;
+    }
+
+    // FvmCallback class name symbol
+    uint64_t symCbClass = readKlassNameSymbol(cbKlassAddr);
+
+    // FvmCallback.<init> name and descriptor symbols
+    uint64_t symInit = 0, symInitDesc = 0;
+    if (!readMethodSymbols(cbInitMethodAddr, &symInit, &symInitDesc)) {
+        setError("cannot_read_cbInit_symbols"); return 0;
+    }
+
+    // FvmCallback.isCancelled name and descriptor symbols
+    uint64_t symIsCancelled = 0, symIsCancelledD = 0;
+    if (!readMethodSymbols(cbIsCancelledAddr, &symIsCancelled, &symIsCancelledD)) {
+        setError("cannot_read_cbIsCancelled_symbols"); return 0;
+    }
+
+    // FvmCallback.getReturnValue name and descriptor symbols
+    uint64_t symGetRetVal = 0, symGetRetValD = 0;
+    if (!readMethodSymbols(cbGetReturnAddr, &symGetRetVal, &symGetRetValD)) {
+        setError("cannot_read_cbGetReturnValue_symbols"); return 0;
+    }
+
+    FVM_LOG("interned symbols: hookClass=0x%llX hookMethod=0x%llX hookDesc=0x%llX",
+            (unsigned long long)symHookClass, (unsigned long long)symHookMethod, (unsigned long long)symHookDesc);
+    FVM_LOG("  cbClass=0x%llX init=0x%llX initDesc=0x%llX",
+            (unsigned long long)symCbClass, (unsigned long long)symInit, (unsigned long long)symInitDesc);
+    FVM_LOG("  isCancelled=0x%llX isCancelledD=0x%llX getRetVal=0x%llX getRetValD=0x%llX",
+            (unsigned long long)symIsCancelled, (unsigned long long)symIsCancelledD,
+            (unsigned long long)symGetRetVal, (unsigned long long)symGetRetValD);
+
+    if (symHookClass == 0 || symHookMethod == 0 || symHookDesc == 0 ||
+        symCbClass == 0 || symInit == 0 || symInitDesc == 0 ||
+        symIsCancelled == 0 || symIsCancelledD == 0 ||
+        symGetRetVal == 0 || symGetRetValD == 0) {
+        setError("failed_to_read_interned_symbols"); return 0;
+    }
+
+    uint64_t symUnboxClass = 0, symUnboxMethod = 0, symUnboxDesc = 0;
+    if (unbox.needsUnbox) {
+        symUnboxClass = readKlassNameSymbol(unboxKlassAddr);
+        if (!readMethodSymbols(unboxMethodAddr, &symUnboxMethod, &symUnboxDesc)) {
+            setError("cannot_read_unbox_method_symbols"); return 0;
+        }
+        if (symUnboxClass == 0 || symUnboxMethod == 0 || symUnboxDesc == 0) {
+            setError("failed_to_read_unbox_symbols"); return 0;
+        }
+        FVM_LOG("unbox symbols: class=0x%llX method=0x%llX desc=0x%llX",
+                (unsigned long long)symUnboxClass, (unsigned long long)symUnboxMethod, (unsigned long long)symUnboxDesc);
+    }
+
+    // 9. Expand _resolved_klasses (needed for 'new' and 'checkcast' to find Klass*)
+    int64_t resolvedKlassesOff = structOffset("ConstantPool", "_resolved_klasses");
+    int numNewClasses = unbox.needsUnbox ? 3 : 2;
+    int hookClassRKIdx = 0, cbClassRKIdx = 0, unboxClassRKIdx = 0;
+    uint64_t newRKAddr = 0;
+
+    if (resolvedKlassesOff >= 0) {
+        uint64_t origRK = 0;
+        memcpy(&origRK, origPoolBytes.data() + resolvedKlassesOff, 8);
+
+        if (origRK != 0) {
+            int64_t rkLenOff = 0, rkDataOff = 8;
+            { int64_t v = structOffset("Array<Klass*>", "_length"); if (v >= 0) rkLenOff = v; }
+            { int64_t v = structOffset("Array<Klass*>", "_data");   if (v >= 0) rkDataOff = v; }
+
+            int32_t origRKLen = 0;
+            readRemoteI32(proc, origRK + (uint64_t)rkLenOff, &origRKLen);
+
+            hookClassRKIdx = origRKLen;
+            cbClassRKIdx   = origRKLen + 1;
+            if (unbox.needsUnbox) unboxClassRKIdx = origRKLen + 2;
+
+            int32_t newRKLen = origRKLen + numNewClasses;
+            size_t origRKSize = (size_t)rkDataOff + origRKLen * 8;
+            size_t newRKSize  = (size_t)rkDataOff + newRKLen * 8;
+            newRKSize = (newRKSize + 7) & ~7;
+
+            std::vector<uint8_t> origRKBytes(origRKSize);
+            readRemoteMem(proc, origRK, origRKBytes.data(), origRKSize);
+
+            std::vector<uint8_t> newRKBytes(newRKSize, 0);
+            memcpy(newRKBytes.data(), origRKBytes.data(), origRKSize);
+            memcpy(newRKBytes.data() + rkLenOff, &newRKLen, 4);
+
+            uint64_t* rkData = (uint64_t*)(newRKBytes.data() + rkDataOff);
+            rkData[hookClassRKIdx] = hookKlassAddr;
+            rkData[cbClassRKIdx]   = cbKlassAddr;
+            if (unbox.needsUnbox) rkData[unboxClassRKIdx] = unboxKlassAddr;
+
+            newRKAddr = (uint64_t)VirtualAllocEx(proc, NULL, newRKSize,
+                                                  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (newRKAddr == 0) { setError("VirtualAllocEx_resolved_klasses_failed"); return 0; }
+            writeRemoteMem(proc, newRKAddr, newRKBytes.data(), newRKSize);
+            FVM_LOG("resolved_klasses: origLen=%d, newLen=%d, newAddr=0x%llX",
+                    origRKLen, newRKLen, (unsigned long long)newRKAddr);
+            FVM_LOG("  hookClassRKIdx=%d (Klass=0x%llX), cbClassRKIdx=%d (Klass=0x%llX)",
+                    hookClassRKIdx, (unsigned long long)hookKlassAddr,
+                    cbClassRKIdx, (unsigned long long)cbKlassAddr);
+        }
+    }
+
+    // 10. Build expanded constant pool (proper symbolic format for JDK 17+)
+    //
+    // CP layout (P = poolLength):
+    //   P+0..P+9:   Utf8 entries (tag=1, slot=Symbol*)
+    //   P+10,P+11:  Class entries (tag=7, slot=(name_idx<<16)|resolved_klass_idx)
+    //   P+12..P+15: NameAndType entries (tag=12, slot=(desc_idx<<16)|name_idx)
+    //   P+16..P+19: Methodref entries (tag=10, slot=(nat_idx<<16)|class_idx)
+    //   [If unbox]: P+20..P+22 Utf8, P+23 Class, P+24 NameAndType, P+25 Methodref
+    //
+    // HotSpot extract helpers:
+    //   extract_low_short(val)  = val & 0xFFFF        (low 16 bits)
+    //   extract_high_short(val) = (val >> 16) & 0xFFFF (high 16 bits)
+
+    uint32_t baseEntries = 20;
+    uint32_t unboxEntries = unbox.needsUnbox ? 6 : 0;
+    uint32_t totalNewEntries = baseEntries + unboxEntries;
+    uint32_t newPoolLength = poolLength + totalNewEntries;
+    size_t newPoolByteSize = poolByteSize + totalNewEntries * 8;
 
     std::vector<uint8_t> newPoolBytes(newPoolByteSize, 0);
     memcpy(newPoolBytes.data(), origPoolBytes.data(), poolByteSize);
@@ -600,30 +834,70 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         memcpy(newPoolBytes.data() + lengthOff, &newLen32, 4);
     }
 
+    // Update _resolved_klasses pointer in pool
+    if (resolvedKlassesOff >= 0 && newRKAddr != 0) {
+        memcpy(newPoolBytes.data() + resolvedKlassesOff, &newRKAddr, 8);
+    }
+
     int64_t cpHeaderSize = typeSize("ConstantPool");
     if (cpHeaderSize < 0) cpHeaderSize = 0x138;
 
     uint64_t* newSlots = (uint64_t*)(newPoolBytes.data() + cpHeaderSize);
+    uint32_t P = poolLength;
 
-    // +0..+2: Utf8 symbols for hook
-    newSlots[poolLength + 0] = hookClassSymbol;
-    newSlots[poolLength + 1] = hookMethodSymbol;
-    newSlots[poolLength + 2] = hookDescSymbol;
-    // +3: Class -> hook Klass*
-    newSlots[poolLength + 3] = hookKlassAddr;
-    // +4: NameAndType (packed)
-    uint32_t natPacked = ((uint32_t)(poolLength + 1) << 16) | (uint32_t)(poolLength + 2);
-    newSlots[poolLength + 4] = (uint64_t)natPacked;
-    // +5: Methodref -> hook Method* (resolved)
-    newSlots[poolLength + 5] = hookMethodAddr;
-    // +6: Class -> FvmCallback Klass*
-    newSlots[poolLength + 6] = cbKlassAddr;
-    // +7: Methodref -> FvmCallback.<init> (resolved)
-    newSlots[poolLength + 7] = cbInitMethodAddr;
-    // +8: Methodref -> FvmCallback.isCancelled (resolved)
-    newSlots[poolLength + 8] = cbIsCancelledAddr;
-    // +9: Methodref -> FvmCallback.getReturnValue (resolved)
-    newSlots[poolLength + 9] = cbGetReturnAddr;
+    // Utf8 entries (tag=1, slot=Symbol*)
+    newSlots[P+0]  = symHookClass;
+    newSlots[P+1]  = symHookMethod;
+    newSlots[P+2]  = symHookDesc;
+    newSlots[P+3]  = symCbClass;
+    newSlots[P+4]  = symInit;
+    newSlots[P+5]  = symInitDesc;
+    newSlots[P+6]  = symIsCancelled;
+    newSlots[P+7]  = symIsCancelledD;
+    newSlots[P+8]  = symGetRetVal;
+    newSlots[P+9]  = symGetRetValD;
+
+    // Class entries (tag=7): slot = (name_utf8_idx << 16) | resolved_klass_idx
+    // HotSpot: klass_slot_at() → high=name_index, low=resolved_klass_index
+    newSlots[P+10] = (uint64_t)(((uint32_t)(P+0) << 16) | (uint32_t)hookClassRKIdx);
+    newSlots[P+11] = (uint64_t)(((uint32_t)(P+3) << 16) | (uint32_t)cbClassRKIdx);
+
+    // NameAndType entries (tag=12): slot = (desc_idx << 16) | name_idx
+    // HotSpot: name_ref_index_at() = extract_low_short = name_idx
+    //          signature_ref_index_at() = extract_high_short = desc_idx
+    newSlots[P+12] = (uint64_t)(((uint32_t)(P+2) << 16) | (uint32_t)(P+1));   // hookDesc<<16 | hookMethod
+    newSlots[P+13] = (uint64_t)(((uint32_t)(P+5) << 16) | (uint32_t)(P+4));   // (Object)V<<16 | <init>
+    newSlots[P+14] = (uint64_t)(((uint32_t)(P+7) << 16) | (uint32_t)(P+6));   // ()Z<<16 | isCancelled
+    newSlots[P+15] = (uint64_t)(((uint32_t)(P+9) << 16) | (uint32_t)(P+8));   // ()Object<<16 | getReturnValue
+
+    // Methodref entries (tag=10): slot = (nat_idx << 16) | class_idx
+    // HotSpot: klass_ref_index_at() = extract_low_short = class_idx
+    //          name_and_type_ref_index_at() = extract_high_short = nat_idx
+    newSlots[P+16] = (uint64_t)(((uint32_t)(P+12) << 16) | (uint32_t)(P+10)); // hook invokestatic
+    newSlots[P+17] = (uint64_t)(((uint32_t)(P+13) << 16) | (uint32_t)(P+11)); // FvmCallback.<init>
+    newSlots[P+18] = (uint64_t)(((uint32_t)(P+14) << 16) | (uint32_t)(P+11)); // FvmCallback.isCancelled
+    newSlots[P+19] = (uint64_t)(((uint32_t)(P+15) << 16) | (uint32_t)(P+11)); // FvmCallback.getReturnValue
+
+    if (unbox.needsUnbox) {
+        newSlots[P+20] = symUnboxClass;
+        newSlots[P+21] = symUnboxMethod;
+        newSlots[P+22] = symUnboxDesc;
+        // Class: (name_idx << 16) | resolved_klass_idx
+        newSlots[P+23] = (uint64_t)(((uint32_t)(P+20) << 16) | (uint32_t)unboxClassRKIdx);
+        // NameAndType: (desc_idx << 16) | name_idx
+        newSlots[P+24] = (uint64_t)(((uint32_t)(P+22) << 16) | (uint32_t)(P+21));
+        // Methodref: (nat_idx << 16) | class_idx
+        newSlots[P+25] = (uint64_t)(((uint32_t)(P+24) << 16) | (uint32_t)(P+23));
+    }
+
+    FVM_LOG("new CP entries (P=%u, newPoolLength=%u):", P, newPoolLength);
+    FVM_LOG("  Class[P+10]=0x%llX Class[P+11]=0x%llX", (unsigned long long)newSlots[P+10], (unsigned long long)newSlots[P+11]);
+    FVM_LOG("  NAT[P+12]=0x%llX NAT[P+13]=0x%llX NAT[P+14]=0x%llX NAT[P+15]=0x%llX",
+            (unsigned long long)newSlots[P+12], (unsigned long long)newSlots[P+13],
+            (unsigned long long)newSlots[P+14], (unsigned long long)newSlots[P+15]);
+    FVM_LOG("  MRef[P+16]=0x%llX MRef[P+17]=0x%llX MRef[P+18]=0x%llX MRef[P+19]=0x%llX",
+            (unsigned long long)newSlots[P+16], (unsigned long long)newSlots[P+17],
+            (unsigned long long)newSlots[P+18], (unsigned long long)newSlots[P+19]);
 
     // Update tags array
     int64_t tagsOff = structOffset("ConstantPool", "_tags");
@@ -655,17 +929,18 @@ int applyTransform(const char* className, const char* methodName, const char* pa
                 int32_t newTagLen = (int32_t)newPoolLength;
                 memcpy(newTags.data() + tagArrayLenOff, &newTagLen, 4);
 
-                uint8_t* tagData = newTags.data() + tagArrayDataOff;
-                tagData[poolLength + 0] = 100; // Utf8
-                tagData[poolLength + 1] = 100; // Utf8
-                tagData[poolLength + 2] = 100; // Utf8
-                tagData[poolLength + 3] = 7;   // Class
-                tagData[poolLength + 4] = 12;  // NameAndType
-                tagData[poolLength + 5] = 10;  // Methodref
-                tagData[poolLength + 6] = 7;   // Class (FvmCallback)
-                tagData[poolLength + 7] = 10;  // Methodref (<init>)
-                tagData[poolLength + 8] = 10;  // Methodref (isCancelled)
-                tagData[poolLength + 9] = 10;  // Methodref (getReturnValue)
+                uint8_t* td = newTags.data() + tagArrayDataOff;
+                for (int i = 0; i < 10; i++) td[P+i] = 1;   // Utf8
+                td[P+10] = 7;  td[P+11] = 7;                 // Class (pre-resolved)
+                td[P+12] = 12; td[P+13] = 12; td[P+14] = 12; td[P+15] = 12; // NameAndType
+                td[P+16] = 10; td[P+17] = 10; td[P+18] = 10; td[P+19] = 10; // Methodref
+
+                if (unbox.needsUnbox) {
+                    td[P+20] = 1;  td[P+21] = 1;  td[P+22] = 1;  // Utf8
+                    td[P+23] = 7;  // Class
+                    td[P+24] = 12; // NameAndType
+                    td[P+25] = 10; // Methodref
+                }
 
                 writeRemoteMem(proc, newTagsAddr, newTags.data(), newTagSize);
                 memcpy(newPoolBytes.data() + tagsOff, &newTagsAddr, 8);
@@ -673,81 +948,175 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         }
     }
 
-    // 9. Build new bytecode
+    // 11. Expand ConstantPoolCache
     //
-    // CP indices for bytecode:
-    uint16_t hookCpIndex = (uint16_t)(poolLength + 5);     // hook method
-    uint16_t cbClassIdx  = (uint16_t)(poolLength + 6);     // FvmCallback class
-    uint16_t cbInitIdx   = (uint16_t)(poolLength + 7);     // FvmCallback.<init>
-    uint16_t cbCancelIdx = (uint16_t)(poolLength + 8);     // FvmCallback.isCancelled
-    uint16_t cbRetValIdx = (uint16_t)(poolLength + 9);     // FvmCallback.getReturnValue
-    //
-    // Injected sequence (HEAD):
-    //   new FvmCallback                    ; 3 bytes
-    //   dup                                ; 1 byte
-    //   invokespecial FvmCallback.<init>    ; 3 bytes
-    //   dup                                ; 1 byte  (keep ref for isCancelled check)
-    //   invokestatic hook.onXxx(FvmCallback) ; 3 bytes
-    //   invokevirtual FvmCallback.isCancelled ; 3 bytes
-    //   ifeq CONTINUE                      ; 3 bytes  (jump offset to skip return block)
-    //   invokevirtual FvmCallback.getReturnValue ; 3 bytes
-    //   areturn (or pop+return for void)    ; 1-2 bytes
-    //   CONTINUE:
-    //   ... original bytecode ...
+    // In JDK 17+, invoke bytecodes use CP cache indices (not CP indices).
+    // We must add cache entries for our new Methodref entries.
+    // Unresolved entries: _indices = cp_index, _f1 = 0, _f2 = 0, _flags = 0.
+    // The JVM will resolve them on first use from our symbolic CP entries.
 
-    // Helper to emit 2-byte big-endian index
+    int64_t cacheOff = structOffset("ConstantPool", "_cache");
+    int32_t origCacheLen = 0;
+    int numNewCacheEntries = unbox.needsUnbox ? 5 : 4;
+    int hookCacheIdx = 0, initCacheIdx = 0, cancelCacheIdx = 0, retValCacheIdx = 0, unboxCacheIdx = 0;
+    uint64_t newCacheAddr = 0;
+    int64_t cacheCpOff = -1;
+    std::vector<uint8_t> newCacheBytes;
+
+    if (cacheOff >= 0) {
+        uint64_t origCacheAddr = 0;
+        memcpy(&origCacheAddr, origPoolBytes.data() + cacheOff, 8);
+
+        if (origCacheAddr != 0) {
+            int64_t cacheHdrSize = typeSize("ConstantPoolCache");
+            if (cacheHdrSize < 0) cacheHdrSize = 16;
+            int64_t cacheLenOff = structOffset("ConstantPoolCache", "_length");
+            if (cacheLenOff < 0) cacheLenOff = 0;
+            int64_t cacheEntrySize = typeSize("ConstantPoolCacheEntry");
+            if (cacheEntrySize < 0) cacheEntrySize = 32;
+            cacheCpOff = structOffset("ConstantPoolCache", "_constant_pool");
+            if (cacheCpOff < 0) cacheCpOff = 8;
+
+            readRemoteI32(proc, origCacheAddr + (uint64_t)cacheLenOff, &origCacheLen);
+
+            hookCacheIdx   = origCacheLen;
+            initCacheIdx   = origCacheLen + 1;
+            cancelCacheIdx = origCacheLen + 2;
+            retValCacheIdx = origCacheLen + 3;
+            if (unbox.needsUnbox) unboxCacheIdx = origCacheLen + 4;
+
+            int32_t newCacheLen = origCacheLen + numNewCacheEntries;
+            size_t origCacheSize = (size_t)cacheHdrSize + origCacheLen * cacheEntrySize;
+            size_t newCacheSize  = (size_t)cacheHdrSize + newCacheLen * cacheEntrySize;
+
+            std::vector<uint8_t> origCacheBytes(origCacheSize);
+            readRemoteMem(proc, origCacheAddr, origCacheBytes.data(), origCacheSize);
+
+            newCacheBytes.resize(newCacheSize, 0);
+            memcpy(newCacheBytes.data(), origCacheBytes.data(), origCacheSize);
+            memcpy(newCacheBytes.data() + cacheLenOff, &newCacheLen, 4);
+
+            // Initialize new cache entries: _indices = CP index of Methodref
+            int64_t indicesFieldOff = structOffset("ConstantPoolCacheEntry", "_indices");
+            if (indicesFieldOff < 0) indicesFieldOff = 0;
+
+            int cpIdxTable[] = { (int)(P+16), (int)(P+17), (int)(P+18), (int)(P+19), (int)(P+25) };
+            for (int i = 0; i < numNewCacheEntries; i++) {
+                uint8_t* entry = newCacheBytes.data() + cacheHdrSize + (origCacheLen + i) * cacheEntrySize;
+                int32_t cpIdx = cpIdxTable[i];
+                memcpy(entry + indicesFieldOff, &cpIdx, 4);
+            }
+
+            newCacheAddr = (uint64_t)VirtualAllocEx(proc, NULL, newCacheSize,
+                                                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (newCacheAddr == 0) { setError("VirtualAllocEx_cache_failed"); return 0; }
+
+            // Update new pool's _cache pointer (will fix cache's back-pointer after pool allocation)
+            memcpy(newPoolBytes.data() + cacheOff, &newCacheAddr, 8);
+
+            FVM_LOG("CPCache: origLen=%d, newLen=%d, entrySize=%lld, newAddr=0x%llX",
+                    origCacheLen, newCacheLen, (long long)cacheEntrySize, (unsigned long long)newCacheAddr);
+            for (int i = 0; i < numNewCacheEntries; i++) {
+                FVM_LOG("  cache[%d] -> _indices CP idx = %d", origCacheLen + i, cpIdxTable[i]);
+            }
+        }
+    }
+
+    // 12. Build new bytecode
+    //
+    // IMPORTANT: invoke operands = CP CACHE indices (not CP indices)
+    //            new/checkcast operands = CP indices
+    uint16_t cbClassCpIdx     = (uint16_t)(P + 11);           // FvmCallback class (for 'new')
+    uint16_t hookCacheIdx16   = (uint16_t)hookCacheIdx;        // invokestatic hook
+    uint16_t initCacheIdx16   = (uint16_t)initCacheIdx;        // invokespecial <init>
+    uint16_t cancelCacheIdx16 = (uint16_t)cancelCacheIdx;      // invokevirtual isCancelled
+    uint16_t retValCacheIdx16 = (uint16_t)retValCacheIdx;      // invokevirtual getReturnValue
+    uint16_t unboxClassCpIdx  = unbox.needsUnbox ? (uint16_t)(P + 23) : 0; // wrapper Class (for checkcast)
+    uint16_t unboxCacheIdx16  = unbox.needsUnbox ? (uint16_t)unboxCacheIdx : 0;
+
+    FVM_LOG("bytecode operand indices:");
+    FVM_LOG("  new FvmCallback CP idx = %u (big-endian)", (unsigned)cbClassCpIdx);
+    FVM_LOG("  invokespecial <init>     cache idx = %u (native-endian)", (unsigned)initCacheIdx16);
+    FVM_LOG("  invokestatic hook        cache idx = %u (native-endian)", (unsigned)hookCacheIdx16);
+    FVM_LOG("  invokevirtual isCancelled cache idx = %u (native-endian)", (unsigned)cancelCacheIdx16);
+    FVM_LOG("  invokevirtual getRetVal   cache idx = %u (native-endian)", (unsigned)retValCacheIdx16);
+    if (unbox.needsUnbox) {
+        FVM_LOG("  checkcast unbox CP idx = %u, invokevirtual unbox cache idx = %u",
+                (unsigned)unboxClassCpIdx, (unsigned)unboxCacheIdx16);
+    }
+
+    // Big-endian: for CP indices used by new/checkcast/ifeq (standard Java bytecode format)
     auto emitIdx = [](std::vector<uint8_t>& bc, uint16_t idx) {
         bc.push_back((uint8_t)(idx >> 8));
         bc.push_back((uint8_t)(idx & 0xFF));
     };
 
-    // Detect original return opcode for void vs non-void
-    uint8_t origReturnOp = 0xB1; // default void
-    if (!origBytecode.empty()) {
-        origReturnOp = origBytecode.back();
-        if (origReturnOp < 0xAC || origReturnOp > 0xB1) origReturnOp = 0xB0; // areturn
+    // Native byte order (little-endian on x86): for CP cache indices used by
+    // invoke bytecodes (invokestatic/invokespecial/invokevirtual).
+    // HotSpot's bytecode rewriter converts invoke operands from big-endian CP indices
+    // to native-endian cache indices. Since our bytecodes bypass the rewriter,
+    // we must emit cache indices in native byte order directly.
+    auto emitNativeIdx = [](std::vector<uint8_t>& bc, uint16_t idx) {
+        bc.push_back((uint8_t)(idx & 0xFF));        // low byte first
+        bc.push_back((uint8_t)((idx >> 8) & 0xFF)); // high byte second
+    };
+
+    // Build cancel branch return sequence
+    std::vector<uint8_t> cancelReturn;
+    if (unbox.returnOp == 0xB1) {
+        // void: pop callback ref and return
+        cancelReturn.push_back(0x57); // pop
+        cancelReturn.push_back(0xB1); // return
+    } else {
+        // invokevirtual getReturnValue (cache index, native byte order) → [Object]
+        cancelReturn.push_back(0xB6);
+        cancelReturn.push_back((uint8_t)(retValCacheIdx16 & 0xFF));
+        cancelReturn.push_back((uint8_t)((retValCacheIdx16 >> 8) & 0xFF));
+
+        if (unbox.needsUnbox) {
+            // checkcast WrapperClass (CP index, big-endian) → [WrapperClass]
+            cancelReturn.push_back(0xC0);
+            cancelReturn.push_back((uint8_t)(unboxClassCpIdx >> 8));
+            cancelReturn.push_back((uint8_t)(unboxClassCpIdx & 0xFF));
+            // invokevirtual unboxMethod (cache index, native byte order) → [primitive]
+            cancelReturn.push_back(0xB6);
+            cancelReturn.push_back((uint8_t)(unboxCacheIdx16 & 0xFF));
+            cancelReturn.push_back((uint8_t)((unboxCacheIdx16 >> 8) & 0xFF));
+        }
+
+        cancelReturn.push_back(unbox.returnOp);
     }
 
-    // Size of the return block after ifeq:
-    //   getReturnValue(3) + areturn(1) = 4  OR  pop(1) + return(1) = 2 (void)
-    int returnBlockSize = (origReturnOp == 0xB1) ? 2 : 4;
-    // ifeq offset = 3 (ifeq instruction size) + returnBlockSize
-    int16_t ifeqOffset = (int16_t)(3 + returnBlockSize);
+    int16_t ifeqOffset = (int16_t)(3 + (int)cancelReturn.size());
 
     std::vector<uint8_t> newBytecode;
     std::string injectAtStr(injectAt);
 
     auto emitCallbackPrologue = [&](std::vector<uint8_t>& bc) {
-        bc.push_back(0xBB); emitIdx(bc, cbClassIdx);       // new FvmCallback
-        bc.push_back(0x59);                                  // dup
-        bc.push_back(0x2A);                                  // aload_0 (push 'this')
-        bc.push_back(0xB7); emitIdx(bc, cbInitIdx);         // invokespecial <init>(Object)
-        bc.push_back(0x59);                                  // dup (keep ref)
-        bc.push_back(0xB8); emitIdx(bc, hookCpIndex);       // invokestatic hook(FvmCallback)
-        bc.push_back(0xB6); emitIdx(bc, cbCancelIdx);       // invokevirtual isCancelled
-        bc.push_back(0x99);                                  // ifeq
+        // Stack trace:
+        bc.push_back(0xBB); emitIdx(bc, cbClassCpIdx);           // new FvmCallback (CP idx, big-endian) → [cbU]
+        bc.push_back(0x59);                                        // dup → [cbU, cbU]
+        bc.push_back(0x2A);                                        // aload_0 → [cbU, cbU, this]
+        bc.push_back(0xB7); emitNativeIdx(bc, initCacheIdx16);    // invokespecial <init> (cache idx, native) → [cb]
+        bc.push_back(0x59);                                        // dup → [cb, cb]
+        bc.push_back(0x59);                                        // dup → [cb, cb, cb]
+        bc.push_back(0xB8); emitNativeIdx(bc, hookCacheIdx16);    // invokestatic hook (cache idx, native) → [cb, cb]
+        bc.push_back(0xB6); emitNativeIdx(bc, cancelCacheIdx16);  // invokevirtual isCancelled (cache idx, native) → [cb, int]
+        bc.push_back(0x99);                                        // ifeq (branch offset, big-endian)
         bc.push_back((uint8_t)(ifeqOffset >> 8));
         bc.push_back((uint8_t)(ifeqOffset & 0xFF));
-        // Return block:
-        if (origReturnOp == 0xB1) {
-            // void: just pop callback ref and return
-            bc.push_back(0x57); // pop (the callback ref left on stack)
-            bc.push_back(0xB1); // return
-        } else {
-            // non-void: get return value and areturn
-            bc.push_back(0xB6); emitIdx(bc, cbRetValIdx);   // invokevirtual getReturnValue
-            bc.push_back(0xB0);                              // areturn
-        }
-        // CONTINUE: callback ref is still on stack from the dup, pop it
-        bc.push_back(0x57); // pop
+        // Cancel branch: stack = [cb]
+        bc.insert(bc.end(), cancelReturn.begin(), cancelReturn.end());
+        // CONTINUE: stack = [cb], pop it
+        bc.push_back(0x57); // pop → []
     };
 
     if (injectAtStr == "HEAD") {
-        newBytecode.reserve(origBytecode.size() + 30);
+        newBytecode.reserve(origBytecode.size() + 50);
         emitCallbackPrologue(newBytecode);
         newBytecode.insert(newBytecode.end(), origBytecode.begin(), origBytecode.end());
     } else if (injectAtStr == "RETURN") {
-        newBytecode.reserve(origBytecode.size() + 30);
+        newBytecode.reserve(origBytecode.size() + 50);
         for (size_t i = 0; i < origBytecode.size(); i++) {
             uint8_t op = origBytecode[i];
             if (op >= 0xAC && op <= 0xB1) {
@@ -760,7 +1129,11 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         return 0;
     }
 
-    // 10. Build new ConstMethod with updated bytecode
+    FVM_LOG("new bytecode built: %zu bytes (orig %u, delta +%zu)",
+            newBytecode.size(), codeSize, newBytecode.size() - codeSize);
+    FVM_LOG_HEX("new bytecode", newBytecode.data(), newBytecode.size());
+
+    // 13. Build new ConstMethod with updated bytecode
     // Read entire original ConstMethod
     int64_t constMethodTypeSize = typeSize("ConstMethod");
     if (constMethodTypeSize < 0) {
@@ -817,13 +1190,33 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         memcpy(newConstMethodBytes.data() + codeSizeOff, &newCodeSize, 2);
     }
 
+    // Update _max_stack: our prologue needs at least 4 stack slots
+    // (new, dup, dup, dup = 3 copies + this = 4 max depth)
+    // Ensure max_stack >= max(original, 4)
+    int64_t maxStackOff = structOffset("ConstMethod", "_max_stack");
+    if (maxStackOff >= 0) {
+        uint16_t origMaxStack = 0;
+        memcpy(&origMaxStack, newConstMethodBytes.data() + maxStackOff, 2);
+        uint16_t needed = 4; // our prologue peak: [cb, cb, cb, this]
+        if (origMaxStack < needed) {
+            FVM_LOG("max_stack: %u -> %u (bumped)", origMaxStack, needed);
+            memcpy(newConstMethodBytes.data() + maxStackOff, &needed, 2);
+        } else {
+            FVM_LOG("max_stack: %u (unchanged)", origMaxStack);
+        }
+    }
+
     // Update _constMethod_size if present
     if (cmSizeOff >= 0) {
         int32_t newCmWords = (int32_t)((newConstMethodSize + 7) / 8);
         memcpy(newConstMethodBytes.data() + cmSizeOff, &newCmWords, 4);
     }
 
-    // 11. Allocate and write new ConstantPool + ConstMethod in target process
+    // 14. Allocate and write new ConstantPool + Cache + ConstMethod in target process
+    FVM_LOG("ConstMethod sizes: origTotal=%zu, newTotal=%zu (hdr=%lld, bc=%zu, trailing=%zu)",
+            origTotalConstMethodSize, newConstMethodSize,
+            (long long)constMethodTypeSize, newBytecode.size(), trailingDataSize);
+
     uint64_t newPoolAddr = (uint64_t)VirtualAllocEx(proc, NULL, newPoolByteSize,
                                                      MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (newPoolAddr == 0) {
@@ -838,10 +1231,27 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         setError("VirtualAllocEx_failed_for_constmethod");
         return 0;
     }
+    FVM_LOG("allocated in target: newPool=0x%llX (%zu bytes), newConstMethod=0x%llX (%zu bytes)",
+            (unsigned long long)newPoolAddr, newPoolByteSize,
+            (unsigned long long)newConstMethodAlloc, newConstMethodSize);
 
     // Update _constants pointer in new ConstMethod to point to new pool
     if (cmConstsOff >= 0) {
         memcpy(newConstMethodBytes.data() + cmConstsOff, &newPoolAddr, 8);
+    }
+
+    // Write ConstantPoolCache (with back-pointer fixed to new pool)
+    if (newCacheAddr != 0 && !newCacheBytes.empty()) {
+        if (cacheCpOff >= 0) {
+            memcpy(newCacheBytes.data() + cacheCpOff, &newPoolAddr, 8);
+        }
+        if (!writeRemoteMem(proc, newCacheAddr, newCacheBytes.data(), newCacheBytes.size())) {
+            setError("write_new_cache_failed");
+            VirtualFreeEx(proc, (LPVOID)newPoolAddr, 0, MEM_RELEASE);
+            VirtualFreeEx(proc, (LPVOID)newConstMethodAlloc, 0, MEM_RELEASE);
+            VirtualFreeEx(proc, (LPVOID)newCacheAddr, 0, MEM_RELEASE);
+            return 0;
+        }
     }
 
     // Write new ConstantPool
@@ -861,10 +1271,15 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     }
 
     // 12. Suspend all threads, swap pointers, clear JIT code, resume
+    FVM_LOG("suspending target threads (pid=%lu)...", (unsigned long)g_target.pid);
     std::vector<DWORD> threadIds;
     suspendTargetThreads(g_target.pid, threadIds);
+    FVM_LOG("suspended %zu threads", threadIds.size());
 
     // Swap Method::_constMethod to point to new ConstMethod
+    FVM_LOG("SWAP: Method[0x%llX]+%lld = 0x%llX -> 0x%llX",
+            (unsigned long long)methodAddr, (long long)constMethodOff,
+            (unsigned long long)origConstMethodAddr, (unsigned long long)newConstMethodAlloc);
     writeRemoteMem(proc, methodAddr + (uint64_t)constMethodOff, &newConstMethodAlloc, 8);
 
     // Clear Method::_code to force deoptimization (interpreter will use new bytecode)
@@ -872,6 +1287,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     if (codeOff >= 0) {
         uint64_t nullCode = 0;
         writeRemoteMem(proc, methodAddr + (uint64_t)codeOff, &nullCode, 8);
+        FVM_LOG("cleared Method::_code (offset %lld)", (long long)codeOff);
     }
 
     // Clear Method::_from_compiled_entry and _from_interpreted_entry to force re-resolution
@@ -880,6 +1296,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     if (fromCompiledOff >= 0) {
         uint64_t zero = 0;
         writeRemoteMem(proc, methodAddr + (uint64_t)fromCompiledOff, &zero, 8);
+        FVM_LOG("cleared Method::_from_compiled_entry (offset %lld)", (long long)fromCompiledOff);
     }
     // Note: _from_interpreted_entry should point to the interpreter entry stub
     // Zeroing it may cause issues; the interpreter will re-resolve it on next call
@@ -887,6 +1304,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     // to force the JVM to re-enter the interpreter path.
 
     resumeTargetThreads(threadIds);
+    FVM_LOG("resumed %zu threads", threadIds.size());
 
     // 13. Save backup for restore
     TransformBackup backup;
@@ -896,10 +1314,13 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     backup.origConstPoolAddr = origConstPoolAddr;
     backup.allocatedConstMethod = newConstMethodAlloc;
     backup.allocatedConstPool = newPoolAddr;
+    backup.allocatedCache = newCacheAddr;
+    backup.allocatedResolvedKlasses = newRKAddr;
     backup.allocatedConstMethodSize = newConstMethodSize;
     backup.allocatedConstPoolSize = newPoolByteSize;
     g_transformBackups[key] = backup;
 
+    FVM_LOG("=== TRANSFORM SUCCESS: %s ===", key.c_str());
     setError("ok");
     return 1;
 }
@@ -911,6 +1332,8 @@ int applyTransform(const char* className, const char* methodName, const char* pa
 int restoreTransform(const char* className, const char* methodName, const char* paramDesc) {
     HANDLE proc = g_target.handle;
     std::string key = makeTransformKey(className, methodName, paramDesc);
+
+    FVM_LOG("=== RESTORE BEGIN: %s ===", key.c_str());
 
     auto it = g_transformBackups.find(key);
     if (it == g_transformBackups.end()) {
@@ -926,8 +1349,12 @@ int restoreTransform(const char* className, const char* methodName, const char* 
     // Suspend threads
     std::vector<DWORD> threadIds;
     suspendTargetThreads(g_target.pid, threadIds);
+    FVM_LOG("suspended %zu threads for restore", threadIds.size());
 
     // Restore original ConstMethod pointer
+    FVM_LOG("RESTORE: Method[0x%llX]+%lld = 0x%llX -> 0x%llX (original)",
+            (unsigned long long)backup.methodAddr, (long long)constMethodOff,
+            (unsigned long long)backup.allocatedConstMethod, (unsigned long long)backup.origConstMethodAddr);
     writeRemoteMem(proc, backup.methodAddr + (uint64_t)constMethodOff, &backup.origConstMethodAddr, 8);
 
     // Clear JIT code again
@@ -944,6 +1371,7 @@ int restoreTransform(const char* className, const char* methodName, const char* 
     }
 
     resumeTargetThreads(threadIds);
+    FVM_LOG("resumed %zu threads", threadIds.size());
 
     // Free allocated memory
     if (backup.allocatedConstMethod != 0) {
@@ -952,9 +1380,17 @@ int restoreTransform(const char* className, const char* methodName, const char* 
     if (backup.allocatedConstPool != 0) {
         VirtualFreeEx(proc, (LPVOID)backup.allocatedConstPool, 0, MEM_RELEASE);
     }
+    if (backup.allocatedCache != 0) {
+        VirtualFreeEx(proc, (LPVOID)backup.allocatedCache, 0, MEM_RELEASE);
+    }
+    if (backup.allocatedResolvedKlasses != 0) {
+        VirtualFreeEx(proc, (LPVOID)backup.allocatedResolvedKlasses, 0, MEM_RELEASE);
+    }
+    FVM_LOG("freed allocated memory (constMethod/constPool/cache/resolvedKlasses)");
 
     g_transformBackups.erase(it);
 
+    FVM_LOG("=== RESTORE SUCCESS: %s ===", key.c_str());
     setError("ok");
     return 1;
 }

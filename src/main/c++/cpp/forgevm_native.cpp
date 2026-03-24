@@ -5,6 +5,111 @@
 #include <string.h>
 
 // ============================================================
+// File-based logging implementation
+// ============================================================
+
+static FILE* g_logFile = nullptr;
+static CRITICAL_SECTION g_logLock;
+static bool g_logLockInit = false;
+
+static void ensureLogLock() {
+    if (!g_logLockInit) {
+        InitializeCriticalSection(&g_logLock);
+        g_logLockInit = true;
+    }
+}
+
+void fvm_log_init(const char* path) {
+    ensureLogLock();
+    EnterCriticalSection(&g_logLock);
+    if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
+    g_logFile = fopen(path, "a");
+    if (g_logFile) {
+        // Write BOM-less UTF-8 header on fresh files, separator on existing
+        fprintf(g_logFile, "\n===== ForgeVM log session =====\n");
+        fflush(g_logFile);
+    }
+    LeaveCriticalSection(&g_logLock);
+}
+
+void fvm_log_open_default() {
+    // Place log next to the DLL (forgevm_native.dll → forgevm.log)
+    char dllPath[MAX_PATH] = {0};
+    HMODULE hm = NULL;
+    // Get handle to this DLL
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&fvm_log_open_default, &hm);
+    if (hm && GetModuleFileNameA(hm, dllPath, MAX_PATH)) {
+        // Replace filename with forgevm.log
+        char* lastSlash = strrchr(dllPath, '\\');
+        if (!lastSlash) lastSlash = strrchr(dllPath, '/');
+        if (lastSlash) {
+            *(lastSlash + 1) = '\0';
+            strcat_s(dllPath, MAX_PATH, "forgevm.log");
+        } else {
+            strcpy_s(dllPath, MAX_PATH, "forgevm.log");
+        }
+    } else {
+        strcpy_s(dllPath, MAX_PATH, "forgevm.log");
+    }
+    fvm_log_init(dllPath);
+}
+
+void fvm_log_write(const char* fmt, ...) {
+    ensureLogLock();
+    EnterCriticalSection(&g_logLock);
+
+    // Log file is initialized by Agent via forgevm_set_log_dir().
+    // If not set, silently discard — no random file creation.
+    if (!g_logFile) {
+        LeaveCriticalSection(&g_logLock);
+        return;
+    }
+
+    // Timestamp
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(g_logFile, "%04d-%02d-%02d %02d:%02d:%02d.%03d | ",
+            st.wYear, st.wMonth, st.wDay,
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(g_logFile, fmt, args);
+    va_end(args);
+
+    fprintf(g_logFile, "\n");
+    fflush(g_logFile);
+
+    LeaveCriticalSection(&g_logLock);
+}
+
+void fvm_log_hex(const char* label, const void* data, size_t len) {
+    ensureLogLock();
+    EnterCriticalSection(&g_logLock);
+
+    if (!g_logFile) { LeaveCriticalSection(&g_logLock); return; }
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(g_logFile, "%04d-%02d-%02d %02d:%02d:%02d.%03d | %s [%zu bytes]: ",
+            st.wYear, st.wMonth, st.wDay,
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            label, len);
+
+    const uint8_t* p = (const uint8_t*)data;
+    for (size_t i = 0; i < len && i < 256; i++) {
+        fprintf(g_logFile, "%02X ", p[i]);
+    }
+    if (len > 256) fprintf(g_logFile, "... (%zu more)", len - 256);
+    fprintf(g_logFile, "\n");
+    fflush(g_logFile);
+
+    LeaveCriticalSection(&g_logLock);
+}
+
+// ============================================================
 // Global state definitions
 // ============================================================
 
@@ -24,10 +129,12 @@ std::unordered_map<std::string, CachedFieldInfo> g_fieldInfoCache;
 
 void setError(const char* value) {
     g_lastError = value;
+    FVM_LOG("ERROR: %s", value);
 }
 
 void setError(const std::string& value) {
     g_lastError = value;
+    FVM_LOG("ERROR: %s", value.c_str());
 }
 
 // ============================================================
@@ -573,7 +680,9 @@ extern "C" __declspec(dllexport) int forgevm_probe_capability_prompt() {
 }
 
 extern "C" __declspec(dllexport) int forgevm_init() {
+    FVM_LOG("forgevm_init() called");
     int capability = resolveCapabilityByToken();
+    FVM_LOG("forgevm_init: capability=%d, promptApproved=%d", capability, (int)g_promptApproved);
     if (capability > 0 || g_promptApproved) {
         g_promptApproved = false;
         setError("ok");
@@ -584,6 +693,7 @@ extern "C" __declspec(dllexport) int forgevm_init() {
 }
 
 extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long targetPid) {
+    FVM_LOG("forgevm_bootstrap_target(pid=%llu)", targetPid);
     if (g_target.handle != NULL) {
         CloseHandle(g_target.handle);
         g_target = TargetProcess{};
@@ -647,6 +757,15 @@ extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long
     extractCompressionParams();
 
     g_target.structMapReady = true;
+    FVM_LOG("bootstrap_target complete: pid=%lu, jvmBase=0x%llX, structMap=%zu, typeMap=%zu",
+            (unsigned long)g_target.pid, (unsigned long long)g_target.jvmDllBase,
+            g_structMap.size(), g_typeMap.size());
+    FVM_LOG("compression: useCompressedOops=%d, narrowOopBase=0x%llX, narrowOopShift=%d",
+            (int)g_target.useCompressedOops,
+            (unsigned long long)g_target.narrowOopBase, g_target.narrowOopShift);
+    FVM_LOG("compression: useCompressedClassPtrs=%d, narrowKlassBase=0x%llX, narrowKlassShift=%d",
+            (int)g_target.useCompressedClassPointers,
+            (unsigned long long)g_target.narrowKlassBase, g_target.narrowKlassShift);
     setError("ok");
     return 1;
 }
@@ -688,6 +807,14 @@ extern "C" __declspec(dllexport) int forgevm_exit_process(unsigned long long pid
     }
     setError("ok");
     return 1;
+}
+
+extern "C" __declspec(dllexport) void forgevm_set_log_dir(const char* logDir) {
+    std::string path(logDir);
+    if (!path.empty() && path.back() != '\\' && path.back() != '/')
+        path += '\\';
+    path += "fvm-transform.log";
+    fvm_log_init(path.c_str());
 }
 
 extern "C" __declspec(dllexport) unsigned long long forgevm_structmap_count() {

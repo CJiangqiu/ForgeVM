@@ -100,107 +100,108 @@ Field descriptor format: `"fully.qualified.ClassName.fieldName"`. Resolved offse
 
 Inject custom logic into any loaded class's methods at runtime. ForgeVM rewrites bytecode in-memory through the Agent — no `java.lang.instrument`, no Instrumentation API.
 
-**Define a transformer:**
+#### Define a transformer
+
+Extend `FvmTransformer`, declare the target in the constructor, and write a `public static` hook method that takes `FvmCallback`:
 
 ```java
 import forgevm.transform.FvmTransformer;
 import forgevm.transform.FvmCallback;
 
-// Simplest form — target class + method name
 public class TickLogger extends FvmTransformer {
     public TickLogger() {
-        super("com.example.Entity", "tick");
+        super("com.example.engine.GameLoop", "tick");
     }
 
-    public void onTick(FvmCallback callback) {
-        System.out.println("tick was called!");
-        // not calling callback methods → original method runs normally
+    // Must be public static — ForgeVM injects an invokestatic call to this method.
+    public static void onTick(FvmCallback callback) {
+        System.out.println("tick called on: " + callback.getInstance());
+        // not calling cancel/setReturnValue → original method runs normally
     }
 }
 ```
 
-**Override a return value:**
+#### Override a return value
 
 ```java
 public class HealthOverride extends FvmTransformer {
     public HealthOverride() {
-        super("com.example.Entity", new String[]{"getHealth", "m1234"});
+        // Multiple candidates for obfuscated environments
+        super("com.example.entity.LivingEntity", new String[]{"getHealth", "m_1234"});
     }
 
-    public void onGetHealth(FvmCallback callback) {
+    public static void onGetHealth(FvmCallback callback) {
         callback.setReturnValue(20.0f);  // original method is skipped
     }
 }
 ```
 
-**Conditional logic based on target instance:**
+#### Conditional logic based on target instance
 
 ```java
-public class PlayerHealthOnly extends FvmTransformer {
-    public PlayerHealthOnly() {
-        super("com.example.Entity", new String[]{"getHealth", "m1234"});
+public class SelectiveHealthPatch extends FvmTransformer {
+    public SelectiveHealthPatch() {
+        super("com.example.entity.LivingEntity", new String[]{"getHealth", "m_1234"});
     }
 
-    public void onGetHealth(FvmCallback callback) {
-        Object target = callback.getInstance();
-        if (target instanceof Player) {
-            callback.setReturnValue(20.0f);  // only Players get 20 HP
+    public static void onGetHealth(FvmCallback callback) {
+        if (callback.getInstance() instanceof com.example.entity.Player) {
+            callback.setReturnValue(20.0f);  // only Player instances
         }
-        // non-Player entities → original method runs normally
+        // other instances → original method runs normally
     }
 }
 ```
 
-**Conditionally cancel a method:**
+#### Cancel a void method
 
 ```java
 public class TickGuard extends FvmTransformer {
     public TickGuard() {
-        super("com.example.Entity", "tick", InjectPoint.HEAD);
+        super("com.example.engine.GameLoop", "tick", InjectPoint.HEAD);
     }
 
-    public void onTick(FvmCallback callback) {
+    public static void onTick(FvmCallback callback) {
         if (shouldBlock()) {
-            callback.cancel();  // original method is skipped (void)
+            callback.cancel();  // original tick() is skipped
         }
-        // not cancelled → original method runs normally
     }
 }
 ```
 
-**Load and unload at runtime:**
+#### Load and unload at runtime
 
 ```java
-// Apply
+// Apply — bytecode is rewritten immediately
 ForgeVM.transformer().load(new HealthOverride());
 
-// Remove (restores original bytecode)
+// Remove — original bytecode is restored
 ForgeVM.transformer().unload(HealthOverride.class);
 ```
 
-**Constructor variants — use only what you need:**
+#### Constructor variants
 
 ```java
 // Single method, no-arg, HEAD (simplest)
-super("com.example.Entity", "tick");
+super("com.example.Foo", "bar");
 
 // Multiple candidate names (obfuscation support)
-super("com.example.Entity", new String[]{"getHealth", "m1234"});
+super("com.example.Foo", new String[]{"bar", "a_42"});
 
 // Specify inject point
-super("com.example.Entity", "tick", InjectPoint.RETURN);
+super("com.example.Foo", "bar", InjectPoint.RETURN);
 
-// With parameter types (to distinguish overloads)
-super("com.example.Entity", "damage", new Class<?>[]{float.class}, InjectPoint.HEAD);
+// With parameter types (distinguish overloads)
+super("com.example.Foo", "bar", new Class<?>[]{float.class}, InjectPoint.HEAD);
 ```
 
-**FvmCallback methods:**
+#### FvmCallback API
 
 | Method | Effect |
 |--------|--------|
-| `callback.getInstance()` | Get the target object (`this` of the hooked method) |
-| `callback.setReturnValue(value)` | Skip original method, return the given value |
-| `callback.cancel()` | Skip original method (for void methods) |
+| `callback.getInstance()` | Returns the target object (`this` of the hooked method) |
+| `callback.setReturnValue(value)` | Skip original method, return the given value (boxed primitives) |
+| `callback.cancel()` | Skip original method (for `void` methods) |
 | *(neither called)* | Original method executes normally |
 
 ## Capability Levels
@@ -245,7 +246,7 @@ Native DLL:
 ```
 Java:  ForgeVM.transformer().load(new MyPatch())
   │
-  ├── Reflect to find hook method name and FvmCallback parameter
+  ├── Reflect to find public static hook method with FvmCallback parameter
   ├── JSON IPC → Agent
   │
   ▼
@@ -253,11 +254,12 @@ Native DLL:
   ├── ClassLoaderDataGraph → find target InstanceKlass
   ├── InstanceKlass._methods → find target Method*
   ├── Read ConstMethod bytecode + ConstantPool
-  ├── VirtualAllocEx → allocate new ConstMethod + expanded ConstantPool
+  ├── Read existing interned Symbol* pointers from Klass/Method metadata
+  ├── VirtualAllocEx → allocate new ConstMethod + expanded ConstantPool + Cache
   ├── Build new bytecode:
-  │     new FvmCallback → invokestatic hook(FvmCallback)
-  │     → isCancelled? → yes: getReturnValue + return
-  │                     → no:  original method body
+  │     new FvmCallback(this) → invokestatic hook(FvmCallback)
+  │     → isCancelled? → yes: getReturnValue + unbox + return
+  │                     → no:  pop callback, execute original method body
   ├── SuspendThread → swap ConstMethod pointer + clear JIT → ResumeThread
-  └── Backup original pointers for restore
+  └── Backup original pointers for unload/restore
 ```

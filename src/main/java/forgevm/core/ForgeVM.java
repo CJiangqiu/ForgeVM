@@ -157,11 +157,15 @@ public final class ForgeVM {
         }
 
         try {
+            Path logDir = Paths.get("ForgeVM", "logs").toAbsolutePath();
+            try { Files.createDirectories(logDir); } catch (Exception ignored) {}
+
             Process process = new ProcessBuilder(
                     agentPath.toAbsolutePath().toString(),
                     "--serve",
                     "--policy=" + policy.name().toLowerCase(),
-                    "--dll=" + dllPath.toAbsolutePath()
+                    "--dll=" + dllPath.toAbsolutePath(),
+                    "--logdir=" + logDir
             ).redirectErrorStream(true).start();
 
             AgentSession session = new AgentSession(

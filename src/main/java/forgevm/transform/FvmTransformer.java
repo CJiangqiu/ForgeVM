@@ -1,37 +1,110 @@
 package forgevm.transform;
 
 /**
- * Base class for all ForgeVM bytecode transformers.
+ * Base class for ForgeVM bytecode transformers.
  *
- * <p>Subclass this, pass target info via constructor, and write your
- * hook method as a regular public method with an {@link FvmCallback} parameter.
- * ForgeVM will inject an {@code invokestatic} call to it at the specified point.
+ * <p>A transformer intercepts a target method at runtime by rewriting its bytecode
+ * in the target JVM's memory. No {@code java.lang.instrument}, no JVMTI — ForgeVM
+ * operates entirely out-of-process through its native Agent.
  *
- * <p>Example — simplest form (single method, no-arg, HEAD):
+ * <h2>How to use</h2>
+ * <ol>
+ *   <li>Extend {@code FvmTransformer} and call the appropriate {@code super(...)}
+ *       constructor to declare which method you want to intercept.</li>
+ *   <li>Write a {@code public static} hook method that takes a single
+ *       {@link FvmCallback} parameter. ForgeVM injects an {@code invokestatic}
+ *       call to this method, so it <b>must</b> be {@code static}.</li>
+ *   <li>Register via {@code ForgeVM.transformer().load(new YourTransformer())}.</li>
+ *   <li>Remove via {@code ForgeVM.transformer().unload(YourTransformer.class)}
+ *       to restore the original bytecode.</li>
+ * </ol>
+ *
+ * <h2>Hook method behavior</h2>
+ * <ul>
+ *   <li>Call {@link FvmCallback#setReturnValue(Object)} — skip the original method
+ *       and return the given value (boxed primitives for primitive return types).</li>
+ *   <li>Call {@link FvmCallback#cancel()} — skip the original method (void methods).</li>
+ *   <li>Call neither — the original method executes normally after the hook returns.</li>
+ * </ul>
+ *
+ * <h2>Examples</h2>
+ *
+ * <p><b>Simplest form</b> — intercept a no-arg method at HEAD:
  * <pre>{@code
  * public class TickLogger extends FvmTransformer {
  *     public TickLogger() {
- *         super("com.example.Entity", "tick");
+ *         super("com.example.engine.GameLoop", "tick");
  *     }
  *
- *     public void onTick(FvmCallback callback) {
- *         System.out.println("tick called");
+ *     public static void onTick(FvmCallback callback) {
+ *         System.out.println("tick called on: " + callback.getInstance());
  *     }
  * }
  * }</pre>
  *
- * <p>Example — override return value with obfuscation candidates:
+ * <p><b>Override return value</b> — with obfuscation candidates:
  * <pre>{@code
- * public class HealthPatch extends FvmTransformer {
- *     public HealthPatch() {
- *         super("com.example.Entity", new String[]{"getHealth", "m1234"});
+ * public class HealthOverride extends FvmTransformer {
+ *     public HealthOverride() {
+ *         super("com.example.entity.LivingEntity",
+ *               new String[]{"getHealth", "m_1234"});
  *     }
  *
- *     public void onGetHealth(FvmCallback callback) {
+ *     public static void onGetHealth(FvmCallback callback) {
  *         callback.setReturnValue(20.0f);
  *     }
  * }
  * }</pre>
+ *
+ * <p><b>Conditional logic</b> — only affect certain instances:
+ * <pre>{@code
+ * public class PlayerHealthOnly extends FvmTransformer {
+ *     public PlayerHealthOnly() {
+ *         super("com.example.entity.LivingEntity",
+ *               new String[]{"getHealth", "m_1234"});
+ *     }
+ *
+ *     public static void onGetHealth(FvmCallback callback) {
+ *         if (callback.getInstance() instanceof com.example.entity.Player) {
+ *             callback.setReturnValue(20.0f);
+ *         }
+ *         // other instances → original method runs normally
+ *     }
+ * }
+ * }</pre>
+ *
+ * <p><b>Cancel a void method</b>:
+ * <pre>{@code
+ * public class TickGuard extends FvmTransformer {
+ *     public TickGuard() {
+ *         super("com.example.engine.GameLoop", "tick", InjectPoint.HEAD);
+ *     }
+ *
+ *     public static void onTick(FvmCallback callback) {
+ *         if (shouldBlock()) {
+ *             callback.cancel();  // original tick() is skipped
+ *         }
+ *     }
+ * }
+ * }</pre>
+ *
+ * <h2>Constructor variants</h2>
+ * <pre>{@code
+ * // Single method, no-arg, HEAD (simplest)
+ * super("com.example.Foo", "bar");
+ *
+ * // Multiple candidate names (obfuscation support)
+ * super("com.example.Foo", new String[]{"bar", "a_42"});
+ *
+ * // Specify inject point
+ * super("com.example.Foo", "bar", InjectPoint.RETURN);
+ *
+ * // With parameter types (distinguish overloads)
+ * super("com.example.Foo", "bar", new Class<?>[]{float.class}, InjectPoint.HEAD);
+ * }</pre>
+ *
+ * @see FvmCallback
+ * @see InjectPoint
  */
 public abstract class FvmTransformer {
 
@@ -41,10 +114,12 @@ public abstract class FvmTransformer {
     private final InjectPoint injectAt;
 
     /**
+     * Full constructor.
+     *
      * @param targetClass            fully qualified name of the target class
      * @param targetMethodCandidates candidate method names, tried in order until one matches
      * @param targetParams           parameter types to distinguish overloads (empty array for no-arg)
-     * @param injectAt               HEAD or RETURN
+     * @param injectAt               where to inject: {@link InjectPoint#HEAD} or {@link InjectPoint#RETURN}
      */
     protected FvmTransformer(String targetClass, String[] targetMethodCandidates,
                              Class<?>[] targetParams, InjectPoint injectAt) {
@@ -100,13 +175,19 @@ public abstract class FvmTransformer {
     public InjectPoint injectAt() { return injectAt; }
 
     /**
-     * Returns the name of the user's hook method in this class.
-     * TransformManager scans for the first public method that takes
-     * a single {@link FvmCallback} parameter.
+     * Returns the name of the hook method defined in this transformer subclass.
+     *
+     * <p>Scans for the first {@code public static} method that takes a single
+     * {@link FvmCallback} parameter. The method must be {@code static} because
+     * ForgeVM injects an {@code invokestatic} bytecode to call it.
+     *
+     * @return the hook method name, or {@code null} if none found
      */
     public String resolveHookMethodName() {
         for (java.lang.reflect.Method m : getClass().getDeclaredMethods()) {
-            if (java.lang.reflect.Modifier.isPublic(m.getModifiers())) {
+            int mod = m.getModifiers();
+            if (java.lang.reflect.Modifier.isPublic(mod)
+                    && java.lang.reflect.Modifier.isStatic(mod)) {
                 Class<?>[] params = m.getParameterTypes();
                 if (params.length == 1 && params[0] == FvmCallback.class) {
                     return m.getName();
@@ -116,6 +197,11 @@ public abstract class FvmTransformer {
         return null;
     }
 
+    /**
+     * Returns a human-readable description of this transformer for logging.
+     *
+     * <p>Format: {@code com.example.Foo.bar (+N candidates)(params) @ HEAD -> hook.Class.method()}
+     */
     public final String describe() {
         StringBuilder sb = new StringBuilder();
         sb.append(targetClass).append('.').append(targetMethodCandidates[0]);

@@ -6,6 +6,51 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <cstdio>
+#include <cstdarg>
+
+// ============================================================
+// Agent-level file logging — unified with DLL into one file
+// ============================================================
+
+static FILE* g_agentLog = nullptr;
+static std::string g_logDir;   // resolved once, passed to DLL for its own log
+
+static void agentLogInit(const std::string& logDir) {
+    g_logDir = logDir;
+    std::string logPath;
+    if (!logDir.empty()) {
+        logPath = logDir;
+        char last = logPath.back();
+        if (last != '\\' && last != '/') logPath += '\\';
+        CreateDirectoryA(logPath.c_str(), NULL);
+        logPath += "fvm-agent.log";
+    } else {
+        logPath = "fvm-agent.log";
+    }
+    g_agentLog = fopen(logPath.c_str(), "a");
+    if (g_agentLog) {
+        fprintf(g_agentLog, "\n===== ForgeVM Agent session =====\n");
+        fflush(g_agentLog);
+    }
+}
+
+static void agentLog(const char* fmt, ...) {
+    if (!g_agentLog) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(g_agentLog, "%04d-%02d-%02d %02d:%02d:%02d.%03d | ",
+            st.wYear, st.wMonth, st.wDay,
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(g_agentLog, fmt, args);
+    va_end(args);
+    fprintf(g_agentLog, "\n");
+    fflush(g_agentLog);
+}
+
+#define AGENT_LOG(fmt, ...) agentLog(fmt, ##__VA_ARGS__)
 
 typedef int(__cdecl* ProbeFn)();
 typedef int(__cdecl* InitFn)();
@@ -15,6 +60,7 @@ typedef int(__cdecl* BootstrapTargetFn)(unsigned long long);
 typedef unsigned long long(__cdecl* StructMapCountFn)();
 typedef int(__cdecl* PutFieldFn)(unsigned long long, const char*, const char*, const unsigned char*, unsigned long long);
 typedef int(__cdecl* PutFieldBatchFn)(const unsigned long long*, unsigned long long, const char*, const char*, const unsigned char*, unsigned long long);
+typedef void(__cdecl* SetLogDirFn)(const char*);
 typedef int(__cdecl* TransformLoadFn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*);
 typedef int(__cdecl* TransformUnloadFn)(const char*, const char*, const char*);
 
@@ -35,6 +81,7 @@ struct NativeApi {
     PutFieldFn putRefField = NULL;
     PutFieldBatchFn putRefFieldBatch = NULL;
     ProbeFn dumpCardStructs = NULL;
+    SetLogDirFn setLogDir = NULL;
     TransformLoadFn transformLoad = NULL;
     TransformUnloadFn transformUnload = NULL;
 };
@@ -297,6 +344,7 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->putFieldBatch   = reinterpret_cast<PutFieldBatchFn>(GetProcAddress(module, "forgevm_put_field_batch"));
     api->putRefField     = reinterpret_cast<PutFieldFn>(GetProcAddress(module, "forgevm_put_ref_field"));
     api->putRefFieldBatch = reinterpret_cast<PutFieldBatchFn>(GetProcAddress(module, "forgevm_put_ref_field_batch"));
+    api->setLogDir       = reinterpret_cast<SetLogDirFn>(GetProcAddress(module, "forgevm_set_log_dir"));
     api->dumpCardStructs = reinterpret_cast<ProbeFn>(GetProcAddress(module, "forgevm_dump_card_structs"));
     api->transformLoad   = reinterpret_cast<TransformLoadFn>(GetProcAddress(module, "forgevm_transform_load"));
     api->transformUnload = reinterpret_cast<TransformUnloadFn>(GetProcAddress(module, "forgevm_transform_unload"));
@@ -316,6 +364,7 @@ std::string copyReason(const NativeApi& api, const char* fallback) {
 
 void handleBootstrap(const NativeApi& api, const std::string& policy,
                      const std::string& dllPath, const std::string& line) {
+    AGENT_LOG("bootstrap: policy=%s", policy.c_str());
     bool prompt = policy == "prompt";
     int capability = 0;
     if (prompt && api.probePrompt != NULL) {
@@ -323,9 +372,11 @@ void handleBootstrap(const NativeApi& api, const std::string& policy,
     } else {
         capability = api.probe();
     }
+    AGENT_LOG("bootstrap: capability=%d (%s)", capability, capFromCode(capability));
 
     if (capability <= 0) {
         std::string reason = copyReason(api, "permission_probe_failed");
+        AGENT_LOG("bootstrap FAILED: %s", reason.c_str());
         printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
         return;
     }
@@ -343,10 +394,13 @@ void handleBootstrap(const NativeApi& api, const std::string& policy,
         g_parentPid.store(static_cast<DWORD>(pid));
     }
     if (pid != 0ULL && api.bootstrapTarget != NULL) {
+        AGENT_LOG("bootstrap_target(pid=%llu)...", pid);
         if (api.bootstrapTarget(pid) == 1) {
             structMapReady = true;
+            AGENT_LOG("bootstrap_target OK: structMap ready");
         } else {
             std::string reason = copyReason(api, "bootstrap_target_failed");
+            AGENT_LOG("bootstrap_target FAILED: %s", reason.c_str());
             printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
             return;
         }
@@ -354,15 +408,24 @@ void handleBootstrap(const NativeApi& api, const std::string& policy,
 
     std::vector<std::pair<std::string, std::string>> fields;
     fields.push_back({"structMapReady", structMapReady ? "true" : "false"});
-    if (structMapReady && api.structMapCount != NULL)
-        fields.push_back({"structMapEntries", std::to_string(api.structMapCount())});
-    if (structMapReady && api.typeMapCount != NULL)
-        fields.push_back({"typeMapEntries", std::to_string(api.typeMapCount())});
+    if (structMapReady && api.structMapCount != NULL) {
+        auto count = api.structMapCount();
+        fields.push_back({"structMapEntries", std::to_string(count)});
+        AGENT_LOG("structMapEntries=%llu", (unsigned long long)count);
+    }
+    if (structMapReady && api.typeMapCount != NULL) {
+        auto count = api.typeMapCount();
+        fields.push_back({"typeMapEntries", std::to_string(count)});
+        AGENT_LOG("typeMapEntries=%llu", (unsigned long long)count);
+    }
     if (structMapReady && api.compressionInfo != NULL) {
         const char* cinfo = api.compressionInfo();
-        if (cinfo != NULL && cinfo[0] != '\0')
+        if (cinfo != NULL && cinfo[0] != '\0') {
             fields.push_back({"compressionInfo", std::string(cinfo)});
+            AGENT_LOG("compressionInfo=%s", cinfo);
+        }
     }
+    AGENT_LOG("bootstrap complete: %s", capFromCode(capability));
     printResultWithFields("ok", capFromCode(capability), dllPath, "ok", fields);
 }
 
@@ -562,8 +625,13 @@ void handleTransformLoad(const NativeApi& api, const std::string& line, const st
     std::string hookMethod   = getJsonStringField(line, "hookMethod");
     std::string hookDesc     = getJsonStringField(line, "hookDesc");
 
+    AGENT_LOG("transform_load: %s.%s(%s) @ %s -> %s.%s%s",
+              targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
+              injectAt.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str());
+
     if (targetClass.empty() || targetMethod.empty() || injectAt.empty() ||
         hookClass.empty() || hookMethod.empty() || hookDesc.empty()) {
+        AGENT_LOG("transform_load: missing params");
         printResult("fallback", "JVM_FALLBACK", dllPath, "missing_transform_load_params");
         return;
     }
@@ -573,6 +641,7 @@ void handleTransformLoad(const NativeApi& api, const std::string& line, const st
         injectAt.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str());
 
     std::string reason = copyReason(api, result == 1 ? "ok" : "transform_load_failed");
+    AGENT_LOG("transform_load result=%d reason=%s", result, reason.c_str());
     if (result == 1) {
         printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
     } else {
@@ -589,6 +658,9 @@ void handleTransformUnload(const NativeApi& api, const std::string& line, const 
     std::string targetMethod = getJsonStringField(line, "targetMethod");
     std::string targetParamDesc = getJsonStringField(line, "targetParamDesc");
 
+    AGENT_LOG("transform_unload: %s.%s(%s)",
+              targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str());
+
     if (targetClass.empty() || targetMethod.empty()) {
         printResult("fallback", "JVM_FALLBACK", dllPath, "missing_transform_unload_params");
         return;
@@ -597,6 +669,7 @@ void handleTransformUnload(const NativeApi& api, const std::string& line, const 
     int result = api.transformUnload(targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str());
 
     std::string reason = copyReason(api, result == 1 ? "ok" : "transform_unload_failed");
+    AGENT_LOG("transform_unload result=%d reason=%s", result, reason.c_str());
     if (result == 1) {
         printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
     } else {
@@ -632,15 +705,31 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // Parse log directory (passed from Java: --logdir={run}/ForgeVM/logs)
+    std::string logDir = parseArg("--logdir=", argc, argv);
+
     NativeApi api;
     std::string loadReason;
+    agentLogInit(logDir);
+    AGENT_LOG("agent starting: dll=%s, policy=%s, serve=%d, logdir=%s",
+              dllPath.c_str(), policy.c_str(), (int)serve, logDir.c_str());
+
     if (!loadNativeApi(dllPathWide, dllPath, &api, &loadReason)) {
+        AGENT_LOG("loadNativeApi FAILED: %s", loadReason.c_str());
         if (api.module != NULL) FreeLibrary(api.module);
         printResult("fallback", "JVM_FALLBACK", dllPath, loadReason.c_str());
         return 3;
     }
+    AGENT_LOG("loadNativeApi OK");
+
+    // Tell DLL to write its logs (fvm-transform.log) to the same directory
+    if (api.setLogDir && !g_logDir.empty()) {
+        api.setLogDir(g_logDir.c_str());
+        AGENT_LOG("DLL log dir set: %s", g_logDir.c_str());
+    }
 
     if (!serve) {
+        AGENT_LOG("one-shot mode: bootstrap");
         handleBootstrap(api, policy, dllPath, "");
         if (api.module != NULL) FreeLibrary(api.module);
         return 0;
@@ -648,12 +737,14 @@ int main(int argc, char** argv) {
 
     // Start parent process watchdog thread
     CreateThread(NULL, 0, parentWatchdogThread, NULL, 0, NULL);
+    AGENT_LOG("serve mode: entering command loop");
 
     AgentLockState lockState;
     std::string line;
     while (std::getline(std::cin, line)) {
         refreshLockIfExpired(&lockState);
         std::string cmd = getJsonStringField(line, "cmd");
+        AGENT_LOG("cmd=%s", cmd.c_str());
 
         if (cmd == "bootstrap") {
             handleBootstrap(api, policy, dllPath, line);

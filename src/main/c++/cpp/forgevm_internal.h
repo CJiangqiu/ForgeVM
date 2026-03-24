@@ -5,6 +5,24 @@
 #include <unordered_map>
 #include <vector>
 #include <cstdint>
+#include <cstdio>
+#include <cstdarg>
+
+// ============================================================
+// File-based logging
+//
+// Writes to forgevm.log next to the DLL. Auto-flushed per line.
+// FVM_LOG(fmt, ...) — printf-style, auto-prepends timestamp.
+// FVM_LOG_HEX(label, data, len) — hex dump for bytecode etc.
+// ============================================================
+
+void fvm_log_init(const char* path);   // explicit path (optional)
+void fvm_log_open_default();           // auto-detect path next to DLL
+void fvm_log_write(const char* fmt, ...);
+void fvm_log_hex(const char* label, const void* data, size_t len);
+
+#define FVM_LOG(fmt, ...)     fvm_log_write(fmt, ##__VA_ARGS__)
+#define FVM_LOG_HEX(l, d, n) fvm_log_hex(l, d, n)
 
 // ============================================================
 // Error state
@@ -201,6 +219,8 @@ struct TransformBackup {
     uint64_t origConstPoolAddr;         // original ConstantPool* value
     uint64_t allocatedConstMethod;      // VirtualAllocEx'd new ConstMethod
     uint64_t allocatedConstPool;        // VirtualAllocEx'd new ConstantPool
+    uint64_t allocatedCache;            // VirtualAllocEx'd new ConstantPoolCache
+    uint64_t allocatedResolvedKlasses;  // VirtualAllocEx'd new _resolved_klasses
     size_t allocatedConstMethodSize;
     size_t allocatedConstPoolSize;
 };
