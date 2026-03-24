@@ -12,10 +12,8 @@ build/
 .claude/
 CLAUDE.md
 
-# Native binaries (distribute via GitHub Releases, not repo)
+# ForgeVM runtime output
 /ForgeVM/
-*.exe
-*.dll
 
 # OS
 Thumbs.db
