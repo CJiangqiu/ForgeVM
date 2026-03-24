@@ -54,17 +54,19 @@ public final class TransformManager {
         }
 
         try {
-            String[] candidates = transformer.targetMethodCandidates();
+            String[][] candidates = transformer.candidates();
             String lastReason = "no_candidates";
 
-            for (String candidate : candidates) {
-                FvmLog.info("TRANSFORM trying method candidate: " + candidate);
-                String command = buildLoadCommand(transformer, candidate, hookMethodName);
+            for (String[] candidate : candidates) {
+                String methodName = candidate[0];
+                String paramDesc = candidate[1];
+                FvmLog.info("TRANSFORM trying method candidate: " + methodName + paramDesc);
+                String command = buildLoadCommand(transformer, methodName, paramDesc, hookMethodName);
                 String response = ForgeVM.agentSend(command);
 
                 if (response != null && response.contains("\"status\":\"ok\"")) {
-                    loaded.put(key, new LoadedTransformer(transformer, key, candidate));
-                    FvmLog.info("TRANSFORM result: success | matched: " + candidate + " | " + desc);
+                    loaded.put(key, new LoadedTransformer(transformer, key, methodName, paramDesc));
+                    FvmLog.info("TRANSFORM result: success | matched: " + methodName + paramDesc + " | " + desc);
                     return true;
                 }
                 lastReason = extractReason(response);
@@ -105,7 +107,7 @@ public final class TransformManager {
         }
 
         try {
-            String command = buildUnloadCommand(entry.transformer(), entry.matchedMethod());
+            String command = buildUnloadCommand(entry.transformer(), entry.matchedMethod(), entry.matchedParamDesc());
             String response = ForgeVM.agentSend(command);
 
             if (response == null || !response.contains("\"status\":\"ok\"")) {
@@ -132,16 +134,15 @@ public final class TransformManager {
 
     // -- internals --
 
-    private String buildLoadCommand(FvmTransformer transformer, String resolvedMethod,
-                                    String hookMethodName) {
+    private String buildLoadCommand(FvmTransformer transformer, String methodName,
+                                    String paramDesc, String hookMethodName) {
         String hookClass = transformer.getClass().getName().replace('.', '/');
-        // Hook signature: (Lforgevm/transform/FvmCallback;)V
         String hookDesc = "(Lforgevm/transform/FvmCallback;)V";
 
         return "{\"cmd\":\"transform_load\""
                 + ",\"targetClass\":\"" + esc(transformer.targetClass()) + "\""
-                + ",\"targetMethod\":\"" + esc(resolvedMethod) + "\""
-                + ",\"targetParamDesc\":\"" + esc(buildParamDescriptor(transformer.targetParams())) + "\""
+                + ",\"targetMethod\":\"" + esc(methodName) + "\""
+                + ",\"targetParamDesc\":\"" + esc(paramDesc) + "\""
                 + ",\"injectAt\":\"" + transformer.injectAt().name() + "\""
                 + ",\"hookClass\":\"" + esc(hookClass) + "\""
                 + ",\"hookMethod\":\"" + esc(hookMethodName) + "\""
@@ -149,36 +150,12 @@ public final class TransformManager {
                 + "}";
     }
 
-    private String buildUnloadCommand(FvmTransformer transformer, String resolvedMethod) {
+    private String buildUnloadCommand(FvmTransformer transformer, String methodName, String paramDesc) {
         return "{\"cmd\":\"transform_unload\""
                 + ",\"targetClass\":\"" + esc(transformer.targetClass()) + "\""
-                + ",\"targetMethod\":\"" + esc(resolvedMethod) + "\""
-                + ",\"targetParamDesc\":\"" + esc(buildParamDescriptor(transformer.targetParams())) + "\""
+                + ",\"targetMethod\":\"" + esc(methodName) + "\""
+                + ",\"targetParamDesc\":\"" + esc(paramDesc) + "\""
                 + "}";
-    }
-
-    private static String buildParamDescriptor(Class<?>[] params) {
-        if (params == null || params.length == 0) return "()";
-        StringBuilder sb = new StringBuilder("(");
-        for (Class<?> p : params) {
-            sb.append(toDescriptor(p));
-        }
-        sb.append(')');
-        return sb.toString();
-    }
-
-    private static String toDescriptor(Class<?> type) {
-        if (type == boolean.class) return "Z";
-        if (type == byte.class) return "B";
-        if (type == char.class) return "C";
-        if (type == short.class) return "S";
-        if (type == int.class) return "I";
-        if (type == float.class) return "F";
-        if (type == long.class) return "J";
-        if (type == double.class) return "D";
-        if (type == void.class) return "V";
-        if (type.isArray()) return type.getName().replace('.', '/');
-        return "L" + type.getName().replace('.', '/') + ";";
     }
 
     private static String transformerKey(FvmTransformer transformer) {
@@ -200,5 +177,5 @@ public final class TransformManager {
         return ForgeVM.escapeJson(value);
     }
 
-    private record LoadedTransformer(FvmTransformer transformer, String key, String matchedMethod) {}
+    private record LoadedTransformer(FvmTransformer transformer, String key, String matchedMethod, String matchedParamDesc) {}
 }

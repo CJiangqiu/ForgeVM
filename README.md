@@ -153,20 +153,25 @@ public class ProcessLogger extends FvmTransformer {
 }
 ```
 
-#### Constructor Variants
+#### Method String Format
+
+The second parameter is a method descriptor string. Comma-separated names are tried in order (for obfuscated methods). Append JVM parameter descriptors in parentheses to distinguish overloads.
 
 ```java
 // Single method, no-arg, inject at HEAD (simplest)
 super("com.example.app.OrderService", "processOrder");
 
-// Multiple candidate names (for obfuscated methods — tried in order)
-super("com.example.app.OrderService", new String[]{"processOrder", "a_42"});
+// Multiple candidate names (comma-separated, tried in order)
+super("com.example.app.OrderService", "processOrder,a_42");
 
-// Specify inject point
-super("com.example.app.OrderService", "processOrder", InjectPoint.RETURN);
+// Specify inject point (use HEAD or RETURN directly)
+super("com.example.app.OrderService", "processOrder", RETURN);
 
-// With parameter types (to distinguish overloads)
-super("com.example.app.OrderService", "processOrder", new Class<?>[]{String.class}, InjectPoint.HEAD);
+// With parameter descriptor (JVM format, to distinguish overloads)
+super("com.example.app.OrderService", "attack(F)");
+
+// Multiple candidates with parameters
+super("com.example.app.OrderService", "a_71(Ljava/lang/String;I),process(Ljava/lang/String;I)");
 ```
 
 #### Controlling Execution Flow via FvmCallback
@@ -179,11 +184,10 @@ Inside the hook method, `FvmCallback` controls whether the original method runs:
 - **`callback.getInstance()`** — get the `this` reference of the intercepted call, for conditional logic.
 
 ```java
-// Override a return value
+// Override a return value — with obfuscation candidates
 public class RetryCountOverride extends FvmTransformer {
     public RetryCountOverride() {
-        super("com.example.app.RetryPolicy",
-              new String[]{"getMaxRetries", "a_56"});
+        super("com.example.app.RetryPolicy", "getMaxRetries,a_56");
     }
 
     public static void onGetMaxRetries(FvmCallback callback) {
@@ -194,7 +198,7 @@ public class RetryCountOverride extends FvmTransformer {
 // Conditionally cancel a void method
 public class ShutdownGuard extends FvmTransformer {
     public ShutdownGuard() {
-        super("com.example.app.AppLifecycle", "shutdown", InjectPoint.HEAD);
+        super("com.example.app.AppLifecycle", "shutdown", HEAD);
     }
 
     public static void onShutdown(FvmCallback callback) {
@@ -207,8 +211,7 @@ public class ShutdownGuard extends FvmTransformer {
 // Conditional logic based on instance type
 public class PremiumRetryOverride extends FvmTransformer {
     public PremiumRetryOverride() {
-        super("com.example.app.RetryPolicy",
-              new String[]{"getMaxRetries", "a_56"});
+        super("com.example.app.RetryPolicy", "getMaxRetries,a_56");
     }
 
     public static void onGetMaxRetries(FvmCallback callback) {
@@ -424,20 +427,25 @@ public class ProcessLogger extends FvmTransformer {
 }
 ```
 
-#### 构造函数变体
+#### 方法字符串格式
+
+第二个参数是方法描述字符串。逗号分隔的名称按顺序尝试（用于混淆后的方法）。在括号中追加 JVM 参数描述符以区分重载方法。
 
 ```java
 // 单方法，无参，注入点 HEAD（最简形式）
 super("com.example.app.OrderService", "processOrder");
 
-// 多个候选名称（用于混淆后的方法 — 按顺序尝试）
-super("com.example.app.OrderService", new String[]{"processOrder", "a_42"});
+// 多个候选名称（逗号分隔，按顺序尝试）
+super("com.example.app.OrderService", "processOrder,a_42");
 
-// 指定注入点
-super("com.example.app.OrderService", "processOrder", InjectPoint.RETURN);
+// 指定注入点（直接使用 HEAD 或 RETURN）
+super("com.example.app.OrderService", "processOrder", RETURN);
 
-// 带参数类型（区分重载方法）
-super("com.example.app.OrderService", "processOrder", new Class<?>[]{String.class}, InjectPoint.HEAD);
+// 带参数描述符（JVM 格式，区分重载方法）
+super("com.example.app.OrderService", "attack(F)");
+
+// 多候选 + 参数
+super("com.example.app.OrderService", "a_71(Ljava/lang/String;I),process(Ljava/lang/String;I)");
 ```
 
 #### 通过 FvmCallback 控制执行流程
@@ -450,11 +458,10 @@ super("com.example.app.OrderService", "processOrder", new Class<?>[]{String.clas
 - **`callback.getInstance()`** — 获取被拦截调用的 `this` 引用，用于条件判断。
 
 ```java
-// 覆盖返回值
+// 覆盖返回值 — 带混淆候选名
 public class RetryCountOverride extends FvmTransformer {
     public RetryCountOverride() {
-        super("com.example.app.RetryPolicy",
-              new String[]{"getMaxRetries", "a_56"});
+        super("com.example.app.RetryPolicy", "getMaxRetries,a_56");
     }
 
     public static void onGetMaxRetries(FvmCallback callback) {
@@ -465,7 +472,7 @@ public class RetryCountOverride extends FvmTransformer {
 // 有条件地取消 void 方法
 public class ShutdownGuard extends FvmTransformer {
     public ShutdownGuard() {
-        super("com.example.app.AppLifecycle", "shutdown", InjectPoint.HEAD);
+        super("com.example.app.AppLifecycle", "shutdown", HEAD);
     }
 
     public static void onShutdown(FvmCallback callback) {
@@ -478,8 +485,7 @@ public class ShutdownGuard extends FvmTransformer {
 // 基于实例类型的条件判断
 public class PremiumRetryOverride extends FvmTransformer {
     public PremiumRetryOverride() {
-        super("com.example.app.RetryPolicy",
-              new String[]{"getMaxRetries", "a_56"});
+        super("com.example.app.RetryPolicy", "getMaxRetries,a_56");
     }
 
     public static void onGetMaxRetries(FvmCallback callback) {
