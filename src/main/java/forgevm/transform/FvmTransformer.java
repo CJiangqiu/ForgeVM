@@ -31,42 +31,42 @@ package forgevm.transform;
  *
  * <p><b>Simplest form</b> — intercept a no-arg method at HEAD:
  * <pre>{@code
- * public class TickLogger extends FvmTransformer {
- *     public TickLogger() {
- *         super("com.example.engine.GameLoop", "tick");
+ * public class ProcessLogger extends FvmTransformer {
+ *     public ProcessLogger() {
+ *         super("com.example.app.OrderService", "processOrder");
  *     }
  *
- *     public static void onTick(FvmCallback callback) {
- *         System.out.println("tick called on: " + callback.getInstance());
+ *     public static void onProcess(FvmCallback callback) {
+ *         System.out.println("processOrder called on: " + callback.getInstance());
  *     }
  * }
  * }</pre>
  *
  * <p><b>Override return value</b> — with obfuscation candidates:
  * <pre>{@code
- * public class HealthOverride extends FvmTransformer {
- *     public HealthOverride() {
- *         super("com.example.entity.LivingEntity",
- *               new String[]{"getHealth", "m_1234"});
+ * public class RetryCountOverride extends FvmTransformer {
+ *     public RetryCountOverride() {
+ *         super("com.example.app.RetryPolicy",
+ *               new String[]{"getMaxRetries", "a_56"});
  *     }
  *
- *     public static void onGetHealth(FvmCallback callback) {
- *         callback.setReturnValue(20.0f);
+ *     public static void onGetMaxRetries(FvmCallback callback) {
+ *         callback.setReturnValue(10);
  *     }
  * }
  * }</pre>
  *
  * <p><b>Conditional logic</b> — only affect certain instances:
  * <pre>{@code
- * public class PlayerHealthOnly extends FvmTransformer {
- *     public PlayerHealthOnly() {
- *         super("com.example.entity.LivingEntity",
- *               new String[]{"getHealth", "m_1234"});
+ * public class PremiumRetryOverride extends FvmTransformer {
+ *     public PremiumRetryOverride() {
+ *         super("com.example.app.RetryPolicy",
+ *               new String[]{"getMaxRetries", "a_56"});
  *     }
  *
- *     public static void onGetHealth(FvmCallback callback) {
- *         if (callback.getInstance() instanceof com.example.entity.Player) {
- *             callback.setReturnValue(20.0f);
+ *     public static void onGetMaxRetries(FvmCallback callback) {
+ *         if (callback.getInstance() instanceof com.example.app.PremiumRetryPolicy) {
+ *             callback.setReturnValue(100);
  *         }
  *         // other instances → original method runs normally
  *     }
@@ -75,14 +75,14 @@ package forgevm.transform;
  *
  * <p><b>Cancel a void method</b>:
  * <pre>{@code
- * public class TickGuard extends FvmTransformer {
- *     public TickGuard() {
- *         super("com.example.engine.GameLoop", "tick", InjectPoint.HEAD);
+ * public class ShutdownGuard extends FvmTransformer {
+ *     public ShutdownGuard() {
+ *         super("com.example.app.AppLifecycle", "shutdown", InjectPoint.HEAD);
  *     }
  *
- *     public static void onTick(FvmCallback callback) {
+ *     public static void onShutdown(FvmCallback callback) {
  *         if (shouldBlock()) {
- *             callback.cancel();  // original tick() is skipped
+ *             callback.cancel();  // original shutdown() is skipped
  *         }
  *     }
  * }
@@ -91,16 +91,16 @@ package forgevm.transform;
  * <h2>Constructor variants</h2>
  * <pre>{@code
  * // Single method, no-arg, HEAD (simplest)
- * super("com.example.Foo", "bar");
+ * super("com.example.app.OrderService", "processOrder");
  *
  * // Multiple candidate names (obfuscation support)
- * super("com.example.Foo", new String[]{"bar", "a_42"});
+ * super("com.example.app.OrderService", new String[]{"processOrder", "a_42"});
  *
  * // Specify inject point
- * super("com.example.Foo", "bar", InjectPoint.RETURN);
+ * super("com.example.app.OrderService", "processOrder", InjectPoint.RETURN);
  *
  * // With parameter types (distinguish overloads)
- * super("com.example.Foo", "bar", new Class<?>[]{float.class}, InjectPoint.HEAD);
+ * super("com.example.app.OrderService", "processOrder", new Class<?>[]{String.class}, InjectPoint.HEAD);
  * }</pre>
  *
  * @see FvmCallback

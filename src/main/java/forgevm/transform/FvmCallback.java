@@ -19,12 +19,12 @@ package forgevm.transform;
  *
  * <h2>Example</h2>
  * <pre>{@code
- * public static void onGetHealth(FvmCallback callback) {
+ * public static void onGetMaxRetries(FvmCallback callback) {
  *     Object target = callback.getInstance();
- *     if (target instanceof com.example.entity.Player) {
- *         callback.setReturnValue(20.0f);  // override return value
+ *     if (target instanceof com.example.app.PremiumRetryPolicy) {
+ *         callback.setReturnValue(100);  // override return value
  *     }
- *     // non-Player instances → original method runs normally
+ *     // other instances → original method runs normally
  * }
  * }</pre>
  *
