@@ -16,8 +16,7 @@
 // FVM_LOG_HEX(label, data, len) — hex dump for bytecode etc.
 // ============================================================
 
-void fvm_log_init(const char* path);   // explicit path (optional)
-void fvm_log_open_default();           // auto-detect path next to DLL
+void fvm_log_init(const char* path);   // explicit path (set via forgevm_set_log_dir)
 void fvm_log_write(const char* fmt, ...);
 void fvm_log_hex(const char* label, const void* data, size_t len);
 

@@ -23,38 +23,16 @@ void fvm_log_init(const char* path) {
     ensureLogLock();
     EnterCriticalSection(&g_logLock);
     if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
-    g_logFile = fopen(path, "a");
+    g_logFile = fopen(path, "w");
     if (g_logFile) {
-        // Write BOM-less UTF-8 header on fresh files, separator on existing
-        fprintf(g_logFile, "\n===== ForgeVM log session =====\n");
+        fprintf(g_logFile, "===== ForgeVM log session =====\n");
         fflush(g_logFile);
     }
     LeaveCriticalSection(&g_logLock);
 }
 
-void fvm_log_open_default() {
-    // Place log next to the DLL (forgevm_native.dll → forgevm.log)
-    char dllPath[MAX_PATH] = {0};
-    HMODULE hm = NULL;
-    // Get handle to this DLL
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCSTR)&fvm_log_open_default, &hm);
-    if (hm && GetModuleFileNameA(hm, dllPath, MAX_PATH)) {
-        // Replace filename with forgevm.log
-        char* lastSlash = strrchr(dllPath, '\\');
-        if (!lastSlash) lastSlash = strrchr(dllPath, '/');
-        if (lastSlash) {
-            *(lastSlash + 1) = '\0';
-            strcat_s(dllPath, MAX_PATH, "forgevm.log");
-        } else {
-            strcpy_s(dllPath, MAX_PATH, "forgevm.log");
-        }
-    } else {
-        strcpy_s(dllPath, MAX_PATH, "forgevm.log");
-    }
-    fvm_log_init(dllPath);
-}
+// fvm_log_open_default() removed — all logging is routed through
+// forgevm_set_log_dir() which places the log in ForgeVM/logs/.
 
 void fvm_log_write(const char* fmt, ...) {
     ensureLogLock();

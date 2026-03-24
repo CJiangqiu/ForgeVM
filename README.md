@@ -272,9 +272,10 @@ You need to compile `forgevm_agent.exe` and `forgevm_native.dll` yourself using 
 
 ## Logging
 
-- **Java side**: `ForgeVM/logs/forgevm.log` (relative to working directory, or `%LOCALAPPDATA%/ForgeVM/logs/`)
-- **Agent side**: `ForgeVM/logs/fvm-agent.log`
-- **Native DLL**: `forgevm.log` (next to the DLL)
+All logs are written to `ForgeVM/logs/` (relative to the working directory):
+
+- `fvm-agent.log` — Full Agent lifecycle (startup, bootstrap, command handling, shutdown)
+- `fvm-transform.log` — Transform module details (method resolution, bytecode rewriting, memory ops)
 
 ## License
 
@@ -542,9 +543,10 @@ ForgeVM 按以下顺序解析 `forgevm_agent.exe` 和 `forgevm_native.dll`：
 
 ## 日志
 
-- **Java 侧**：`ForgeVM/logs/forgevm.log`（相对于工作目录，或 `%LOCALAPPDATA%/ForgeVM/logs/`）
-- **Agent 侧**：`ForgeVM/logs/fvm-agent.log`
-- **原生 DLL**：`forgevm.log`（DLL 同目录）
+所有日志统一写入 `ForgeVM/logs/`（相对于工作目录）：
+
+- `fvm-agent.log` — Agent 完整生命周期（启动、bootstrap、命令处理、关闭）
+- `fvm-transform.log` — Transform 模块细节（方法定位、字节码重写、内存操作）
 
 ## 许可证
 

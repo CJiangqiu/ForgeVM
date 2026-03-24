@@ -284,6 +284,232 @@ bool findJavaMethod(const char* className, const char* methodName,
 }
 
 // ============================================================
+// Force deoptimization of all compiled methods
+//
+// JIT may inline the target method into callers. Modifying the
+// target Method*'s ConstMethod does NOT affect inlined copies.
+// We must mark all nmethods as "not_entrant" so the JVM
+// deoptimizes them at the next safepoint and re-interprets
+// (picking up our new bytecodes on re-compilation).
+// ============================================================
+
+static void forceDeoptimizeAll() {
+    HANDLE proc = g_target.handle;
+
+    int64_t codeOff = structOffset("Method", "_code");
+    int64_t fromCompiledOff = structOffset("Method", "_from_compiled_entry");
+    if (codeOff < 0 || fromCompiledOff < 0) {
+        FVM_LOG("WARN: Method::_code(%lld) or _from_compiled_entry(%lld) not in VMStructs",
+                (long long)codeOff, (long long)fromCompiledOff);
+        return;
+    }
+
+    int64_t nmethodStateOff = structOffset("nmethod", "_state");
+    if (nmethodStateOff < 0) nmethodStateOff = structOffset("CompiledMethod", "_state");
+
+    // === Empirically probe for Method::_adapter offset ===
+    // Strategy: find an uncompiled method (_code==NULL). Its _from_compiled_entry
+    // is the c2i adapter entry. Scan all pointer-sized fields in Method* to find
+    // which one, when dereferenced at various offsets, yields the c2i value.
+    // That field is _adapter, and the inner offset is _c2i_entry.
+    int64_t adapterOff = structOffset("Method", "_adapter");
+    int64_t c2iEntryOff = structOffset("AdapterHandlerEntry", "_c2i_entry");
+    if (c2iEntryOff < 0) c2iEntryOff = -1; // will be probed
+
+    // Walk ClassLoaderDataGraph to find all classes
+    uint64_t cldgHeadAddr = structStaticAddr("ClassLoaderDataGraph", "_head");
+    if (cldgHeadAddr == 0) cldgHeadAddr = structStaticAddr("ClassLoaderData", "_head");
+    if (cldgHeadAddr == 0) {
+        FVM_LOG("WARN: CLDG not found, cannot deoptimize");
+        return;
+    }
+
+    uint64_t cldAddr = 0;
+    if (!readRemotePointer(proc, cldgHeadAddr, &cldAddr) || cldAddr == 0) return;
+
+    int64_t cldNextOff = structOffset("ClassLoaderData", "_next");
+    if (cldNextOff < 0) cldNextOff = 8;
+    int64_t cldKlassesOff = structOffset("ClassLoaderData", "_klasses");
+    if (cldKlassesOff < 0) cldKlassesOff = 16;
+    int64_t klassNextOff = structOffset("Klass", "_next_link");
+    if (klassNextOff < 0) klassNextOff = structOffset("InstanceKlass", "_next_link");
+
+    int64_t methodsOff = structOffset("InstanceKlass", "_methods");
+    if (methodsOff < 0) { FVM_LOG("WARN: _methods not found"); return; }
+
+    int64_t arrayLengthOff = structOffset("Array<int>", "_length");
+    if (arrayLengthOff < 0) arrayLengthOff = 0;
+    int64_t arrayDataOff = structOffset("Array<int>", "_data");
+    if (arrayDataOff < 0) arrayDataOff = arrayLengthOff + 4;
+    if (arrayDataOff < 8) arrayDataOff = 8;
+
+    // === Phase 1: Probe for _adapter offset using an uncompiled method ===
+    // For an uncompiled method, _from_compiled_entry = c2i adapter entry point.
+    // We scan Method* fields to find which pointer, when dereferenced at some offset,
+    // yields the same c2i value. That gives us _adapter offset and _c2i_entry offset.
+    if (adapterOff < 0 || c2iEntryOff < 0) {
+        FVM_LOG("deopt: probing for _adapter offset empirically...");
+        bool probed = false;
+        // Walk a few classes to find an uncompiled method
+        uint64_t probeCld = cldAddr;
+        for (int pc = 0; probeCld != 0 && pc < 200 && !probed; pc++) {
+            uint64_t probeKlass = 0;
+            readRemotePointer(proc, probeCld + (uint64_t)cldKlassesOff, &probeKlass);
+            for (int pk = 0; probeKlass != 0 && pk < 1000 && !probed; pk++) {
+                uint64_t mArr = 0;
+                if (readRemotePointer(proc, probeKlass + (uint64_t)methodsOff, &mArr) && mArr != 0) {
+                    int32_t mc = 0;
+                    if (readRemoteI32(proc, mArr + (uint64_t)arrayLengthOff, &mc) && mc > 0 && mc < 10000) {
+                        std::vector<uint64_t> mps(mc);
+                        if (readRemoteMem(proc, mArr + (uint64_t)arrayDataOff, mps.data(), mc * 8)) {
+                            for (int mi = 0; mi < mc && !probed; mi++) {
+                                if (mps[mi] == 0) continue;
+                                uint64_t nmCheck = 0;
+                                readRemotePointer(proc, mps[mi] + (uint64_t)codeOff, &nmCheck);
+                                if (nmCheck != 0) continue; // skip compiled methods
+
+                                // This method is uncompiled. Read _from_compiled_entry = c2i entry.
+                                uint64_t c2iTarget = 0;
+                                readRemotePointer(proc, mps[mi] + (uint64_t)fromCompiledOff, &c2iTarget);
+                                if (c2iTarget == 0) continue;
+
+                                // Scan Method* at offsets 0..88 (every 8 bytes) for a pointer
+                                // that, when dereferenced at offset 8/16/24/32, yields c2iTarget
+                                uint8_t methodBytes[96];
+                                if (!readRemoteMem(proc, mps[mi], methodBytes, 96)) continue;
+
+                                for (int off = 0; off <= 88 && !probed; off += 8) {
+                                    // Skip known fields
+                                    if (off == (int)fromCompiledOff || off == (int)codeOff) continue;
+                                    uint64_t fieldVal = 0;
+                                    memcpy(&fieldVal, methodBytes + off, 8);
+                                    if (fieldVal == 0 || fieldVal < 0x10000) continue;
+
+                                    // Try dereferencing at inner offsets 0,8,16,24,32
+                                    for (int inner = 0; inner <= 32; inner += 8) {
+                                        uint64_t candidate = 0;
+                                        if (readRemotePointer(proc, fieldVal + inner, &candidate)
+                                            && candidate == c2iTarget && candidate != 0) {
+                                            adapterOff = off;
+                                            c2iEntryOff = inner;
+                                            FVM_LOG("deopt: FOUND _adapter offset=%d, c2i_entry offset=%d "
+                                                    "(probed from Method=0x%llX, c2i=0x%llX, adapter=0x%llX)",
+                                                    off, inner, (unsigned long long)mps[mi],
+                                                    (unsigned long long)c2iTarget,
+                                                    (unsigned long long)fieldVal);
+                                            probed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                uint64_t nk = 0;
+                if (klassNextOff < 0 || !readRemotePointer(proc, probeKlass + (uint64_t)klassNextOff, &nk)) break;
+                probeKlass = nk;
+            }
+            uint64_t nc = 0;
+            if (!readRemotePointer(proc, probeCld + (uint64_t)cldNextOff, &nc)) break;
+            probeCld = nc;
+        }
+        if (!probed) {
+            FVM_LOG("deopt: WARNING - could not probe _adapter offset, c2i redirect will be skipped");
+        }
+    }
+
+    FVM_LOG("deopt offsets: _code=%lld, _from_compiled_entry=%lld, _adapter=%lld, c2i_entry=%lld, nmethod_state=%lld",
+            (long long)codeOff, (long long)fromCompiledOff, (long long)adapterOff,
+            (long long)c2iEntryOff, (long long)nmethodStateOff);
+
+    // === Phase 2: Walk all methods, deoptimize compiled ones ===
+    int deoptCount = 0, c2iCount = 0;
+    int klassCount = 0;
+
+    for (int cldC = 0; cldAddr != 0 && cldC < 10000; cldC++) {
+        uint64_t klassAddr = 0;
+        readRemotePointer(proc, cldAddr + (uint64_t)cldKlassesOff, &klassAddr);
+
+        for (int kc = 0; klassAddr != 0 && kc < 100000; kc++) {
+            klassCount++;
+
+            // Read _methods array
+            uint64_t methodsArrayAddr = 0;
+            if (readRemotePointer(proc, klassAddr + (uint64_t)methodsOff, &methodsArrayAddr)
+                && methodsArrayAddr != 0) {
+
+                int32_t methodCount = 0;
+                if (readRemoteI32(proc, methodsArrayAddr + (uint64_t)arrayLengthOff, &methodCount)
+                    && methodCount > 0 && methodCount < 100000) {
+
+                    // Read all Method* pointers in one go
+                    std::vector<uint64_t> methodPtrs(methodCount);
+                    if (readRemoteMem(proc, methodsArrayAddr + (uint64_t)arrayDataOff,
+                                       methodPtrs.data(), methodCount * 8)) {
+
+                        for (int m = 0; m < methodCount; m++) {
+                            uint64_t mAddr = methodPtrs[m];
+                            if (mAddr == 0) continue;
+
+                            // Read Method::_code (nmethod pointer)
+                            uint64_t nmAddr = 0;
+                            if (!readRemotePointer(proc, mAddr + (uint64_t)codeOff, &nmAddr)
+                                || nmAddr == 0) continue;
+
+                            // 1. Mark nmethod as not_entrant (state = 1)
+                            if (nmethodStateOff >= 0) {
+                                uint8_t notEntrant = 1;
+                                writeRemoteMem(proc, nmAddr + (uint64_t)nmethodStateOff, &notEntrant, 1);
+                            }
+
+                            // 2. Read c2i adapter and redirect _from_compiled_entry
+                            if (adapterOff >= 0 && c2iEntryOff >= 0) {
+                                uint64_t adapterAddr = 0;
+                                if (readRemotePointer(proc, mAddr + (uint64_t)adapterOff, &adapterAddr)
+                                    && adapterAddr != 0) {
+                                    uint64_t c2iEntry = 0;
+                                    if (readRemotePointer(proc, adapterAddr + (uint64_t)c2iEntryOff, &c2iEntry)
+                                        && c2iEntry != 0) {
+                                        writeRemoteMem(proc, mAddr + (uint64_t)fromCompiledOff, &c2iEntry, 8);
+                                        if (c2iCount < 3) {
+                                            FVM_LOG("  deopt sample[%d]: Method=0x%llX c2i=0x%llX nmethod=0x%llX",
+                                                    c2iCount, (unsigned long long)mAddr,
+                                                    (unsigned long long)c2iEntry,
+                                                    (unsigned long long)nmAddr);
+                                        }
+                                        c2iCount++;
+                                    }
+                                }
+                            }
+
+                            // 3. Clear Method::_code
+                            uint64_t zero = 0;
+                            writeRemoteMem(proc, mAddr + (uint64_t)codeOff, &zero, 8);
+
+                            deoptCount++;
+                        }
+                    }
+                }
+            }
+
+            // Next klass
+            if (klassNextOff < 0) break;
+            uint64_t nextKlass = 0;
+            if (!readRemotePointer(proc, klassAddr + (uint64_t)klassNextOff, &nextKlass)) break;
+            klassAddr = nextKlass;
+        }
+
+        // Next CLD
+        uint64_t nextCld = 0;
+        if (!readRemotePointer(proc, cldAddr + (uint64_t)cldNextOff, &nextCld)) break;
+        cldAddr = nextCld;
+    }
+
+    FVM_LOG("deopt sweep: visited %d classes, deopt %d methods, c2i-redirected %d", klassCount, deoptCount, c2iCount);
+}
+
+// ============================================================
 // Read ConstMethod bytecode
 // ============================================================
 
@@ -996,15 +1222,76 @@ int applyTransform(const char* className, const char* methodName, const char* pa
             memcpy(newCacheBytes.data(), origCacheBytes.data(), origCacheSize);
             memcpy(newCacheBytes.data() + cacheLenOff, &newCacheLen, 4);
 
-            // Initialize new cache entries: _indices = CP index of Methodref
+            // PRE-RESOLVE new cache entries.
+            // CRITICAL: In modular class loader environments (e.g. Forge), the target class's
+            // class loader cannot see FvmCallback/hook classes (loaded by a child mod loader).
+            // If we leave entries unresolved, the interpreter calls LinkResolver which performs
+            // class loader constraint checks → ClassNotFoundException → silent failure.
+            // By pre-resolving (setting bytecode marker + _f1 + _flags), the interpreter
+            // uses the cached Method* directly, bypassing LinkResolver entirely.
+
             int64_t indicesFieldOff = structOffset("ConstantPoolCacheEntry", "_indices");
             if (indicesFieldOff < 0) indicesFieldOff = 0;
+            int64_t f1FieldOff = structOffset("ConstantPoolCacheEntry", "_f1");
+            if (f1FieldOff < 0) f1FieldOff = 8;
+            int64_t f2FieldOff = structOffset("ConstantPoolCacheEntry", "_f2");
+            if (f2FieldOff < 0) f2FieldOff = 16;
+            int64_t flagsFieldOff = structOffset("ConstantPoolCacheEntry", "_flags");
+            if (flagsFieldOff < 0) flagsFieldOff = 24;
 
+            // CP indices for each Methodref entry
             int cpIdxTable[] = { (int)(P+16), (int)(P+17), (int)(P+18), (int)(P+19), (int)(P+25) };
+
+            // Bytecodes: invokestatic for hook, invokespecial for all others
+            // All use bytecode_1 (invokevirtual would use bytecode_2, but we avoid it)
+            uint8_t bcTable[] = { 0xB8, 0xB7, 0xB7, 0xB7, 0xB7 };
+
+            // Method* for each entry: hook, <init>, isCancelled, getReturnValue, unbox
+            uint64_t methodTable[] = { hookMethodAddr, cbInitMethodAddr, cbIsCancelledAddr,
+                                       cbGetReturnAddr, unboxMethodAddr };
+
+            // TOS state: vtos=9(void), itos=4(int/bool), atos=8(object)
+            // _flags = (tos_state << 28) | parameter_size
+            // param_size: invokestatic counts args only; invokespecial counts this + args
+            int64_t flagsTable[5];
+            flagsTable[0] = ((int64_t)9 << 28) | 1;  // hook(FvmCallback)V: void, 1 param
+            flagsTable[1] = ((int64_t)9 << 28) | 2;  // <init>(Object)V:    void, 2 params (this+arg)
+            flagsTable[2] = ((int64_t)4 << 28) | 1;  // isCancelled()Z:     int,  1 param  (this)
+            flagsTable[3] = ((int64_t)8 << 28) | 1;  // getReturnValue()O:  obj,  1 param  (this)
+            flagsTable[4] = 0;                         // unbox: computed below
+
+            if (unbox.needsUnbox) {
+                // Determine unbox TOS state from return bytecode
+                int unboxTos = 4; // default itos
+                switch (unbox.returnOp) {
+                    case 0xAC: unboxTos = 4; break; // ireturn → itos
+                    case 0xAD: unboxTos = 5; break; // lreturn → ltos
+                    case 0xAE: unboxTos = 6; break; // freturn → ftos
+                    case 0xAF: unboxTos = 7; break; // dreturn → dtos
+                    case 0xB0: unboxTos = 8; break; // areturn → atos
+                    default:   unboxTos = 9; break; // return  → vtos
+                }
+                flagsTable[4] = ((int64_t)unboxTos << 28) | 1; // 1 param (this)
+            }
+
             for (int i = 0; i < numNewCacheEntries; i++) {
                 uint8_t* entry = newCacheBytes.data() + cacheHdrSize + (origCacheLen + i) * cacheEntrySize;
-                int32_t cpIdx = cpIdxTable[i];
-                memcpy(entry + indicesFieldOff, &cpIdx, 4);
+
+                // _indices: CP index in lower 16 bits, bytecode_1 in bits 16-23
+                int64_t indicesVal = (int64_t)cpIdxTable[i] | ((int64_t)bcTable[i] << 16);
+                memcpy(entry + indicesFieldOff, &indicesVal, 8);
+
+                // _f1: resolved Method* (interpreter reads this directly for static/special)
+                uint64_t f1Val = methodTable[i];
+                memcpy(entry + f1FieldOff, &f1Val, 8);
+
+                // _f2: 0 (unused for invokestatic/invokespecial)
+                uint64_t f2Val = 0;
+                memcpy(entry + f2FieldOff, &f2Val, 8);
+
+                // _flags: (tos_state << 28) | parameter_size
+                int64_t flagsVal = flagsTable[i];
+                memcpy(entry + flagsFieldOff, &flagsVal, 8);
             }
 
             newCacheAddr = (uint64_t)VirtualAllocEx(proc, NULL, newCacheSize,
@@ -1016,8 +1303,12 @@ int applyTransform(const char* className, const char* methodName, const char* pa
 
             FVM_LOG("CPCache: origLen=%d, newLen=%d, entrySize=%lld, newAddr=0x%llX",
                     origCacheLen, newCacheLen, (long long)cacheEntrySize, (unsigned long long)newCacheAddr);
+            FVM_LOG("CPCache field offsets: _indices=%lld, _f1=%lld, _f2=%lld, _flags=%lld",
+                    (long long)indicesFieldOff, (long long)f1FieldOff, (long long)f2FieldOff, (long long)flagsFieldOff);
             for (int i = 0; i < numNewCacheEntries; i++) {
-                FVM_LOG("  cache[%d] -> _indices CP idx = %d", origCacheLen + i, cpIdxTable[i]);
+                FVM_LOG("  cache[%d]: cpIdx=%d bc=0x%02X f1=0x%llX flags=0x%llX [PRE-RESOLVED]",
+                        origCacheLen + i, cpIdxTable[i], bcTable[i],
+                        (unsigned long long)methodTable[i], (unsigned long long)flagsTable[i]);
             }
         }
     }
@@ -1029,8 +1320,8 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     uint16_t cbClassCpIdx     = (uint16_t)(P + 11);           // FvmCallback class (for 'new')
     uint16_t hookCacheIdx16   = (uint16_t)hookCacheIdx;        // invokestatic hook
     uint16_t initCacheIdx16   = (uint16_t)initCacheIdx;        // invokespecial <init>
-    uint16_t cancelCacheIdx16 = (uint16_t)cancelCacheIdx;      // invokevirtual isCancelled
-    uint16_t retValCacheIdx16 = (uint16_t)retValCacheIdx;      // invokevirtual getReturnValue
+    uint16_t cancelCacheIdx16 = (uint16_t)cancelCacheIdx;      // invokespecial isCancelled
+    uint16_t retValCacheIdx16 = (uint16_t)retValCacheIdx;      // invokespecial getReturnValue
     uint16_t unboxClassCpIdx  = unbox.needsUnbox ? (uint16_t)(P + 23) : 0; // wrapper Class (for checkcast)
     uint16_t unboxCacheIdx16  = unbox.needsUnbox ? (uint16_t)unboxCacheIdx : 0;
 
@@ -1038,10 +1329,10 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     FVM_LOG("  new FvmCallback CP idx = %u (big-endian)", (unsigned)cbClassCpIdx);
     FVM_LOG("  invokespecial <init>     cache idx = %u (native-endian)", (unsigned)initCacheIdx16);
     FVM_LOG("  invokestatic hook        cache idx = %u (native-endian)", (unsigned)hookCacheIdx16);
-    FVM_LOG("  invokevirtual isCancelled cache idx = %u (native-endian)", (unsigned)cancelCacheIdx16);
-    FVM_LOG("  invokevirtual getRetVal   cache idx = %u (native-endian)", (unsigned)retValCacheIdx16);
+    FVM_LOG("  invokespecial isCancelled cache idx = %u (native-endian)", (unsigned)cancelCacheIdx16);
+    FVM_LOG("  invokespecial getRetVal   cache idx = %u (native-endian)", (unsigned)retValCacheIdx16);
     if (unbox.needsUnbox) {
-        FVM_LOG("  checkcast unbox CP idx = %u, invokevirtual unbox cache idx = %u",
+        FVM_LOG("  checkcast unbox CP idx = %u, invokespecial unbox cache idx = %u",
                 (unsigned)unboxClassCpIdx, (unsigned)unboxCacheIdx16);
     }
 
@@ -1068,8 +1359,10 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         cancelReturn.push_back(0x57); // pop
         cancelReturn.push_back(0xB1); // return
     } else {
-        // invokevirtual getReturnValue (cache index, native byte order) → [Object]
-        cancelReturn.push_back(0xB6);
+        // invokespecial getReturnValue (cache index, native byte order) → [Object]
+        // Using invokespecial instead of invokevirtual to enable CP cache pre-resolution
+        // (bypasses class loader constraints in modular class loader environments)
+        cancelReturn.push_back(0xB7);
         cancelReturn.push_back((uint8_t)(retValCacheIdx16 & 0xFF));
         cancelReturn.push_back((uint8_t)((retValCacheIdx16 >> 8) & 0xFF));
 
@@ -1078,8 +1371,8 @@ int applyTransform(const char* className, const char* methodName, const char* pa
             cancelReturn.push_back(0xC0);
             cancelReturn.push_back((uint8_t)(unboxClassCpIdx >> 8));
             cancelReturn.push_back((uint8_t)(unboxClassCpIdx & 0xFF));
-            // invokevirtual unboxMethod (cache index, native byte order) → [primitive]
-            cancelReturn.push_back(0xB6);
+            // invokespecial unboxMethod (cache index, native byte order) → [primitive]
+            cancelReturn.push_back(0xB7);
             cancelReturn.push_back((uint8_t)(unboxCacheIdx16 & 0xFF));
             cancelReturn.push_back((uint8_t)((unboxCacheIdx16 >> 8) & 0xFF));
         }
@@ -1101,7 +1394,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         bc.push_back(0x59);                                        // dup → [cb, cb]
         bc.push_back(0x59);                                        // dup → [cb, cb, cb]
         bc.push_back(0xB8); emitNativeIdx(bc, hookCacheIdx16);    // invokestatic hook (cache idx, native) → [cb, cb]
-        bc.push_back(0xB6); emitNativeIdx(bc, cancelCacheIdx16);  // invokevirtual isCancelled (cache idx, native) → [cb, int]
+        bc.push_back(0xB7); emitNativeIdx(bc, cancelCacheIdx16);  // invokespecial isCancelled (cache idx, native) → [cb, int]
         bc.push_back(0x99);                                        // ifeq (branch offset, big-endian)
         bc.push_back((uint8_t)(ifeqOffset >> 8));
         bc.push_back((uint8_t)(ifeqOffset & 0xFF));
@@ -1132,6 +1425,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     FVM_LOG("new bytecode built: %zu bytes (orig %u, delta +%zu)",
             newBytecode.size(), codeSize, newBytecode.size() - codeSize);
     FVM_LOG_HEX("new bytecode", newBytecode.data(), newBytecode.size());
+
 
     // 13. Build new ConstMethod with updated bytecode
     // Read entire original ConstMethod
@@ -1290,18 +1584,39 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         FVM_LOG("cleared Method::_code (offset %lld)", (long long)codeOff);
     }
 
-    // Clear Method::_from_compiled_entry and _from_interpreted_entry to force re-resolution
+    // Clear Method::_from_compiled_entry to prevent JIT-compiled code from running
     int64_t fromCompiledOff = structOffset("Method", "_from_compiled_entry");
-    int64_t fromInterpOff = structOffset("Method", "_from_interpreted_entry");
     if (fromCompiledOff >= 0) {
         uint64_t zero = 0;
         writeRemoteMem(proc, methodAddr + (uint64_t)fromCompiledOff, &zero, 8);
         FVM_LOG("cleared Method::_from_compiled_entry (offset %lld)", (long long)fromCompiledOff);
     }
-    // Note: _from_interpreted_entry should point to the interpreter entry stub
-    // Zeroing it may cause issues; the interpreter will re-resolve it on next call
-    // For safety, we leave _from_interpreted_entry alone — clearing _code is sufficient
-    // to force the JVM to re-enter the interpreter path.
+
+    // Reset Method::_from_interpreted_entry so the interpreter picks up the new bytecode.
+    // Try _i2i_entry first; if not found in VMStructs, zero it out to force re-resolution.
+    int64_t fromInterpOff = structOffset("Method", "_from_interpreted_entry");
+    int64_t i2iOff = structOffset("Method", "_i2i_entry");
+    FVM_LOG("entry offsets: _from_interpreted_entry=%lld, _i2i_entry=%lld", (long long)fromInterpOff, (long long)i2iOff);
+    if (fromInterpOff >= 0) {
+        bool reset = false;
+        if (i2iOff >= 0) {
+            uint64_t i2iEntry = 0;
+            if (readRemotePointer(proc, methodAddr + (uint64_t)i2iOff, &i2iEntry) && i2iEntry != 0) {
+                writeRemoteMem(proc, methodAddr + (uint64_t)fromInterpOff, &i2iEntry, 8);
+                FVM_LOG("reset _from_interpreted_entry to _i2i_entry (0x%llX)", (unsigned long long)i2iEntry);
+                reset = true;
+            }
+        }
+        if (!reset) {
+            // _i2i_entry not in VMStructs or unreadable — zero _from_interpreted_entry
+            // to force JVM to rebuild entry point on next call
+            uint64_t zero = 0;
+            writeRemoteMem(proc, methodAddr + (uint64_t)fromInterpOff, &zero, 8);
+            FVM_LOG("zeroed _from_interpreted_entry (offset %lld), _i2i_entry unavailable", (long long)fromInterpOff);
+        }
+    } else {
+        FVM_LOG("WARN: _from_interpreted_entry not in VMStructs, cannot reset");
+    }
 
     resumeTargetThreads(threadIds);
     FVM_LOG("resumed %zu threads", threadIds.size());
@@ -1319,6 +1634,51 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     backup.allocatedConstMethodSize = newConstMethodSize;
     backup.allocatedConstPoolSize = newPoolByteSize;
     g_transformBackups[key] = backup;
+
+    // 14. Force deoptimization of ALL compiled methods.
+    FVM_LOG("starting global deoptimization sweep (force JIT to pick up new bytecodes)...");
+    forceDeoptimizeAll();
+
+    // 15. Readback verification: confirm the swap is intact after deopt sweep
+    {
+        uint64_t readbackCM = 0;
+        if (readRemotePointer(proc, methodAddr + (uint64_t)constMethodOff, &readbackCM)) {
+            if (readbackCM == newConstMethodAlloc) {
+                FVM_LOG("VERIFY: Method::_constMethod = 0x%llX (OK, matches new)",
+                        (unsigned long long)readbackCM);
+            } else {
+                FVM_LOG("VERIFY FAIL: Method::_constMethod = 0x%llX, expected 0x%llX",
+                        (unsigned long long)readbackCM, (unsigned long long)newConstMethodAlloc);
+            }
+        }
+        // Read first 8 bytes of bytecodes from new ConstMethod
+        uint8_t bcCheck[8] = {0};
+        if (readRemoteMem(proc, newConstMethodAlloc + (uint64_t)constMethodTypeSize, bcCheck, 8)) {
+            FVM_LOG("VERIFY bytecodes at ConstMethod+%lld: %02X %02X %02X %02X %02X %02X %02X %02X (expect BB 13 A6 59 2A B7 ...)",
+                    (long long)constMethodTypeSize,
+                    bcCheck[0], bcCheck[1], bcCheck[2], bcCheck[3],
+                    bcCheck[4], bcCheck[5], bcCheck[6], bcCheck[7]);
+        }
+        // Read _constants pointer from new ConstMethod
+        int64_t cmcOff = structOffset("ConstMethod", "_constants");
+        if (cmcOff >= 0) {
+            uint64_t readbackCP = 0;
+            if (readRemotePointer(proc, newConstMethodAlloc + (uint64_t)cmcOff, &readbackCP)) {
+                FVM_LOG("VERIFY: ConstMethod::_constants = 0x%llX (expected newPool=0x%llX) %s",
+                        (unsigned long long)readbackCP, (unsigned long long)newPoolAddr,
+                        readbackCP == newPoolAddr ? "OK" : "MISMATCH!");
+            }
+        }
+        // Read _from_interpreted_entry and _i2i_entry
+        if (fromInterpOff >= 0 && i2iOff >= 0) {
+            uint64_t fie = 0, i2i = 0;
+            readRemotePointer(proc, methodAddr + (uint64_t)fromInterpOff, &fie);
+            readRemotePointer(proc, methodAddr + (uint64_t)i2iOff, &i2i);
+            FVM_LOG("VERIFY: _from_interpreted_entry=0x%llX, _i2i_entry=0x%llX %s",
+                    (unsigned long long)fie, (unsigned long long)i2i,
+                    fie == i2i ? "OK" : "MISMATCH!");
+        }
+    }
 
     FVM_LOG("=== TRANSFORM SUCCESS: %s ===", key.c_str());
     setError("ok");
@@ -1370,6 +1730,26 @@ int restoreTransform(const char* className, const char* methodName, const char* 
         writeRemoteMem(proc, backup.methodAddr + (uint64_t)fromCompiledOff, &zero, 8);
     }
 
+    // Reset _from_interpreted_entry (same logic as in applyTransform)
+    int64_t fromInterpOff = structOffset("Method", "_from_interpreted_entry");
+    int64_t i2iOff = structOffset("Method", "_i2i_entry");
+    if (fromInterpOff >= 0) {
+        bool reset = false;
+        if (i2iOff >= 0) {
+            uint64_t i2iEntry = 0;
+            if (readRemotePointer(proc, backup.methodAddr + (uint64_t)i2iOff, &i2iEntry) && i2iEntry != 0) {
+                writeRemoteMem(proc, backup.methodAddr + (uint64_t)fromInterpOff, &i2iEntry, 8);
+                FVM_LOG("reset _from_interpreted_entry to _i2i_entry (0x%llX)", (unsigned long long)i2iEntry);
+                reset = true;
+            }
+        }
+        if (!reset) {
+            uint64_t zero = 0;
+            writeRemoteMem(proc, backup.methodAddr + (uint64_t)fromInterpOff, &zero, 8);
+            FVM_LOG("zeroed _from_interpreted_entry (offset %lld)", (long long)fromInterpOff);
+        }
+    }
+
     resumeTargetThreads(threadIds);
     FVM_LOG("resumed %zu threads", threadIds.size());
 
@@ -1389,6 +1769,10 @@ int restoreTransform(const char* className, const char* methodName, const char* 
     FVM_LOG("freed allocated memory (constMethod/constPool/cache/resolvedKlasses)");
 
     g_transformBackups.erase(it);
+
+    // Force deoptimization so callers pick up the restored original bytecodes
+    FVM_LOG("starting global deoptimization sweep (restore)...");
+    forceDeoptimizeAll();
 
     FVM_LOG("=== RESTORE SUCCESS: %s ===", key.c_str());
     setError("ok");

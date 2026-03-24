@@ -28,9 +28,9 @@ static void agentLogInit(const std::string& logDir) {
     } else {
         logPath = "fvm-agent.log";
     }
-    g_agentLog = fopen(logPath.c_str(), "a");
+    g_agentLog = fopen(logPath.c_str(), "w");
     if (g_agentLog) {
-        fprintf(g_agentLog, "\n===== ForgeVM Agent session =====\n");
+        fprintf(g_agentLog, "===== ForgeVM Agent session =====\n");
         fflush(g_agentLog);
     }
 }
