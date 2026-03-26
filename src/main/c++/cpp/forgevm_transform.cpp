@@ -975,7 +975,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
 
     // Find FvmCallback class and methods
     uint64_t cbKlassAddr = 0;
-    if (!findInstanceKlassByName("forgevm/transform/FvmCallback", &cbKlassAddr)) {
+    if (!findInstanceKlassByName("forgevm/forge/FvmCallback", &cbKlassAddr)) {
         setError("FvmCallback_class_not_loaded"); return 0;
     }
     uint64_t cbInitMethodAddr = 0;
@@ -1559,18 +1559,267 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         bc.push_back(0x57); // pop → []
     };
 
-    if (injectAtStr == "HEAD") {
+    // Bytecode instruction length table (for proper traversal)
+    // -1 = variable length (tableswitch, lookupswitch, wide)
+    static const int8_t bcLengths[256] = {
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // 0x00-0x0F
+        2,3,2,3,3,2,2,2,2,2,1,1,1,1,1,1, // 0x10-0x1F
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // 0x20-0x2F
+        1,1,1,1,1,1,2,2,2,2,2,1,1,1,1,1, // 0x30-0x3F
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // 0x40-0x4F
+        1,1,1,1,2,2,2,2,2,1,1,1,1,1,1,1, // 0x50-0x5F
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // 0x60-0x6F
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // 0x70-0x7F
+        1,1,1,1,2,1,1,1,1,1,1,1,1,1,1,1, // 0x80-0x8F
+        1,1,1,1,1,1,1,1,1,3,3,3,3,3,3,3, // 0x90-0x9F
+        3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3, // 0xA0-0xAF  (0xAC-0xB1 = return ops)
+        1,1,1,1,1,1,3,3,3,5,1,1,1,1,1,1, // 0xB0-0xBF  (0xB2-0xB6=field/invoke 3bytes, 0xB9=invokeinterface 5bytes)
+        3,3,3,3,3,2,-1,-1,3,3,1,1,1,1,1,1, // 0xC0-0xCF (0xC4=wide, 0xAA/0xAB=switch → handled below)
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // 0xD0-0xDF
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // 0xE0-0xEF
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, // 0xF0-0xFF
+    };
+
+    // Helper: get instruction length at a given offset
+    auto getInsnLength = [&](size_t off) -> int {
+        uint8_t op = origBytecode[off];
+        if (op == 0xAA) { // tableswitch
+            int pad = (4 - ((off + 1) % 4)) % 4;
+            if (off + 1 + pad + 12 > origBytecode.size()) return -1;
+            int32_t lo, hi;
+            memcpy(&lo, &origBytecode[off + 1 + pad + 4], 4); lo = _byteswap_ulong(lo);
+            memcpy(&hi, &origBytecode[off + 1 + pad + 8], 4); hi = _byteswap_ulong(hi);
+            return 1 + pad + 12 + (hi - lo + 1) * 4;
+        }
+        if (op == 0xAB) { // lookupswitch
+            int pad = (4 - ((off + 1) % 4)) % 4;
+            if (off + 1 + pad + 8 > origBytecode.size()) return -1;
+            int32_t npairs;
+            memcpy(&npairs, &origBytecode[off + 1 + pad + 4], 4); npairs = _byteswap_ulong(npairs);
+            return 1 + pad + 8 + npairs * 8;
+        }
+        if (op == 0xC4) { // wide
+            if (off + 1 >= origBytecode.size()) return -1;
+            uint8_t wideOp = origBytecode[off + 1];
+            return (wideOp == 0x84) ? 6 : 4; // wide iinc = 6, others = 4
+        }
+        int len = bcLengths[op];
+        return len > 0 ? len : 1;
+    };
+
+    // Helper: resolve method name from a CP cache index in bytecode (invoke instructions)
+    // invoke bytecodes use native-endian CP cache indices in rewritten bytecode,
+    // but in original bytecode they use big-endian CP indices.
+    auto resolveInvokeMethodName = [&](size_t invokeOff) -> std::string {
+        if (invokeOff + 2 >= origBytecode.size()) return "";
+        // Original bytecode: big-endian CP index
+        uint16_t cpIdx = ((uint16_t)origBytecode[invokeOff + 1] << 8) | origBytecode[invokeOff + 2];
+        // CP entry at cpIdx is a Methodref: hi16 = class, lo16 = NameAndType
+        // Read the CP slot
+        int64_t cpHeaderSize_ = typeSize("ConstantPool");
+        if (cpHeaderSize_ < 0) cpHeaderSize_ = 0x138;
+        uint64_t cpSlotAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)cpIdx * 8;
+        uint64_t methodrefSlot = 0;
+        if (!readRemotePointer(proc, cpSlotAddr, &methodrefSlot)) return "";
+        // NameAndType index is in the low 16 bits
+        uint16_t natIdx = (uint16_t)(methodrefSlot & 0xFFFF);
+        // Read NameAndType slot: hi16 = descriptor, lo16 = name
+        uint64_t natSlotAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)natIdx * 8;
+        uint64_t natSlot = 0;
+        if (!readRemotePointer(proc, natSlotAddr, &natSlot)) return "";
+        uint16_t nameIdx = (uint16_t)(natSlot & 0xFFFF);
+        // Read name symbol
+        uint64_t nameSymAddr = 0;
+        uint64_t nameEntryAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)nameIdx * 8;
+        if (!readRemotePointer(proc, nameEntryAddr, &nameSymAddr) || nameSymAddr == 0) return "";
+        std::string name;
+        readSymbolBody(proc, nameSymAddr, &name);
+        return name;
+    };
+
+    // Helper: resolve field name from CP index (getfield/putfield/getstatic/putstatic)
+    auto resolveFieldName = [&](size_t fieldOff) -> std::string {
+        if (fieldOff + 2 >= origBytecode.size()) return "";
+        uint16_t cpIdx = ((uint16_t)origBytecode[fieldOff + 1] << 8) | origBytecode[fieldOff + 2];
+        int64_t cpHeaderSize_ = typeSize("ConstantPool");
+        if (cpHeaderSize_ < 0) cpHeaderSize_ = 0x138;
+        uint64_t cpSlotAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)cpIdx * 8;
+        uint64_t fieldrefSlot = 0;
+        if (!readRemotePointer(proc, cpSlotAddr, &fieldrefSlot)) return "";
+        uint16_t natIdx = (uint16_t)(fieldrefSlot & 0xFFFF);
+        uint64_t natSlotAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)natIdx * 8;
+        uint64_t natSlot = 0;
+        if (!readRemotePointer(proc, natSlotAddr, &natSlot)) return "";
+        uint16_t nameIdx = (uint16_t)(natSlot & 0xFFFF);
+        uint64_t nameSymAddr = 0;
+        uint64_t nameEntryAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)nameIdx * 8;
+        if (!readRemotePointer(proc, nameEntryAddr, &nameSymAddr) || nameSymAddr == 0) return "";
+        std::string name;
+        readSymbolBody(proc, nameSymAddr, &name);
+        return name;
+    };
+
+    // Helper: resolve class name from CP index (new instruction)
+    auto resolveNewClassName = [&](size_t newOff) -> std::string {
+        if (newOff + 2 >= origBytecode.size()) return "";
+        uint16_t cpIdx = ((uint16_t)origBytecode[newOff + 1] << 8) | origBytecode[newOff + 2];
+        int64_t cpHeaderSize_ = typeSize("ConstantPool");
+        if (cpHeaderSize_ < 0) cpHeaderSize_ = 0x138;
+        uint64_t cpSlotAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)cpIdx * 8;
+        uint64_t classSlot = 0;
+        if (!readRemotePointer(proc, cpSlotAddr, &classSlot)) return "";
+        // Class entry: name index in low 16 bits
+        uint16_t nameIdx = (uint16_t)(classSlot & 0xFFFF);
+        uint64_t nameSymAddr = 0;
+        uint64_t nameEntryAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)nameIdx * 8;
+        if (!readRemotePointer(proc, nameEntryAddr, &nameSymAddr) || nameSymAddr == 0) return "";
+        std::string name;
+        readSymbolBody(proc, nameSymAddr, &name);
+        return name;
+    };
+
+    // Parse injectAt — may be "HEAD", "RETURN", or "INVOKE:methodName", "FIELD_GET:fieldName", etc.
+    std::string injectType = injectAtStr;
+    std::string injectTargetName;
+    size_t colonPos = injectAtStr.find(':');
+    if (colonPos != std::string::npos) {
+        injectType = injectAtStr.substr(0, colonPos);
+        injectTargetName = injectAtStr.substr(colonPos + 1);
+    }
+
+    if (injectType == "HEAD") {
         newBytecode.reserve(origBytecode.size() + 50);
         emitCallbackPrologue(newBytecode);
         newBytecode.insert(newBytecode.end(), origBytecode.begin(), origBytecode.end());
-    } else if (injectAtStr == "RETURN") {
+    } else if (injectType == "RETURN") {
         newBytecode.reserve(origBytecode.size() + 50);
-        for (size_t i = 0; i < origBytecode.size(); i++) {
+        for (size_t i = 0; i < origBytecode.size(); ) {
             uint8_t op = origBytecode[i];
             if (op >= 0xAC && op <= 0xB1) {
                 emitCallbackPrologue(newBytecode);
+                newBytecode.push_back(op);
+                i++;
+            } else {
+                int len = getInsnLength(i);
+                if (len <= 0) len = 1;
+                for (int j = 0; j < len && i + j < origBytecode.size(); j++) {
+                    newBytecode.push_back(origBytecode[i + j]);
+                }
+                i += len;
             }
-            newBytecode.push_back(op);
+        }
+    } else if (injectType == "INVOKE") {
+        // Find invoke instruction targeting the specified method
+        bool found = false;
+        newBytecode.reserve(origBytecode.size() + 50);
+        for (size_t i = 0; i < origBytecode.size(); ) {
+            uint8_t op = origBytecode[i];
+            int len = getInsnLength(i);
+            if (len <= 0) len = 1;
+
+            // invokevirtual=0xB6, invokespecial=0xB7, invokestatic=0xB8, invokeinterface=0xB9
+            if (!found && op >= 0xB6 && op <= 0xB9) {
+                std::string mName = resolveInvokeMethodName(i);
+                if (mName == injectTargetName) {
+                    FVM_LOG("INVOKE inject: found %s at bytecode offset %zu", mName.c_str(), i);
+                    emitCallbackPrologue(newBytecode);
+                    found = true;
+                }
+            }
+
+            for (int j = 0; j < len && i + j < origBytecode.size(); j++) {
+                newBytecode.push_back(origBytecode[i + j]);
+            }
+            i += len;
+        }
+        if (!found) {
+            setError("invoke_target_not_found:" + injectTargetName);
+            return 0;
+        }
+    } else if (injectType == "FIELD_GET") {
+        bool found = false;
+        newBytecode.reserve(origBytecode.size() + 50);
+        for (size_t i = 0; i < origBytecode.size(); ) {
+            uint8_t op = origBytecode[i];
+            int len = getInsnLength(i);
+            if (len <= 0) len = 1;
+
+            // getfield=0xB4, getstatic=0xB2
+            if (!found && (op == 0xB4 || op == 0xB2)) {
+                std::string fName = resolveFieldName(i);
+                if (fName == injectTargetName) {
+                    FVM_LOG("FIELD_GET inject: found %s at bytecode offset %zu", fName.c_str(), i);
+                    emitCallbackPrologue(newBytecode);
+                    found = true;
+                }
+            }
+
+            for (int j = 0; j < len && i + j < origBytecode.size(); j++) {
+                newBytecode.push_back(origBytecode[i + j]);
+            }
+            i += len;
+        }
+        if (!found) {
+            setError("field_get_target_not_found:" + injectTargetName);
+            return 0;
+        }
+    } else if (injectType == "FIELD_PUT") {
+        bool found = false;
+        newBytecode.reserve(origBytecode.size() + 50);
+        for (size_t i = 0; i < origBytecode.size(); ) {
+            uint8_t op = origBytecode[i];
+            int len = getInsnLength(i);
+            if (len <= 0) len = 1;
+
+            // putfield=0xB5, putstatic=0xB3
+            if (!found && (op == 0xB5 || op == 0xB3)) {
+                std::string fName = resolveFieldName(i);
+                if (fName == injectTargetName) {
+                    FVM_LOG("FIELD_PUT inject: found %s at bytecode offset %zu", fName.c_str(), i);
+                    emitCallbackPrologue(newBytecode);
+                    found = true;
+                }
+            }
+
+            for (int j = 0; j < len && i + j < origBytecode.size(); j++) {
+                newBytecode.push_back(origBytecode[i + j]);
+            }
+            i += len;
+        }
+        if (!found) {
+            setError("field_put_target_not_found:" + injectTargetName);
+            return 0;
+        }
+    } else if (injectType == "NEW") {
+        bool found = false;
+        // Convert dot-separated class name to internal form for matching
+        std::string internalTarget = injectTargetName;
+        for (char& c : internalTarget) { if (c == '.') c = '/'; }
+
+        newBytecode.reserve(origBytecode.size() + 50);
+        for (size_t i = 0; i < origBytecode.size(); ) {
+            uint8_t op = origBytecode[i];
+            int len = getInsnLength(i);
+            if (len <= 0) len = 1;
+
+            // new=0xBB
+            if (!found && op == 0xBB) {
+                std::string cName = resolveNewClassName(i);
+                if (cName == internalTarget) {
+                    FVM_LOG("NEW inject: found %s at bytecode offset %zu", cName.c_str(), i);
+                    emitCallbackPrologue(newBytecode);
+                    found = true;
+                }
+            }
+
+            for (int j = 0; j < len && i + j < origBytecode.size(); j++) {
+                newBytecode.push_back(origBytecode[i + j]);
+            }
+            i += len;
+        }
+        if (!found) {
+            setError("new_target_not_found:" + internalTarget);
+            return 0;
         }
     } else {
         setError("unknown_inject_point:" + injectAtStr);
@@ -2164,4 +2413,144 @@ extern "C" __declspec(dllexport) int forgevm_transform_load(
 extern "C" __declspec(dllexport) int forgevm_transform_unload(
     const char* className, const char* methodName, const char* paramDesc) {
     return restoreTransform(className, methodName, paramDesc);
+}
+
+// ============================================================
+// Subclass-aware forge: find all subclasses and apply transform
+// ============================================================
+
+static bool isSubclassOf(uint64_t klassAddr, uint64_t targetKlassAddr) {
+    HANDLE proc = g_target.handle;
+    int64_t superOff = structOffset("Klass", "_super");
+    if (superOff < 0) return false;
+
+    uint64_t current = klassAddr;
+    for (int depth = 0; current != 0 && depth < 100; depth++) {
+        uint64_t superKlass = 0;
+        if (!readRemotePointer(proc, current + (uint64_t)superOff, &superKlass)) break;
+        if (superKlass == targetKlassAddr) return true;
+        current = superKlass;
+    }
+    return false;
+}
+
+static std::vector<uint64_t> findAllSubclasses(uint64_t targetKlassAddr) {
+    HANDLE proc = g_target.handle;
+    std::vector<uint64_t> result;
+
+    uint64_t cldgHeadAddr = structStaticAddr("ClassLoaderDataGraph", "_head");
+    if (cldgHeadAddr == 0) cldgHeadAddr = structStaticAddr("ClassLoaderData", "_head");
+    if (cldgHeadAddr == 0) return result;
+
+    uint64_t cldAddr = 0;
+    if (!readRemotePointer(proc, cldgHeadAddr, &cldAddr) || cldAddr == 0) return result;
+
+    int64_t cldNextOff = structOffset("ClassLoaderData", "_next");
+    if (cldNextOff < 0) cldNextOff = 8;
+    int64_t cldKlassesOff = structOffset("ClassLoaderData", "_klasses");
+    if (cldKlassesOff < 0) cldKlassesOff = 16;
+    int64_t klassNextOff = structOffset("Klass", "_next_link");
+    if (klassNextOff < 0) klassNextOff = structOffset("InstanceKlass", "_next_link");
+
+    for (int cldCount = 0; cldAddr != 0 && cldCount < 10000; cldCount++) {
+        uint64_t klassAddr = 0;
+        readRemotePointer(proc, cldAddr + (uint64_t)cldKlassesOff, &klassAddr);
+
+        for (int kc = 0; klassAddr != 0 && kc < 100000; kc++) {
+            if (klassAddr != targetKlassAddr && isSubclassOf(klassAddr, targetKlassAddr)) {
+                result.push_back(klassAddr);
+            }
+            if (klassNextOff < 0) break;
+            uint64_t next = 0;
+            if (!readRemotePointer(proc, klassAddr + (uint64_t)klassNextOff, &next)) break;
+            klassAddr = next;
+        }
+
+        uint64_t nextCld = 0;
+        if (!readRemotePointer(proc, cldAddr + (uint64_t)cldNextOff, &nextCld)) break;
+        cldAddr = nextCld;
+    }
+
+    return result;
+}
+
+extern "C" __declspec(dllexport) int forgevm_forge_load_subclasses(
+    const char* className, const char* methodName, const char* paramDesc,
+    const char* injectAt, const char* hookClass, const char* hookMethod,
+    const char* hookDesc) {
+
+    // First, apply to the target class itself
+    int result = applyTransform(className, methodName, paramDesc, injectAt,
+                                hookClass, hookMethod, hookDesc);
+
+    // Find the target Klass
+    std::string internalName = toInternalName(className);
+    uint64_t targetKlassAddr = 0;
+    if (!findInstanceKlassByName(internalName, &targetKlassAddr)) {
+        FVM_LOG("forge_subclasses: target class not found, skipping subclass scan");
+        return result;
+    }
+
+    // Find and forge all subclasses
+    std::vector<uint64_t> subclasses = findAllSubclasses(targetKlassAddr);
+    FVM_LOG("forge_subclasses: found %zu subclasses of %s", subclasses.size(), className);
+
+    int forgedCount = result == 1 ? 1 : 0;
+    for (uint64_t subKlass : subclasses) {
+        // Read subclass name
+        std::string subName;
+        if (!readKlassName(g_target.handle, subKlass, &subName)) continue;
+
+        // Check if this subclass has the target method (i.e., overrides it)
+        uint64_t subMethodAddr = 0;
+        if (!findMethodInKlass(subKlass, methodName, paramDesc, &subMethodAddr)) {
+            continue; // no override, parent's forged method applies via vtable
+        }
+
+        // Convert internal name back to dot-separated for applyTransform
+        std::string dotName = subName;
+        for (char& c : dotName) { if (c == '/') c = '.'; }
+
+        FVM_LOG("forge_subclasses: forging override in %s", dotName.c_str());
+        int subResult = applyTransform(dotName.c_str(), methodName, paramDesc,
+                                        injectAt, hookClass, hookMethod, hookDesc);
+        if (subResult == 1) forgedCount++;
+    }
+
+    FVM_LOG("forge_subclasses: total forged = %d (target + %d subclasses)", forgedCount, forgedCount - (result == 1 ? 1 : 0));
+
+    if (forgedCount > 0) {
+        setError("ok");
+        return 1;
+    }
+    return result;
+}
+
+extern "C" __declspec(dllexport) int forgevm_forge_unload_subclasses(
+    const char* className, const char* methodName, const char* paramDesc) {
+
+    // Restore the target class
+    int result = restoreTransform(className, methodName, paramDesc);
+
+    // Find the target Klass
+    std::string internalName = toInternalName(className);
+    uint64_t targetKlassAddr = 0;
+    if (!findInstanceKlassByName(internalName, &targetKlassAddr)) {
+        return result;
+    }
+
+    // Restore all subclasses
+    std::vector<uint64_t> subclasses = findAllSubclasses(targetKlassAddr);
+    for (uint64_t subKlass : subclasses) {
+        std::string subName;
+        if (!readKlassName(g_target.handle, subKlass, &subName)) continue;
+
+        std::string dotName = subName;
+        for (char& c : dotName) { if (c == '/') c = '.'; }
+
+        restoreTransform(dotName.c_str(), methodName, paramDesc);
+    }
+
+    setError("ok");
+    return 1;
 }

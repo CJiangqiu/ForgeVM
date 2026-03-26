@@ -1,8 +1,8 @@
 package forgevm.jvm;
 
 import forgevm.core.ForgeVM;
-import forgevm.transform.FvmCallback;
-import forgevm.transform.FvmTransformer;
+import forgevm.forge.FvmCallback;
+import forgevm.forge.FvmIngot;
 import forgevm.util.FvmLog;
 
 import java.util.jar.JarFile;
@@ -48,8 +48,8 @@ public final class AttachGuard {
 
         preloadTargetClasses();
 
-        boolean attachHooked = ForgeVM.transformer().load(new AttachHook());
-        boolean loadAgentHooked = ForgeVM.transformer().load(new LoadAgentHook());
+        boolean attachHooked = ForgeVM.forge().load(new AttachHook());
+        boolean loadAgentHooked = ForgeVM.forge().load(new LoadAgentHook());
 
         if (attachHooked || loadAgentHooked) {
             installed = true;
@@ -101,7 +101,7 @@ public final class AttachGuard {
         return installed && active;
     }
 
-    // -- Transformers --
+    // -- Ingots --
 
     /**
      * Hooks {@code VirtualMachine.attach(String)}.
@@ -109,7 +109,7 @@ public final class AttachGuard {
      * When filter is BLACKLIST/WHITELIST: allows attach (filtering at loadAgent level).
      * When no filter: pass-through.
      */
-    public static class AttachHook extends FvmTransformer {
+    public static class AttachHook extends FvmIngot {
         public AttachHook() {
             super("com.sun.tools.attach.VirtualMachine", "attach(Ljava/lang/String;)");
         }
@@ -130,7 +130,7 @@ public final class AttachGuard {
      * Hooks {@code HotSpotVirtualMachine.loadAgent(String, String)}.
      * Checks the JAR path (first parameter) against filter rules.
      */
-    public static class LoadAgentHook extends FvmTransformer {
+    public static class LoadAgentHook extends FvmIngot {
         public LoadAgentHook() {
             super("sun.tools.attach.HotSpotVirtualMachine",
                     "loadAgent(Ljava/lang/String;Ljava/lang/String;)");

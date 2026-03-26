@@ -1,21 +1,21 @@
-package forgevm.transform;
+package forgevm.forge;
 
 /**
- * Base class for ForgeVM bytecode transformers.
+ * Base class for ForgeVM bytecode ingots — code pieces forged into target methods.
  *
- * <p>A transformer intercepts a target method at runtime by rewriting its bytecode
+ * <p>An ingot intercepts a target method at runtime by rewriting its bytecode
  * in the target JVM's memory. No {@code java.lang.instrument}, no JVMTI — ForgeVM
  * operates entirely out-of-process through its native Agent.
  *
  * <h2>How to use</h2>
  * <ol>
- *   <li>Extend {@code FvmTransformer} and call {@code super(targetClass, method)}
+ *   <li>Extend {@code FvmIngot} and call {@code super(targetClass, method)}
  *       to declare which method you want to intercept.</li>
  *   <li>Write a {@code public static} hook method that takes a single
  *       {@link FvmCallback} parameter. ForgeVM injects an {@code invokestatic}
  *       call to this method, so it <b>must</b> be {@code static}.</li>
- *   <li>Register via {@code ForgeVM.transformer().load(new YourTransformer())}.</li>
- *   <li>Remove via {@code ForgeVM.transformer().unload(YourTransformer.class)}
+ *   <li>Register via {@code ForgeVM.forge().load(new YourIngot())}.</li>
+ *   <li>Remove via {@code ForgeVM.forge().unload(YourIngot.class)}
  *       to restore the original bytecode.</li>
  * </ol>
  *
@@ -36,11 +36,15 @@ package forgevm.transform;
  *   <li>Call neither — the original method executes normally after the hook returns.</li>
  * </ul>
  *
+ * <h2>Subclass propagation</h2>
+ * <p>Override {@link #includeSubclasses()} to return {@code true} to automatically
+ * forge all loaded subclasses that override the target method.
+ *
  * <h2>Examples</h2>
  *
  * <p><b>Simplest form</b> — intercept a no-arg method at HEAD:
  * <pre>{@code
- * public class ProcessLogger extends FvmTransformer {
+ * public class ProcessLogger extends FvmIngot {
  *     public ProcessLogger() {
  *         super("com.example.app.OrderService", "processOrder");
  *     }
@@ -53,7 +57,7 @@ package forgevm.transform;
  *
  * <p><b>Override return value</b> — with obfuscation candidates:
  * <pre>{@code
- * public class RetryCountOverride extends FvmTransformer {
+ * public class RetryCountOverride extends FvmIngot {
  *     public RetryCountOverride() {
  *         super("com.example.app.RetryPolicy", "getMaxRetries,a_56");
  *     }
@@ -64,22 +68,25 @@ package forgevm.transform;
  * }
  * }</pre>
  *
- * <p><b>With parameters</b> — distinguish overloads:
+ * <p><b>With subclass propagation</b>:
  * <pre>{@code
- * public class AttackBlocker extends FvmTransformer {
- *     public AttackBlocker() {
- *         super("com.example.app.CombatService", "a_71(F),applyDamage(F)");
+ * public class HealthOverride extends FvmIngot {
+ *     public HealthOverride() {
+ *         super("net.minecraft.world.entity.LivingEntity", "getHealth");
  *     }
  *
- *     public static void onDamage(FvmCallback callback) {
- *         callback.cancel();
+ *     @Override
+ *     public boolean includeSubclasses() { return true; }
+ *
+ *     public static void onGetHealth(FvmCallback callback) {
+ *         if (customDead) callback.setReturnValue(0.0f);
  *     }
  * }
  * }</pre>
  *
  * <p><b>Specify inject point</b>:
  * <pre>{@code
- * public class ShutdownGuard extends FvmTransformer {
+ * public class ShutdownGuard extends FvmIngot {
  *     public ShutdownGuard() {
  *         super("com.example.app.AppLifecycle", "shutdown", RETURN);
  *     }
@@ -93,10 +100,19 @@ package forgevm.transform;
  * @see FvmCallback
  * @see InjectPoint
  */
-public abstract class FvmTransformer {
+public abstract class FvmIngot {
 
     public static final InjectPoint HEAD = InjectPoint.HEAD;
     public static final InjectPoint RETURN = InjectPoint.RETURN;
+
+    /** Create an INVOKE injection point. Usage: {@code super("Foo", "bar", INVOKE("targetMethod"))} */
+    public static InjectPoint INVOKE(String methodName) { return InjectPoint.INVOKE(methodName); }
+    /** Create a FIELD_GET injection point. Usage: {@code super("Foo", "bar", FIELD_GET("fieldName"))} */
+    public static InjectPoint FIELD_GET(String fieldName) { return InjectPoint.FIELD_GET(fieldName); }
+    /** Create a FIELD_PUT injection point. Usage: {@code super("Foo", "bar", FIELD_PUT("fieldName"))} */
+    public static InjectPoint FIELD_PUT(String fieldName) { return InjectPoint.FIELD_PUT(fieldName); }
+    /** Create a NEW injection point. Usage: {@code super("Foo", "bar", NEW("java.util.ArrayList"))} */
+    public static InjectPoint NEW(String className) { return InjectPoint.NEW(className); }
 
     private final String targetClass;
     private final InjectPoint injectAt;
@@ -111,7 +127,7 @@ public abstract class FvmTransformer {
      * super("com.example.Foo", "m_123_(F),attack(F)");
      * }</pre>
      */
-    protected FvmTransformer(String targetClass, String methodDescriptor) {
+    protected FvmIngot(String targetClass, String methodDescriptor) {
         this(targetClass, methodDescriptor, InjectPoint.HEAD);
     }
 
@@ -122,7 +138,7 @@ public abstract class FvmTransformer {
      * super("com.example.Foo", "m_123_,doStuff", RETURN);
      * }</pre>
      */
-    protected FvmTransformer(String targetClass, String methodDescriptor, InjectPoint injectAt) {
+    protected FvmIngot(String targetClass, String methodDescriptor, InjectPoint injectAt) {
         if (targetClass == null || targetClass.isBlank()) {
             throw new IllegalArgumentException("targetClass must not be empty");
         }
@@ -141,13 +157,25 @@ public abstract class FvmTransformer {
     public InjectPoint injectAt() { return injectAt; }
 
     /**
+     * Whether to automatically forge all loaded subclasses that override the target method.
+     * Default is {@code false} — only the specified class is forged.
+     *
+     * <p>Override to return {@code true} to enable subclass propagation:
+     * <pre>{@code
+     * @Override
+     * public boolean includeSubclasses() { return true; }
+     * }</pre>
+     */
+    public boolean includeSubclasses() { return false; }
+
+    /**
      * Returns parsed candidate entries. Each entry is {@code [methodName, paramDesc]}.
      * paramDesc is in JVM format, e.g. {@code "(F)"} or {@code "()"} for no-arg.
      */
     public String[][] candidates() { return parsedCandidates; }
 
     /**
-     * Returns the name of the hook method defined in this transformer subclass.
+     * Returns the name of the hook method defined in this ingot subclass.
      *
      * <p>Scans for the first {@code public static} method that takes a single
      * {@link FvmCallback} parameter. The method must be {@code static} because
@@ -170,7 +198,7 @@ public abstract class FvmTransformer {
     }
 
     /**
-     * Returns a human-readable description of this transformer for logging.
+     * Returns a human-readable description of this ingot for logging.
      */
     public final String describe() {
         StringBuilder sb = new StringBuilder();
@@ -183,6 +211,7 @@ public abstract class FvmTransformer {
         String hookName = resolveHookMethodName();
         sb.append(" -> ").append(getClass().getName());
         if (hookName != null) sb.append('.').append(hookName).append("()");
+        if (includeSubclasses()) sb.append(" [+subclasses]");
         return sb.toString();
     }
 

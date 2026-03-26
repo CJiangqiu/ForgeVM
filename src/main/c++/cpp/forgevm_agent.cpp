@@ -65,6 +65,8 @@ typedef int(__cdecl* TransformLoadFn)(const char*, const char*, const char*, con
 typedef int(__cdecl* TransformUnloadFn)(const char*, const char*, const char*);
 typedef int(__cdecl* PurgeAgentFn)(const char*);
 typedef int(__cdecl* PutFieldPathFn)(const char*, const char*, const unsigned char*, unsigned long long);
+typedef int(__cdecl* ForgeSubclassLoadFn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*);
+typedef int(__cdecl* ForgeSubclassUnloadFn)(const char*, const char*, const char*);
 
 namespace {
 struct NativeApi {
@@ -88,6 +90,8 @@ struct NativeApi {
     TransformUnloadFn transformUnload = NULL;
     PurgeAgentFn purgeAgent = NULL;
     PutFieldPathFn putFieldPath = NULL;
+    ForgeSubclassLoadFn forgeSubLoad = NULL;
+    ForgeSubclassUnloadFn forgeSubUnload = NULL;
 };
 
 struct AgentLockState {
@@ -355,6 +359,8 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->transformUnload = reinterpret_cast<TransformUnloadFn>(GetProcAddress(module, "forgevm_transform_unload"));
     api->purgeAgent      = reinterpret_cast<PurgeAgentFn>(GetProcAddress(module, "forgevm_purge_agent"));
     api->putFieldPath    = reinterpret_cast<PutFieldPathFn>(GetProcAddress(module, "forgevm_put_field_path"));
+    api->forgeSubLoad    = reinterpret_cast<ForgeSubclassLoadFn>(GetProcAddress(module, "forgevm_forge_load_subclasses"));
+    api->forgeSubUnload  = reinterpret_cast<ForgeSubclassUnloadFn>(GetProcAddress(module, "forgevm_forge_unload_subclasses"));
 
     if (api->probe == NULL || api->init == NULL) { *reason = "missing_export"; return false; }
     return true;
@@ -619,36 +625,52 @@ void handlePutRefFieldBatch(const NativeApi& api, const std::string& line, const
     }
 }
 
-void handleTransformLoad(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+void handleForgeLoad(const NativeApi& api, const std::string& line, const std::string& dllPath) {
     if (api.transformLoad == NULL) {
-        printResult("fallback", "UNAVAILABLE", dllPath, "transform_load_not_exported");
+        printResult("fallback", "UNAVAILABLE", dllPath, "forge_load_not_exported");
         return;
     }
     std::string targetClass  = getJsonStringField(line, "targetClass");
     std::string targetMethod = getJsonStringField(line, "targetMethod");
     std::string targetParamDesc = getJsonStringField(line, "targetParamDesc");
     std::string injectAt     = getJsonStringField(line, "injectAt");
+    std::string injectTarget = getJsonStringField(line, "injectTarget");
     std::string hookClass    = getJsonStringField(line, "hookClass");
     std::string hookMethod   = getJsonStringField(line, "hookMethod");
     std::string hookDesc     = getJsonStringField(line, "hookDesc");
+    bool includeSubclasses   = line.find("\"includeSubclasses\":true") != std::string::npos;
 
-    AGENT_LOG("transform_load: %s.%s(%s) @ %s -> %s.%s%s",
+    // Combine injectAt + injectTarget into "TYPE:target" format for DLL
+    std::string injectAtFull = injectAt;
+    if (!injectTarget.empty()) {
+        injectAtFull += ":" + injectTarget;
+    }
+
+    AGENT_LOG("forge_load: %s.%s(%s) @ %s -> %s.%s%s [subclasses=%s]",
               targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
-              injectAt.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str());
+              injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str(),
+              includeSubclasses ? "true" : "false");
 
     if (targetClass.empty() || targetMethod.empty() || injectAt.empty() ||
         hookClass.empty() || hookMethod.empty() || hookDesc.empty()) {
-        AGENT_LOG("transform_load: missing params");
-        printResult("fallback", "UNAVAILABLE", dllPath, "missing_transform_load_params");
+        AGENT_LOG("forge_load: missing params");
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_forge_load_params");
         return;
     }
 
-    int result = api.transformLoad(
-        targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
-        injectAt.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str());
+    int result;
+    if (includeSubclasses && api.forgeSubLoad != NULL) {
+        result = api.forgeSubLoad(
+            targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
+            injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str());
+    } else {
+        result = api.transformLoad(
+            targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
+            injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str());
+    }
 
-    std::string reason = copyReason(api, result == 1 ? "ok" : "transform_load_failed");
-    AGENT_LOG("transform_load result=%d reason=%s", result, reason.c_str());
+    std::string reason = copyReason(api, result == 1 ? "ok" : "forge_load_failed");
+    AGENT_LOG("forge_load result=%d reason=%s", result, reason.c_str());
     if (result == 1) {
         printResult("ok", "FULL", dllPath, reason.c_str());
     } else {
@@ -656,27 +678,34 @@ void handleTransformLoad(const NativeApi& api, const std::string& line, const st
     }
 }
 
-void handleTransformUnload(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+void handleForgeUnload(const NativeApi& api, const std::string& line, const std::string& dllPath) {
     if (api.transformUnload == NULL) {
-        printResult("fallback", "UNAVAILABLE", dllPath, "transform_unload_not_exported");
+        printResult("fallback", "UNAVAILABLE", dllPath, "forge_unload_not_exported");
         return;
     }
     std::string targetClass  = getJsonStringField(line, "targetClass");
     std::string targetMethod = getJsonStringField(line, "targetMethod");
     std::string targetParamDesc = getJsonStringField(line, "targetParamDesc");
+    bool includeSubclasses   = line.find("\"includeSubclasses\":true") != std::string::npos;
 
-    AGENT_LOG("transform_unload: %s.%s(%s)",
-              targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str());
+    AGENT_LOG("forge_unload: %s.%s(%s) [subclasses=%s]",
+              targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
+              includeSubclasses ? "true" : "false");
 
     if (targetClass.empty() || targetMethod.empty()) {
-        printResult("fallback", "UNAVAILABLE", dllPath, "missing_transform_unload_params");
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_forge_unload_params");
         return;
     }
 
-    int result = api.transformUnload(targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str());
+    int result;
+    if (includeSubclasses && api.forgeSubUnload != NULL) {
+        result = api.forgeSubUnload(targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str());
+    } else {
+        result = api.transformUnload(targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str());
+    }
 
-    std::string reason = copyReason(api, result == 1 ? "ok" : "transform_unload_failed");
-    AGENT_LOG("transform_unload result=%d reason=%s", result, reason.c_str());
+    std::string reason = copyReason(api, result == 1 ? "ok" : "forge_unload_failed");
+    AGENT_LOG("forge_unload result=%d reason=%s", result, reason.c_str());
     if (result == 1) {
         printResult("ok", "FULL", dllPath, reason.c_str());
     } else {
@@ -820,10 +849,10 @@ int main(int argc, char** argv) {
             handlePutRefField(api, line, dllPath);
         } else if (cmd == "put_ref_field_batch") {
             handlePutRefFieldBatch(api, line, dllPath);
-        } else if (cmd == "transform_load") {
-            handleTransformLoad(api, line, dllPath);
-        } else if (cmd == "transform_unload") {
-            handleTransformUnload(api, line, dllPath);
+        } else if (cmd == "forge_load") {
+            handleForgeLoad(api, line, dllPath);
+        } else if (cmd == "forge_unload") {
+            handleForgeUnload(api, line, dllPath);
         } else if (cmd == "purge_agent") {
             handlePurgeAgent(api, line, dllPath);
         } else if (cmd == "put_field_path") {

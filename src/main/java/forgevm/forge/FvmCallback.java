@@ -1,7 +1,7 @@
-package forgevm.transform;
+package forgevm.forge;
 
 /**
- * Callback handle passed to transformer hook methods.
+ * Callback handle passed to ingot hook methods.
  *
  * <p>An {@code FvmCallback} is created by the injected bytecode and passed to your
  * {@code public static} hook method. It lets you inspect the target instance and
@@ -28,7 +28,7 @@ package forgevm.transform;
  * }
  * }</pre>
  *
- * @see FvmTransformer
+ * @see FvmIngot
  */
 public final class FvmCallback {
 
