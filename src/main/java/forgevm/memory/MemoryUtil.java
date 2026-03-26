@@ -13,7 +13,7 @@ import java.nio.ByteOrder;
  * process via ReadProcessMemory/WriteProcessMemory. Java side only sends
  * string descriptors — no Unsafe, no reflection, no JVM API.
  *
- * <h3>Usage</h3>
+ * <p><b>Usage</b></p>
  * <pre>
  * // Static field:
  * ForgeVM.memory().putIntField("com.example.Config", "maxHealth", 200);
