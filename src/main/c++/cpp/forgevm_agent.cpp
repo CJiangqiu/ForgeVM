@@ -185,9 +185,9 @@ std::string wideToUtf8(const std::wstring& wide) {
 }
 
 const char* capFromCode(int code) {
-    if (code >= 2) return "NATIVE_FULL";
-    if (code == 1) return "NATIVE_RESTRICTED";
-    return "JVM_FALLBACK";
+    if (code >= 2) return "FULL";
+    if (code == 1) return "RESTRICTED";
+    return "UNAVAILABLE";
 }
 
 std::string escapeJson(const std::string& value) {
@@ -384,14 +384,14 @@ void handleBootstrap(const NativeApi& api, const std::string& policy,
     if (capability <= 0) {
         std::string reason = copyReason(api, "permission_probe_failed");
         AGENT_LOG("bootstrap FAILED: %s", reason.c_str());
-        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
         return;
     }
 
     int initCode = api.init();
     if (initCode != 1) {
         std::string reason = copyReason(api, "native_init_failed");
-        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
         return;
     }
 
@@ -408,7 +408,7 @@ void handleBootstrap(const NativeApi& api, const std::string& policy,
         } else {
             std::string reason = copyReason(api, "bootstrap_target_failed");
             AGENT_LOG("bootstrap_target FAILED: %s", reason.c_str());
-            printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+            printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
             return;
         }
     }
@@ -440,7 +440,7 @@ void handleExitJvm(const NativeApi& api, const std::string& line, const std::str
     unsigned long long pid  = getJsonUnsignedField(line, "pid", 0ULL);
     unsigned long long code = getJsonUnsignedField(line, "code", 0ULL);
     if (pid == 0ULL) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_pid");
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_pid");
         return;
     }
 
@@ -456,9 +456,9 @@ void handleExitJvm(const NativeApi& api, const std::string& line, const std::str
     }
 
     if (ok) {
-        printResult("ok", "NATIVE_RESTRICTED", dllPath, "exit_sent");
+        printResult("ok", "RESTRICTED", dllPath, "exit_sent");
     } else {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "exit_failed");
+        printResult("fallback", "UNAVAILABLE", dllPath, "exit_failed");
     }
 }
 
@@ -468,34 +468,34 @@ void handleLockAgent(AgentLockState* lockState, const std::string& line, const s
     if (ttlSec > 600ULL) ttlSec = 600ULL;
     lockState->locked = true;
     lockState->lockUntilTick = nowTick() + static_cast<ULONGLONG>(ttlSec * 1000ULL);
-    printResult("ok", "NATIVE_RESTRICTED", dllPath, "agent_locked");
+    printResult("ok", "RESTRICTED", dllPath, "agent_locked");
 }
 
 void handleUnlockAgent(AgentLockState* lockState, const std::string& dllPath) {
     lockState->locked = false;
     lockState->lockUntilTick = 0;
     lockState->ownerPid = 0ULL;
-    printResult("ok", "NATIVE_RESTRICTED", dllPath, "agent_unlocked");
+    printResult("ok", "RESTRICTED", dllPath, "agent_unlocked");
 }
 
 void handleRebindJvm(AgentLockState* lockState, const std::string& line, const std::string& dllPath) {
     refreshLockIfExpired(lockState);
     if (!lockState->locked) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "agent_not_locked");
+        printResult("fallback", "UNAVAILABLE", dllPath, "agent_not_locked");
         return;
     }
     unsigned long long pid = getJsonUnsignedField(line, "pid", 0ULL);
     if (pid == 0ULL) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_pid");
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_pid");
         return;
     }
     lockState->ownerPid = pid;
-    printResult("ok", "NATIVE_RESTRICTED", dllPath, "agent_rebound");
+    printResult("ok", "RESTRICTED", dllPath, "agent_rebound");
 }
 
 void handlePutField(const NativeApi& api, const std::string& line, const std::string& dllPath) {
     if (api.putField == NULL) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "put_field_not_exported");
+        printResult("fallback", "UNAVAILABLE", dllPath, "put_field_not_exported");
         return;
     }
     unsigned long long oop = getJsonUnsignedField(line, "oop", 0ULL);
@@ -504,13 +504,13 @@ void handlePutField(const NativeApi& api, const std::string& line, const std::st
     std::string valueHex  = getJsonStringField(line, "valueHex");
 
     if (fieldName.empty() || className.empty() || valueHex.empty()) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_put_field_params");
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_put_field_params");
         return;
     }
 
     std::vector<unsigned char> valueBytes = fromHex(valueHex);
     if (valueBytes.empty()) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "empty_value_bytes");
+        printResult("fallback", "UNAVAILABLE", dllPath, "empty_value_bytes");
         return;
     }
 
@@ -518,15 +518,15 @@ void handlePutField(const NativeApi& api, const std::string& line, const std::st
                                valueBytes.data(), static_cast<unsigned long long>(valueBytes.size()));
     std::string reason = copyReason(api, result == 1 ? "ok" : "put_field_failed");
     if (result == 1) {
-        printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
+        printResult("ok", "FULL", dllPath, reason.c_str());
     } else {
-        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
     }
 }
 
 void handlePutFieldBatch(const NativeApi& api, const std::string& line, const std::string& dllPath) {
     if (api.putFieldBatch == NULL) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "put_field_batch_not_exported");
+        printResult("fallback", "UNAVAILABLE", dllPath, "put_field_batch_not_exported");
         return;
     }
     std::vector<unsigned long long> oops = parseJsonUint64Array(line, "oops");
@@ -535,13 +535,13 @@ void handlePutFieldBatch(const NativeApi& api, const std::string& line, const st
     std::string valueHex  = getJsonStringField(line, "valueHex");
 
     if (oops.empty() || fieldName.empty() || className.empty() || valueHex.empty()) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_put_field_batch_params");
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_put_field_batch_params");
         return;
     }
 
     std::vector<unsigned char> valueBytes = fromHex(valueHex);
     if (valueBytes.empty()) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "empty_value_bytes");
+        printResult("fallback", "UNAVAILABLE", dllPath, "empty_value_bytes");
         return;
     }
 
@@ -550,15 +550,15 @@ void handlePutFieldBatch(const NativeApi& api, const std::string& line, const st
                                     valueBytes.data(), static_cast<unsigned long long>(valueBytes.size()));
     std::string reason = copyReason(api, result == 1 ? "ok" : "put_field_batch_failed");
     if (result == 1) {
-        printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
+        printResult("ok", "FULL", dllPath, reason.c_str());
     } else {
-        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
     }
 }
 
 void handlePutRefField(const NativeApi& api, const std::string& line, const std::string& dllPath) {
     if (api.putRefField == NULL) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "put_ref_field_not_exported");
+        printResult("fallback", "UNAVAILABLE", dllPath, "put_ref_field_not_exported");
         return;
     }
     unsigned long long oop = getJsonUnsignedField(line, "oop", 0ULL);
@@ -567,13 +567,13 @@ void handlePutRefField(const NativeApi& api, const std::string& line, const std:
     std::string valueHex  = getJsonStringField(line, "valueHex");
 
     if (fieldName.empty() || className.empty() || valueHex.empty()) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_put_ref_field_params");
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_put_ref_field_params");
         return;
     }
 
     std::vector<unsigned char> valueBytes = fromHex(valueHex);
     if (valueBytes.empty()) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "empty_value_bytes");
+        printResult("fallback", "UNAVAILABLE", dllPath, "empty_value_bytes");
         return;
     }
 
@@ -581,15 +581,15 @@ void handlePutRefField(const NativeApi& api, const std::string& line, const std:
                                   valueBytes.data(), static_cast<unsigned long long>(valueBytes.size()));
     std::string reason = copyReason(api, result == 1 ? "ok" : "put_ref_field_failed");
     if (result == 1) {
-        printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
+        printResult("ok", "FULL", dllPath, reason.c_str());
     } else {
-        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
     }
 }
 
 void handlePutRefFieldBatch(const NativeApi& api, const std::string& line, const std::string& dllPath) {
     if (api.putRefFieldBatch == NULL) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "put_ref_field_batch_not_exported");
+        printResult("fallback", "UNAVAILABLE", dllPath, "put_ref_field_batch_not_exported");
         return;
     }
     std::vector<unsigned long long> oops = parseJsonUint64Array(line, "oops");
@@ -598,13 +598,13 @@ void handlePutRefFieldBatch(const NativeApi& api, const std::string& line, const
     std::string valueHex  = getJsonStringField(line, "valueHex");
 
     if (oops.empty() || fieldName.empty() || className.empty() || valueHex.empty()) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_put_ref_field_batch_params");
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_put_ref_field_batch_params");
         return;
     }
 
     std::vector<unsigned char> valueBytes = fromHex(valueHex);
     if (valueBytes.empty()) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "empty_value_bytes");
+        printResult("fallback", "UNAVAILABLE", dllPath, "empty_value_bytes");
         return;
     }
 
@@ -613,15 +613,15 @@ void handlePutRefFieldBatch(const NativeApi& api, const std::string& line, const
                                        valueBytes.data(), static_cast<unsigned long long>(valueBytes.size()));
     std::string reason = copyReason(api, result == 1 ? "ok" : "put_ref_field_batch_failed");
     if (result == 1) {
-        printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
+        printResult("ok", "FULL", dllPath, reason.c_str());
     } else {
-        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
     }
 }
 
 void handleTransformLoad(const NativeApi& api, const std::string& line, const std::string& dllPath) {
     if (api.transformLoad == NULL) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "transform_load_not_exported");
+        printResult("fallback", "UNAVAILABLE", dllPath, "transform_load_not_exported");
         return;
     }
     std::string targetClass  = getJsonStringField(line, "targetClass");
@@ -639,7 +639,7 @@ void handleTransformLoad(const NativeApi& api, const std::string& line, const st
     if (targetClass.empty() || targetMethod.empty() || injectAt.empty() ||
         hookClass.empty() || hookMethod.empty() || hookDesc.empty()) {
         AGENT_LOG("transform_load: missing params");
-        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_transform_load_params");
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_transform_load_params");
         return;
     }
 
@@ -650,15 +650,15 @@ void handleTransformLoad(const NativeApi& api, const std::string& line, const st
     std::string reason = copyReason(api, result == 1 ? "ok" : "transform_load_failed");
     AGENT_LOG("transform_load result=%d reason=%s", result, reason.c_str());
     if (result == 1) {
-        printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
+        printResult("ok", "FULL", dllPath, reason.c_str());
     } else {
-        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
     }
 }
 
 void handleTransformUnload(const NativeApi& api, const std::string& line, const std::string& dllPath) {
     if (api.transformUnload == NULL) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "transform_unload_not_exported");
+        printResult("fallback", "UNAVAILABLE", dllPath, "transform_unload_not_exported");
         return;
     }
     std::string targetClass  = getJsonStringField(line, "targetClass");
@@ -669,7 +669,7 @@ void handleTransformUnload(const NativeApi& api, const std::string& line, const 
               targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str());
 
     if (targetClass.empty() || targetMethod.empty()) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_transform_unload_params");
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_transform_unload_params");
         return;
     }
 
@@ -678,15 +678,15 @@ void handleTransformUnload(const NativeApi& api, const std::string& line, const 
     std::string reason = copyReason(api, result == 1 ? "ok" : "transform_unload_failed");
     AGENT_LOG("transform_unload result=%d reason=%s", result, reason.c_str());
     if (result == 1) {
-        printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
+        printResult("ok", "FULL", dllPath, reason.c_str());
     } else {
-        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
     }
 }
 
 void handlePutFieldPath(const NativeApi& api, const std::string& line, const std::string& dllPath) {
     if (api.putFieldPath == NULL) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "put_field_path_not_exported");
+        printResult("fallback", "UNAVAILABLE", dllPath, "put_field_path_not_exported");
         return;
     }
     std::string className  = getJsonStringField(line, "className");
@@ -694,13 +694,13 @@ void handlePutFieldPath(const NativeApi& api, const std::string& line, const std
     std::string valueHex   = getJsonStringField(line, "valueHex");
 
     if (className.empty() || fieldChain.empty() || valueHex.empty()) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_put_field_path_params");
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_put_field_path_params");
         return;
     }
 
     std::vector<unsigned char> valueBytes = fromHex(valueHex);
     if (valueBytes.empty()) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "empty_value_bytes");
+        printResult("fallback", "UNAVAILABLE", dllPath, "empty_value_bytes");
         return;
     }
 
@@ -710,20 +710,20 @@ void handlePutFieldPath(const NativeApi& api, const std::string& line, const std
                                    valueBytes.data(), static_cast<unsigned long long>(valueBytes.size()));
     std::string reason = copyReason(api, result == 1 ? "ok" : "put_field_path_failed");
     if (result == 1) {
-        printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
+        printResult("ok", "FULL", dllPath, reason.c_str());
     } else {
-        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
     }
 }
 
 void handlePurgeAgent(const NativeApi& api, const std::string& line, const std::string& dllPath) {
     if (api.purgeAgent == NULL) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "purge_agent_not_exported");
+        printResult("fallback", "UNAVAILABLE", dllPath, "purge_agent_not_exported");
         return;
     }
     std::string agentClass = getJsonStringField(line, "agentClass");
     if (agentClass.empty()) {
-        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_agent_class");
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_agent_class");
         return;
     }
 
@@ -733,9 +733,9 @@ void handlePurgeAgent(const NativeApi& api, const std::string& line, const std::
     std::string reason = copyReason(api, result == 1 ? "ok" : "purge_agent_failed");
     AGENT_LOG("purge_agent result=%d reason=%s", result, reason.c_str());
     if (result == 1) {
-        printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
+        printResult("ok", "FULL", dllPath, reason.c_str());
     } else {
-        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
     }
 }
 
@@ -763,7 +763,7 @@ int main(int argc, char** argv) {
     }
 
     if (dllPath.empty()) {
-        printResult("fallback", "JVM_FALLBACK", "", "missing_dll_path");
+        printResult("fallback", "UNAVAILABLE", "", "missing_dll_path");
         return 2;
     }
 
@@ -779,7 +779,7 @@ int main(int argc, char** argv) {
     if (!loadNativeApi(dllPathWide, dllPath, &api, &loadReason)) {
         AGENT_LOG("loadNativeApi FAILED: %s", loadReason.c_str());
         if (api.module != NULL) FreeLibrary(api.module);
-        printResult("fallback", "JVM_FALLBACK", dllPath, loadReason.c_str());
+        printResult("fallback", "UNAVAILABLE", dllPath, loadReason.c_str());
         return 3;
     }
     AGENT_LOG("loadNativeApi OK");
@@ -831,12 +831,12 @@ int main(int argc, char** argv) {
         } else if (cmd == "dump_card_structs") {
             if (api.dumpCardStructs != NULL) {
                 api.dumpCardStructs();
-                printResult("ok", "NATIVE_FULL", dllPath, api.lastError ? api.lastError() : "no_data");
+                printResult("ok", "FULL", dllPath, api.lastError ? api.lastError() : "no_data");
             } else {
-                printResult("fallback", "JVM_FALLBACK", dllPath, "dump_card_structs_not_exported");
+                printResult("fallback", "UNAVAILABLE", dllPath, "dump_card_structs_not_exported");
             }
         } else if (cmd == "ping") {
-            printResult("ok", "NATIVE_RESTRICTED", dllPath, lockState.locked ? "pong_locked" : "pong_unlocked");
+            printResult("ok", "RESTRICTED", dllPath, lockState.locked ? "pong_locked" : "pong_unlocked");
         } else if (cmd == "lock_agent") {
             handleLockAgent(&lockState, line, dllPath);
         } else if (cmd == "unlock_agent") {
@@ -844,10 +844,10 @@ int main(int argc, char** argv) {
         } else if (cmd == "rebind_jvm") {
             handleRebindJvm(&lockState, line, dllPath);
         } else if (cmd == "shutdown") {
-            printResult("ok", "NATIVE_RESTRICTED", dllPath, "bye");
+            printResult("ok", "RESTRICTED", dllPath, "bye");
             break;
         } else {
-            printResult("fallback", "JVM_FALLBACK", dllPath, "unknown_command");
+            printResult("fallback", "UNAVAILABLE", dllPath, "unknown_command");
         }
     }
 

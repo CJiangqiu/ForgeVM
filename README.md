@@ -63,7 +63,7 @@ Native Backend (C++, Win32 API)
 
 ### 1. Bootstrap (Required First)
 
-All ForgeVM operations depend on a successful launch. You must call `ForgeVM.launch()` at an appropriate point during your application startup before using any other API. If the launch fails, the system falls back to `JVM_FALLBACK` mode and all Agent-dependent operations will throw `ForgeVMException`.
+All ForgeVM operations depend on a successful launch. You must call `ForgeVM.launch()` at an appropriate point during your application startup before using any other API. If the launch fails, the Agent status will be `UNAVAILABLE` and all Agent-dependent operations will throw `ForgeVMException`.
 
 ```java
 // Call this early in your application — everything else depends on it
@@ -283,13 +283,13 @@ Produces the JAR in `build/libs/`.
 
 You need to compile `forgevm_agent.exe` and `forgevm_native.dll` yourself using MSVC. Place the compiled binaries into `src/main/resources/native/win-x64/` if you want them bundled into the JAR.
 
-## Capability Levels
+## Agent Status
 
-| Level | Meaning |
+| Status | Meaning |
 |---|---|
-| `NATIVE_FULL` | Agent running, process handle open, struct map loaded, compression params resolved |
-| `NATIVE_RESTRICTED` | Agent running but with limited privileges (no `SeDebugPrivilege`) |
-| `JVM_FALLBACK` | Agent failed to start or initialize — all operations that require the Agent will throw `ForgeVMException` |
+| `FULL`        | Agent running, process handle open, struct map loaded, compression params resolved                        |
+| `RESTRICTED`  | Agent running but with limited privileges (no `SeDebugPrivilege`)                                          |
+| `UNAVAILABLE` | Agent failed to start or initialize — all operations that require the Agent will throw `ForgeVMException`  |
 
 ## Logging
 
@@ -355,7 +355,7 @@ ForgeVM Agent（forgevm_agent.exe，独立进程）
 
 ### 1. 启动（必须首先执行）
 
-所有 ForgeVM 操作都依赖于成功启动。你必须在应用启动的合适位置调用 `ForgeVM.launch()`，之后才能使用其他 API。如果启动失败，系统回退到 `JVM_FALLBACK` 模式，所有依赖 Agent 的操作将抛出 `ForgeVMException`。
+所有 ForgeVM 操作都依赖于成功启动。你必须在应用启动的合适位置调用 `ForgeVM.launch()`，之后才能使用其他 API。如果启动失败，Agent 状态将为 `UNAVAILABLE`，所有依赖 Agent 的操作将抛出 `ForgeVMException`。
 
 ```java
 // 在应用启动早期调用 — 后续一切操作都依赖于此
@@ -575,13 +575,13 @@ ForgeVM 按以下顺序解析 `forgevm_agent.exe` 和 `forgevm_native.dll`：
 
 需要自行使用 MSVC 编译 `forgevm_agent.exe` 和 `forgevm_native.dll`。如需打包到 JAR 中，将编译产物放入 `src/main/resources/native/win-x64/`。
 
-## 能力等级
+## Agent 状态
 
-| 等级 | 含义 |
+| 状态 | 含义 |
 |---|---|
-| `NATIVE_FULL` | Agent 运行中，进程句柄已打开，结构映射已加载，压缩参数已解析 |
-| `NATIVE_RESTRICTED` | Agent 运行中但权限受限（无 `SeDebugPrivilege`） |
-| `JVM_FALLBACK` | Agent 启动或初始化失败 — 所有需要 Agent 的操作将抛出 `ForgeVMException` |
+| `FULL`        | Agent 运行中，进程句柄已打开，结构映射已加载，压缩参数已解析                |
+| `RESTRICTED`  | Agent 运行中但权限受限（无 `SeDebugPrivilege`）                              |
+| `UNAVAILABLE` | Agent 启动或初始化失败 — 所有需要 Agent 的操作将抛出 `ForgeVMException`      |
 
 ## 日志
 

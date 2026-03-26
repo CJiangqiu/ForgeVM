@@ -216,7 +216,7 @@ public final class ForgeVM {
             }
 
             LaunchResult result = parseAgentResponse(responseLine, dllPath);
-            if (result.capabilityLevel() != CapabilityLevel.JVM_FALLBACK) {
+            if (result.agentStatus() != AgentStatus.UNAVAILABLE) {
                 agentSession = session;
                 registerAgentExitSender(session);
                 registerAgentLockController(session);
@@ -380,12 +380,12 @@ public final class ForgeVM {
     private static LaunchResult parseAgentResponse(String responseLine, Path dllPath) {
         Map<String, String> fields = JsonUtils.parseFlatJsonObject(responseLine);
         String status = fields.getOrDefault("status", "fallback");
-        String capability = fields.getOrDefault("capability", "JVM_FALLBACK");
+        String capability = fields.getOrDefault("capability", "UNAVAILABLE");
         String reason = normalizeReason(fields.getOrDefault("reason", "unknown"));
         String activePath = fields.getOrDefault("dllPath", dllPath.toAbsolutePath().toString());
 
-        CapabilityLevel level = parseCapability(capability);
-        if (!"ok".equalsIgnoreCase(status) || level == CapabilityLevel.JVM_FALLBACK) {
+        AgentStatus level = parseAgentStatus(capability);
+        if (!"ok".equalsIgnoreCase(status) || level == AgentStatus.UNAVAILABLE) {
             return agentUnavailable("agent_reported_fallback:" + reason, activePath);
         }
 
@@ -494,16 +494,16 @@ public final class ForgeVM {
         }
     }
 
-    private static CapabilityLevel parseCapability(String value) {
-        if ("NATIVE_FULL".equalsIgnoreCase(value)) return CapabilityLevel.NATIVE_FULL;
-        if ("NATIVE_RESTRICTED".equalsIgnoreCase(value)) return CapabilityLevel.NATIVE_RESTRICTED;
-        return CapabilityLevel.JVM_FALLBACK;
+    private static AgentStatus parseAgentStatus(String value) {
+        if ("FULL".equalsIgnoreCase(value)) return AgentStatus.FULL;
+        if ("RESTRICTED".equalsIgnoreCase(value)) return AgentStatus.RESTRICTED;
+        return AgentStatus.UNAVAILABLE;
     }
 
     private static LaunchResult agentUnavailable(String reason, String dllPath) {
         String normalized = normalizeReason(reason);
         FvmLog.error("launch failed: " + normalized);
-        return new LaunchResult(CapabilityLevel.JVM_FALLBACK, false, dllPath, normalized);
+        return new LaunchResult(AgentStatus.UNAVAILABLE, false, dllPath, normalized);
     }
 
     private static String normalizeReason(String reason) {
@@ -547,13 +547,13 @@ public final class ForgeVM {
         }
     }
 
-    public enum CapabilityLevel {
-        /** Native backend is active with full capability. */
-        NATIVE_FULL,
-        /** Native backend is active with restricted capability. */
-        NATIVE_RESTRICTED,
-        /** Native backend is unavailable; agent not active. */
-        JVM_FALLBACK
+    public enum AgentStatus {
+        /** Agent is active with full privileges. */
+        FULL,
+        /** Agent is active with restricted privileges. */
+        RESTRICTED,
+        /** Agent is unavailable — all operations will fail. */
+        UNAVAILABLE
     }
 
     public enum LaunchPermissionPolicy {
@@ -564,7 +564,7 @@ public final class ForgeVM {
     }
 
     public record LaunchResult(
-            CapabilityLevel capabilityLevel,
+            AgentStatus agentStatus,
             boolean nativeDllActive,
             String nativeDllPath,
             String reason
