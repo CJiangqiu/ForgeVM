@@ -1618,19 +1618,19 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         // Read the CP slot
         int64_t cpHeaderSize_ = typeSize("ConstantPool");
         if (cpHeaderSize_ < 0) cpHeaderSize_ = 0x138;
-        uint64_t cpSlotAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)cpIdx * 8;
+        uint64_t cpSlotAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)cpIdx * 8;
         uint64_t methodrefSlot = 0;
         if (!readRemotePointer(proc, cpSlotAddr, &methodrefSlot)) return "";
         // NameAndType index is in the low 16 bits
         uint16_t natIdx = (uint16_t)(methodrefSlot & 0xFFFF);
         // Read NameAndType slot: hi16 = descriptor, lo16 = name
-        uint64_t natSlotAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)natIdx * 8;
+        uint64_t natSlotAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)natIdx * 8;
         uint64_t natSlot = 0;
         if (!readRemotePointer(proc, natSlotAddr, &natSlot)) return "";
         uint16_t nameIdx = (uint16_t)(natSlot & 0xFFFF);
         // Read name symbol
         uint64_t nameSymAddr = 0;
-        uint64_t nameEntryAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)nameIdx * 8;
+        uint64_t nameEntryAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)nameIdx * 8;
         if (!readRemotePointer(proc, nameEntryAddr, &nameSymAddr) || nameSymAddr == 0) return "";
         std::string name;
         readSymbolBody(proc, nameSymAddr, &name);
@@ -1643,16 +1643,16 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         uint16_t cpIdx = ((uint16_t)origBytecode[fieldOff + 1] << 8) | origBytecode[fieldOff + 2];
         int64_t cpHeaderSize_ = typeSize("ConstantPool");
         if (cpHeaderSize_ < 0) cpHeaderSize_ = 0x138;
-        uint64_t cpSlotAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)cpIdx * 8;
+        uint64_t cpSlotAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)cpIdx * 8;
         uint64_t fieldrefSlot = 0;
         if (!readRemotePointer(proc, cpSlotAddr, &fieldrefSlot)) return "";
         uint16_t natIdx = (uint16_t)(fieldrefSlot & 0xFFFF);
-        uint64_t natSlotAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)natIdx * 8;
+        uint64_t natSlotAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)natIdx * 8;
         uint64_t natSlot = 0;
         if (!readRemotePointer(proc, natSlotAddr, &natSlot)) return "";
         uint16_t nameIdx = (uint16_t)(natSlot & 0xFFFF);
         uint64_t nameSymAddr = 0;
-        uint64_t nameEntryAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)nameIdx * 8;
+        uint64_t nameEntryAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)nameIdx * 8;
         if (!readRemotePointer(proc, nameEntryAddr, &nameSymAddr) || nameSymAddr == 0) return "";
         std::string name;
         readSymbolBody(proc, nameSymAddr, &name);
@@ -1665,13 +1665,13 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         uint16_t cpIdx = ((uint16_t)origBytecode[newOff + 1] << 8) | origBytecode[newOff + 2];
         int64_t cpHeaderSize_ = typeSize("ConstantPool");
         if (cpHeaderSize_ < 0) cpHeaderSize_ = 0x138;
-        uint64_t cpSlotAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)cpIdx * 8;
+        uint64_t cpSlotAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)cpIdx * 8;
         uint64_t classSlot = 0;
         if (!readRemotePointer(proc, cpSlotAddr, &classSlot)) return "";
         // Class entry: name index in low 16 bits
         uint16_t nameIdx = (uint16_t)(classSlot & 0xFFFF);
         uint64_t nameSymAddr = 0;
-        uint64_t nameEntryAddr = constPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)nameIdx * 8;
+        uint64_t nameEntryAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)nameIdx * 8;
         if (!readRemotePointer(proc, nameEntryAddr, &nameSymAddr) || nameSymAddr == 0) return "";
         std::string name;
         readSymbolBody(proc, nameSymAddr, &name);
