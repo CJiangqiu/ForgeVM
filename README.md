@@ -5,7 +5,7 @@
 ![Windows 11](https://img.shields.io/badge/Windows_11-0078D4?style=flat-square&logo=windows11&logoColor=white)
 ![Java 17+](https://img.shields.io/badge/Java_17+-ED8B00?style=flat-square&logo=openjdk&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)
-[![](https://jitpack.io/v/CJiangqiu/ForgeVM.svg)](https://jitpack.io/#CJiangqiu/ForgeVM)
+[![JitPack](https://jitpack.io/v/CJiangqiu/ForgeVM.svg)](https://jitpack.io/#CJiangqiu/ForgeVM)
 
 **[English](#english)** | **[中文](#中文)**
 
@@ -22,8 +22,6 @@ ForgeVM (FVM) manipulates a running JVM through an independent, external Agent p
 ## Getting Started
 
 ### 1. Add Dependency
-
-[![](https://jitpack.io/v/CJiangqiu/ForgeVM.svg)](https://jitpack.io/#CJiangqiu/ForgeVM)
 
 ```gradle
 // settings.gradle
@@ -241,8 +239,6 @@ ForgeVM (FVM) 通过独立的外部 Agent 进程操控运行中的 JVM。所有�
 ## 快速开始
 
 ### 1. 添加依赖
-
-[![](https://jitpack.io/v/CJiangqiu/ForgeVM.svg)](https://jitpack.io/#CJiangqiu/ForgeVM)
 
 ```gradle
 // settings.gradle
