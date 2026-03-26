@@ -33,16 +33,31 @@ package forgevm.transform;
 public final class FvmCallback {
 
     private final Object instance;
+    private final Object[] args;
     private Object returnValue;
     private boolean cancelled;
 
     /**
-     * Constructs a callback. Called by injected bytecode — not intended for direct use.
+     * Constructs a callback with no argument access.
+     * Called by injected bytecode for methods with no parameters.
      *
      * @param instance the target method's {@code this}, or {@code null} for static methods
      */
     public FvmCallback(Object instance) {
         this.instance = instance;
+        this.args = null;
+    }
+
+    /**
+     * Constructs a callback with argument access.
+     * Called by injected bytecode — not intended for direct use.
+     *
+     * @param instance the target method's {@code this}, or {@code null} for static methods
+     * @param args the target method's arguments (reference types only; primitives are boxed)
+     */
+    public FvmCallback(Object instance, Object[] args) {
+        this.instance = instance;
+        this.args = args;
     }
 
     /**
@@ -89,5 +104,25 @@ public final class FvmCallback {
     /** Returns the value set by {@link #setReturnValue(Object)}, or {@code null} if not set. */
     public Object getReturnValue() {
         return returnValue;
+    }
+
+    /**
+     * Returns the number of arguments captured from the target method.
+     *
+     * @return argument count, or 0 if argument access is not available
+     */
+    public int argumentCount() {
+        return args != null ? args.length : 0;
+    }
+
+    /**
+     * Returns the target method's argument at the given index.
+     *
+     * @param index zero-based argument index
+     * @return the argument value, or {@code null} if index is out of bounds or args not available
+     */
+    public Object getArgument(int index) {
+        if (args == null || index < 0 || index >= args.length) return null;
+        return args[index];
     }
 }

@@ -7,20 +7,24 @@ public final class JvmControl {
     private JvmControl() {
     }
 
-    public static void exitJvm() {
-        exitJvm(0);
+    public static boolean exitJvm() {
+        return exitJvm(0);
     }
 
-    public static void exitJvm(int exitCode) {
+    public static boolean exitJvm(int exitCode) {
         ExitCommandSender sender = exitSender;
-        if (sender != null && sender.isAvailable()) {
-            try {
-                sender.sendExitCommand(exitCode);
-            } catch (Throwable ignored) {
-            }
+        if (sender == null || !sender.isAvailable()) {
+            return false;
         }
-
-        Runtime.getRuntime().halt(exitCode);
+        try {
+            sender.sendExitCommand(exitCode);
+            // If Agent succeeded, TerminateProcess kills us — we never reach here.
+            // If we're still alive, the kill failed.
+            Thread.sleep(1000);
+            return false;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     public static void registerExitSender(ExitCommandSender sender) {
@@ -45,6 +49,18 @@ public final class JvmControl {
         }
     }
 
+    public static boolean lockAgent() {
+        AgentLockController controller = agentLockController;
+        if (controller == null || !controller.isAvailable()) {
+            return false;
+        }
+        try {
+            return controller.lockAgent(0);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     public static boolean unlockAgent() {
         AgentLockController controller = agentLockController;
         if (controller == null || !controller.isAvailable()) {
@@ -55,6 +71,18 @@ public final class JvmControl {
         } catch (Throwable ignored) {
             return false;
         }
+    }
+
+    public static boolean banJavaAgent() {
+        return AttachGuard.activate(null);
+    }
+
+    public static boolean banJavaAgent(AgentFilter filter) {
+        return AttachGuard.activate(filter);
+    }
+
+    public static boolean unbanJavaAgent() {
+        return AttachGuard.deactivate();
     }
 
     public static boolean rebindAgentToCurrentJvm() {

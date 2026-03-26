@@ -226,6 +226,9 @@ struct TransformBackup {
 
 extern std::unordered_map<std::string, TransformBackup> g_transformBackups;
 
+// Find an InstanceKlass by internal name (e.g. "com/example/Foo")
+bool findInstanceKlassByName(const std::string& internalName, uint64_t* outKlassAddr);
+
 // Locate a Java Method* by class name, method name, and param descriptor
 // Walks SystemDictionary -> InstanceKlass -> methods array
 bool findJavaMethod(const char* className, const char* methodName,

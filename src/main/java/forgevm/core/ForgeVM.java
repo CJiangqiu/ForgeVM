@@ -1,5 +1,7 @@
 package forgevm.core;
 
+import forgevm.jvm.AgentFilter;
+import forgevm.jvm.AttachGuard;
 import forgevm.jvm.JvmControl;
 import forgevm.memory.MemoryUtil;
 import forgevm.transform.TransformManager;
@@ -49,12 +51,6 @@ public final class ForgeVM {
     private ForgeVM() {
     }
 
-    // -- version --
-
-    public static String version() {
-        return "0.1.0-SNAPSHOT";
-    }
-
     // -- launch --
 
     public static LaunchResult launch() {
@@ -72,6 +68,7 @@ public final class ForgeVM {
         if (currentSession != null && !currentSession.process().isAlive()) {
             clearAgentExitSender();
             clearAgentLockController();
+
             closeAgentSession(currentSession);
             agentSession = null;
         }
@@ -119,20 +116,53 @@ public final class ForgeVM {
 
     // -- jvm control --
 
-    public static void exit() {
-        JvmControl.exitJvm();
+    public static boolean exit() {
+        return JvmControl.exitJvm();
     }
 
-    public static void exit(int exitCode) {
-        JvmControl.exitJvm(exitCode);
+    public static boolean exit(int exitCode) {
+        return JvmControl.exitJvm(exitCode);
     }
 
     public static boolean lockAgent(int ttlSeconds) {
         return JvmControl.lockAgent(ttlSeconds);
     }
 
+    public static boolean lockAgent() {
+        return JvmControl.lockAgent();
+    }
+
     public static boolean unlockAgent() {
         return JvmControl.unlockAgent();
+    }
+
+    public static boolean banJavaAgent() {
+        return JvmControl.banJavaAgent();
+    }
+
+    public static boolean banJavaAgent(AgentFilter filter) {
+        return JvmControl.banJavaAgent(filter);
+    }
+
+    public static boolean unbanJavaAgent() {
+        return JvmControl.unbanJavaAgent();
+    }
+
+    public static boolean purgeAgent(String agentClassName) {
+        if (agentClassName == null || agentClassName.isBlank()) {
+            return false;
+        }
+        AgentSession session = agentSession;
+        if (session == null || !session.process().isAlive()) {
+            return false;
+        }
+        try {
+            String command = buildCommand("purge_agent", Map.of("agentClass", agentClassName));
+            String response = sendCommand(session, command);
+            return isOkResponse(response);
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     public static boolean rebindAgentToCurrentJvm() {
@@ -146,6 +176,7 @@ public final class ForgeVM {
         if (dllPath == null || !Files.exists(dllPath)) {
             clearAgentExitSender();
             clearAgentLockController();
+
             return agentUnavailable("native_dll_not_found", "");
         }
 
@@ -153,6 +184,7 @@ public final class ForgeVM {
         if (agentPath == null || !Files.exists(agentPath)) {
             clearAgentExitSender();
             clearAgentLockController();
+
             return agentUnavailable("agent_exe_not_found", "");
         }
 
@@ -188,16 +220,19 @@ public final class ForgeVM {
                 agentSession = session;
                 registerAgentExitSender(session);
                 registerAgentLockController(session);
+                AttachGuard.install();
                 return result;
             }
 
             closeAgentSession(session);
             clearAgentExitSender();
             clearAgentLockController();
+
             return result;
         } catch (Throwable ex) {
             clearAgentExitSender();
             clearAgentLockController();
+
             return agentUnavailable("agent_exception:" + ex.getClass().getSimpleName(), "");
         }
     }

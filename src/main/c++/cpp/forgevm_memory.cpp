@@ -1032,6 +1032,157 @@ extern "C" __declspec(dllexport) int forgevm_put_ref_field_batch(
 }
 
 // ============================================================
+// put_field_path: navigate a field chain from a static root
+//
+// className:  "com.example.Server" (dot or slash form)
+// fieldChain: "INSTANCE.config.maxHealth" (dot-separated)
+//
+// Resolves className → Klass, then follows each field in the chain
+// via RPM. Writes valueBytes to the final field.
+// If the final field is a reference type, also dirties the GC card.
+// ============================================================
+
+static std::vector<std::string> splitDots(const std::string& s) {
+    std::vector<std::string> parts;
+    size_t start = 0;
+    while (start < s.size()) {
+        size_t dot = s.find('.', start);
+        if (dot == std::string::npos) {
+            parts.push_back(s.substr(start));
+            break;
+        }
+        parts.push_back(s.substr(start, dot - start));
+        start = dot + 1;
+    }
+    return parts;
+}
+
+static std::string toInternalClassName(const char* name) {
+    std::string result(name);
+    for (char& c : result) { if (c == '.') c = '/'; }
+    return result;
+}
+
+extern "C" __declspec(dllexport) int forgevm_put_field_path(
+        const char* className, const char* fieldChain,
+        const unsigned char* valueBytes, unsigned long long valueSize) {
+    if (!g_target.structMapReady || g_target.handle == NULL) {
+        setError("agent_not_bootstrapped");
+        return 0;
+    }
+    if (className == NULL || fieldChain == NULL || valueBytes == NULL || valueSize == 0) {
+        setError("invalid_params");
+        return 0;
+    }
+
+    HANDLE proc = g_target.handle;
+    std::string internalName = toInternalClassName(className);
+    std::vector<std::string> fields = splitDots(fieldChain);
+    if (fields.empty()) {
+        setError("empty_field_chain");
+        return 0;
+    }
+
+    FVM_LOG("put_field_path: %s -> %s (%llu bytes)", className, fieldChain, valueSize);
+
+    // Step 1: Find the root Klass
+    uint64_t currentKlass = 0;
+    if (!findInstanceKlassByName(internalName, &currentKlass)) {
+        return 0;
+    }
+
+    // Step 2: Navigate the chain
+    // For each field except the last: resolve field, read OOP, get next Klass
+    uint64_t currentObj = 0; // 0 means "reading from Klass (static context)"
+    bool isRefWrite = false;
+
+    for (size_t i = 0; i < fields.size(); i++) {
+        bool isLast = (i == fields.size() - 1);
+        const std::string& fname = fields[i];
+
+        ResolvedField rf = {};
+        if (!resolveFieldInKlass(currentKlass, fname, "", &rf)) {
+            setError("field_not_found_in_chain:" + fname);
+            return 0;
+        }
+
+        if (isLast) {
+            // Write the value to this field
+            uint64_t writeAddr = 0;
+            if (rf.isStatic) {
+                writeAddr = rf.staticAddress;
+            } else {
+                if (currentObj == 0) {
+                    setError("instance_field_without_object:" + fname);
+                    return 0;
+                }
+                writeAddr = currentObj + rf.offset;
+            }
+
+            if (writeAddr == 0) {
+                setError("write_addr_zero:" + fname);
+                return 0;
+            }
+
+            if (!writeRemoteMem(proc, writeAddr, valueBytes, static_cast<size_t>(valueSize))) {
+                setError("write_failed:" + fname);
+                return 0;
+            }
+
+            // If field descriptor starts with L or [, it's a reference — dirty GC card
+            isRefWrite = (!rf.descriptor.empty() &&
+                          (rf.descriptor[0] == 'L' || rf.descriptor[0] == '['));
+            if (isRefWrite) {
+                resolveCardTableBase();
+                dirtyCard(writeAddr);
+            }
+
+            FVM_LOG("put_field_path: wrote %llu bytes to %s at 0x%llX (ref=%d)",
+                    valueSize, fname.c_str(), writeAddr, isRefWrite ? 1 : 0);
+            setError("ok");
+            return 1;
+        }
+
+        // Not the last field: read the OOP and follow it
+        uint64_t fieldAddr = 0;
+        if (rf.isStatic) {
+            fieldAddr = rf.staticAddress;
+        } else {
+            if (currentObj == 0) {
+                setError("instance_field_without_object:" + fname);
+                return 0;
+            }
+            fieldAddr = currentObj + rf.offset;
+        }
+
+        if (fieldAddr == 0) {
+            setError("field_addr_zero:" + fname);
+            return 0;
+        }
+
+        // Read the OOP value (reference to next object)
+        uint64_t nextObj = readOop(proc, fieldAddr, g_target.useCompressedOops);
+        if (nextObj == 0) {
+            setError("null_ref_in_chain:" + fname);
+            return 0;
+        }
+
+        // Read Klass from the object header
+        uint64_t nextKlass = readKlass(proc, nextObj, g_target.useCompressedClassPointers);
+        if (nextKlass == 0) {
+            setError("klass_read_failed_in_chain:" + fname);
+            return 0;
+        }
+
+        currentObj = nextObj;
+        currentKlass = nextKlass;
+    }
+
+    setError("unexpected_end_of_chain");
+    return 0;
+}
+
+// ============================================================
 // Diagnostic: dump barrier/card related structMap entries
 // ============================================================
 

@@ -13,6 +13,59 @@ static std::string makeTransformKey(const char* className, const char* methodNam
     return std::string(className) + "#" + methodName + "#" + paramDesc;
 }
 
+// ============================================================
+// Parameter type parsing for argument capture
+// ============================================================
+
+struct ParamSlotInfo {
+    int slot;    // local variable slot index
+    bool isRef;  // true if reference type (L...; or [...), false if primitive
+};
+
+// Parse JVM method signature to extract parameter slot info.
+// fullSig format: "(Ljava/lang/String;I)V"
+// isStatic: if true, params start at slot 0; otherwise slot 0 = this, params start at slot 1.
+static std::vector<ParamSlotInfo> parseParamSlots(const std::string& fullSig, bool isStatic) {
+    std::vector<ParamSlotInfo> params;
+    if (fullSig.empty() || fullSig[0] != '(') return params;
+
+    int slot = isStatic ? 0 : 1;
+    size_t i = 1; // skip '('
+    while (i < fullSig.size() && fullSig[i] != ')') {
+        ParamSlotInfo p;
+        p.slot = slot;
+        char c = fullSig[i];
+
+        if (c == 'L') {
+            p.isRef = true;
+            while (i < fullSig.size() && fullSig[i] != ';') i++;
+            i++; // skip ';'
+            slot++;
+        } else if (c == '[') {
+            p.isRef = true;
+            while (i < fullSig.size() && fullSig[i] == '[') i++;
+            if (i < fullSig.size() && fullSig[i] == 'L') {
+                while (i < fullSig.size() && fullSig[i] != ';') i++;
+                i++; // skip ';'
+            } else {
+                i++; // skip primitive component type
+            }
+            slot++;
+        } else if (c == 'J' || c == 'D') {
+            p.isRef = false;
+            i++;
+            slot += 2; // long/double occupy 2 slots
+        } else {
+            // B, C, F, I, S, Z
+            p.isRef = false;
+            i++;
+            slot++;
+        }
+        params.push_back(p);
+    }
+    return params;
+}
+
 // suspendTargetThreads / resumeTargetThreads — defined in forgevm_memory.cpp, declared in forgevm_internal.h
 
 // ============================================================
@@ -49,7 +102,7 @@ static bool readKlassName(HANDLE proc, uint64_t klassAddr, std::string* out) {
 }
 
 // Walk ClassLoaderData chain to find an InstanceKlass by name
-static bool findInstanceKlassByName(const std::string& internalName, uint64_t* outKlassAddr) {
+bool findInstanceKlassByName(const std::string& internalName, uint64_t* outKlassAddr) {
     HANDLE proc = g_target.handle;
 
     // Get SystemDictionary via gHotSpotVMStructs
@@ -829,9 +882,22 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     }
     FVM_LOG("hookMethod (%s%s) = 0x%llX", hookMethod, hookDesc, (unsigned long long)hookMethodAddr);
 
-    // 7. Read target method's return type from its signature descriptor
+    // 7. Read target method's signature and access flags
     std::string targetReturnDesc = "V"; // default void
+    std::string targetFullSig;          // full signature e.g. "(Ljava/lang/String;Ljava/lang/String;)V"
+    bool targetIsStatic = false;
     {
+        // Read access flags from Method to detect static
+        int64_t accessFlagsOff = structOffset("Method", "_access_flags");
+        if (accessFlagsOff >= 0) {
+            int32_t flags = 0;
+            readRemoteI32(proc, methodAddr + (uint64_t)accessFlagsOff, &flags);
+            targetIsStatic = (flags & 0x0008) != 0; // ACC_STATIC
+            FVM_LOG("target access_flags=0x%X, isStatic=%d", flags, (int)targetIsStatic);
+        } else {
+            FVM_LOG("WARN: cannot read Method::_access_flags, assuming instance method");
+        }
+
         int64_t sigIdxOff = structOffset("ConstMethod", "_signature_index");
         if (sigIdxOff >= 0) {
             uint16_t sigIndex = 0;
@@ -843,6 +909,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
                 if (readRemotePointer(proc, sigEntryAddr, &sigSymbol) && sigSymbol != 0) {
                     std::string fullSig;
                     if (readSymbolBody(proc, sigSymbol, &fullSig)) {
+                        targetFullSig = fullSig;
                         size_t closeParen = fullSig.find(')');
                         if (closeParen != std::string::npos && closeParen + 1 < fullSig.size()) {
                             targetReturnDesc = fullSig.substr(closeParen + 1);
@@ -852,6 +919,11 @@ int applyTransform(const char* className, const char* methodName, const char* pa
             }
         }
     }
+
+    // Parse target method's parameters for argument capture
+    std::vector<ParamSlotInfo> targetParams = parseParamSlots(targetFullSig, targetIsStatic);
+    FVM_LOG("target params: %zu (sig=%s, static=%d)", targetParams.size(),
+            targetFullSig.c_str(), (int)targetIsStatic);
 
     // Determine return type category and unboxing info
     struct UnboxInfo {
@@ -907,7 +979,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         setError("FvmCallback_class_not_loaded"); return 0;
     }
     uint64_t cbInitMethodAddr = 0;
-    if (!findMethodInKlass(cbKlassAddr, "<init>", "(Ljava/lang/Object;)V", &cbInitMethodAddr)) {
+    if (!findMethodInKlass(cbKlassAddr, "<init>", "(Ljava/lang/Object;[Ljava/lang/Object;)V", &cbInitMethodAddr)) {
         setError("FvmCallback_init_not_found"); return 0;
     }
     uint64_t cbIsCancelledAddr = 0;
@@ -917,6 +989,16 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     uint64_t cbGetReturnAddr = 0;
     if (!findMethodInKlass(cbKlassAddr, "getReturnValue", "()Ljava/lang/Object;", &cbGetReturnAddr)) {
         setError("FvmCallback_getReturnValue_not_found"); return 0;
+    }
+
+    // Find java/lang/Object klass (needed for anewarray to build Object[] args)
+    uint64_t objectKlassAddr = 0;
+    bool hasArgCapture = !targetParams.empty();
+    if (hasArgCapture) {
+        if (!findInstanceKlassByName("java/lang/Object", &objectKlassAddr)) {
+            FVM_LOG("WARN: java/lang/Object klass not found, disabling arg capture");
+            hasArgCapture = false;
+        }
     }
 
     // 8. Read EXISTING interned Symbol* pointers from target JVM metadata
@@ -968,6 +1050,16 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         setError("failed_to_read_interned_symbols"); return 0;
     }
 
+    // java/lang/Object class name symbol (for anewarray Object[])
+    uint64_t symObjectClass = 0;
+    if (hasArgCapture) {
+        symObjectClass = readKlassNameSymbol(objectKlassAddr);
+        if (symObjectClass == 0) {
+            FVM_LOG("WARN: cannot read java/lang/Object name symbol, disabling arg capture");
+            hasArgCapture = false;
+        }
+    }
+
     uint64_t symUnboxClass = 0, symUnboxMethod = 0, symUnboxDesc = 0;
     if (unbox.needsUnbox) {
         symUnboxClass = readKlassNameSymbol(unboxKlassAddr);
@@ -983,8 +1075,8 @@ int applyTransform(const char* className, const char* methodName, const char* pa
 
     // 9. Expand _resolved_klasses (needed for 'new' and 'checkcast' to find Klass*)
     int64_t resolvedKlassesOff = structOffset("ConstantPool", "_resolved_klasses");
-    int numNewClasses = unbox.needsUnbox ? 3 : 2;
-    int hookClassRKIdx = 0, cbClassRKIdx = 0, unboxClassRKIdx = 0;
+    int numNewClasses = 2 + (hasArgCapture ? 1 : 0) + (unbox.needsUnbox ? 1 : 0);
+    int hookClassRKIdx = 0, cbClassRKIdx = 0, objectClassRKIdx = 0, unboxClassRKIdx = 0;
     uint64_t newRKAddr = 0;
 
     if (resolvedKlassesOff >= 0) {
@@ -1001,7 +1093,9 @@ int applyTransform(const char* className, const char* methodName, const char* pa
 
             hookClassRKIdx = origRKLen;
             cbClassRKIdx   = origRKLen + 1;
-            if (unbox.needsUnbox) unboxClassRKIdx = origRKLen + 2;
+            int nextRKIdx  = origRKLen + 2;
+            if (hasArgCapture) objectClassRKIdx = nextRKIdx++;
+            if (unbox.needsUnbox) unboxClassRKIdx = nextRKIdx++;
 
             int32_t newRKLen = origRKLen + numNewClasses;
             size_t origRKSize = (size_t)rkDataOff + origRKLen * 8;
@@ -1018,6 +1112,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
             uint64_t* rkData = (uint64_t*)(newRKBytes.data() + rkDataOff);
             rkData[hookClassRKIdx] = hookKlassAddr;
             rkData[cbClassRKIdx]   = cbKlassAddr;
+            if (hasArgCapture) rkData[objectClassRKIdx] = objectKlassAddr;
             if (unbox.needsUnbox) rkData[unboxClassRKIdx] = unboxKlassAddr;
 
             newRKAddr = (uint64_t)VirtualAllocEx(proc, NULL, newRKSize,
@@ -1039,15 +1134,16 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     //   P+10,P+11:  Class entries (tag=7, slot=(name_idx<<16)|resolved_klass_idx)
     //   P+12..P+15: NameAndType entries (tag=12, slot=(desc_idx<<16)|name_idx)
     //   P+16..P+19: Methodref entries (tag=10, slot=(nat_idx<<16)|class_idx)
-    //   [If unbox]: P+20..P+22 Utf8, P+23 Class, P+24 NameAndType, P+25 Methodref
+    //   [If argCapture]: +1 Utf8 (Object name), +1 Class (Object)
+    //   [If unbox]:      +3 Utf8, +1 Class, +1 NameAndType, +1 Methodref
     //
     // HotSpot extract helpers:
     //   extract_low_short(val)  = val & 0xFFFF        (low 16 bits)
     //   extract_high_short(val) = (val >> 16) & 0xFFFF (high 16 bits)
 
-    uint32_t baseEntries = 20;
+    uint32_t argCaptureEntries = hasArgCapture ? 2 : 0;  // 1 Utf8 + 1 Class
     uint32_t unboxEntries = unbox.needsUnbox ? 6 : 0;
-    uint32_t totalNewEntries = baseEntries + unboxEntries;
+    uint32_t totalNewEntries = 20 + argCaptureEntries + unboxEntries;
     uint32_t newPoolLength = poolLength + totalNewEntries;
     size_t newPoolByteSize = poolByteSize + totalNewEntries * 8;
 
@@ -1084,46 +1180,51 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     newSlots[P+9]  = symGetRetValD;
 
     // Class entries (tag=7): slot = (name_utf8_idx << 16) | resolved_klass_idx
-    // HotSpot: klass_slot_at() → high=name_index, low=resolved_klass_index
     newSlots[P+10] = (uint64_t)(((uint32_t)(P+0) << 16) | (uint32_t)hookClassRKIdx);
     newSlots[P+11] = (uint64_t)(((uint32_t)(P+3) << 16) | (uint32_t)cbClassRKIdx);
 
     // NameAndType entries (tag=12): slot = (desc_idx << 16) | name_idx
-    // HotSpot: name_ref_index_at() = extract_low_short = name_idx
-    //          signature_ref_index_at() = extract_high_short = desc_idx
     newSlots[P+12] = (uint64_t)(((uint32_t)(P+2) << 16) | (uint32_t)(P+1));   // hookDesc<<16 | hookMethod
-    newSlots[P+13] = (uint64_t)(((uint32_t)(P+5) << 16) | (uint32_t)(P+4));   // (Object)V<<16 | <init>
+    newSlots[P+13] = (uint64_t)(((uint32_t)(P+5) << 16) | (uint32_t)(P+4));   // initDesc<<16 | <init>
     newSlots[P+14] = (uint64_t)(((uint32_t)(P+7) << 16) | (uint32_t)(P+6));   // ()Z<<16 | isCancelled
     newSlots[P+15] = (uint64_t)(((uint32_t)(P+9) << 16) | (uint32_t)(P+8));   // ()Object<<16 | getReturnValue
 
     // Methodref entries (tag=10): slot = (nat_idx << 16) | class_idx
-    // HotSpot: klass_ref_index_at() = extract_low_short = class_idx
-    //          name_and_type_ref_index_at() = extract_high_short = nat_idx
     newSlots[P+16] = (uint64_t)(((uint32_t)(P+12) << 16) | (uint32_t)(P+10)); // hook invokestatic
     newSlots[P+17] = (uint64_t)(((uint32_t)(P+13) << 16) | (uint32_t)(P+11)); // FvmCallback.<init>
     newSlots[P+18] = (uint64_t)(((uint32_t)(P+14) << 16) | (uint32_t)(P+11)); // FvmCallback.isCancelled
     newSlots[P+19] = (uint64_t)(((uint32_t)(P+15) << 16) | (uint32_t)(P+11)); // FvmCallback.getReturnValue
 
-    if (unbox.needsUnbox) {
-        newSlots[P+20] = symUnboxClass;
-        newSlots[P+21] = symUnboxMethod;
-        newSlots[P+22] = symUnboxDesc;
-        // Class: (name_idx << 16) | resolved_klass_idx
-        newSlots[P+23] = (uint64_t)(((uint32_t)(P+20) << 16) | (uint32_t)unboxClassRKIdx);
-        // NameAndType: (desc_idx << 16) | name_idx
-        newSlots[P+24] = (uint64_t)(((uint32_t)(P+22) << 16) | (uint32_t)(P+21));
-        // Methodref: (nat_idx << 16) | class_idx
-        newSlots[P+25] = (uint64_t)(((uint32_t)(P+24) << 16) | (uint32_t)(P+23));
+    // Dynamic extension point — optional entries use running index E
+    uint32_t E = 20;
+
+    // [arg capture] Object class for anewarray
+    uint32_t objClassCpIdx = 0; // CP index of java/lang/Object Class entry (for anewarray bytecode)
+    if (hasArgCapture) {
+        newSlots[P+E]   = symObjectClass;  // Utf8: "java/lang/Object"
+        newSlots[P+E+1] = (uint64_t)(((uint32_t)(P+E) << 16) | (uint32_t)objectClassRKIdx); // Class
+        objClassCpIdx = P + E + 1;
+        FVM_LOG("  argCapture: Object Utf8=P+%u, Class=P+%u (cpIdx=%u)", E, E+1, objClassCpIdx);
+        E += 2;
     }
 
-    FVM_LOG("new CP entries (P=%u, newPoolLength=%u):", P, newPoolLength);
-    FVM_LOG("  Class[P+10]=0x%llX Class[P+11]=0x%llX", (unsigned long long)newSlots[P+10], (unsigned long long)newSlots[P+11]);
-    FVM_LOG("  NAT[P+12]=0x%llX NAT[P+13]=0x%llX NAT[P+14]=0x%llX NAT[P+15]=0x%llX",
-            (unsigned long long)newSlots[P+12], (unsigned long long)newSlots[P+13],
-            (unsigned long long)newSlots[P+14], (unsigned long long)newSlots[P+15]);
-    FVM_LOG("  MRef[P+16]=0x%llX MRef[P+17]=0x%llX MRef[P+18]=0x%llX MRef[P+19]=0x%llX",
-            (unsigned long long)newSlots[P+16], (unsigned long long)newSlots[P+17],
-            (unsigned long long)newSlots[P+18], (unsigned long long)newSlots[P+19]);
+    // [unbox] wrapper class + valueOf method
+    uint32_t unboxMethodrefCpOff = 0; // relative offset from P for unbox Methodref
+    if (unbox.needsUnbox) {
+        newSlots[P+E]   = symUnboxClass;
+        newSlots[P+E+1] = symUnboxMethod;
+        newSlots[P+E+2] = symUnboxDesc;
+        // Class: (name_idx << 16) | resolved_klass_idx
+        newSlots[P+E+3] = (uint64_t)(((uint32_t)(P+E) << 16) | (uint32_t)unboxClassRKIdx);
+        // NameAndType: (desc_idx << 16) | name_idx
+        newSlots[P+E+4] = (uint64_t)(((uint32_t)(P+E+2) << 16) | (uint32_t)(P+E+1));
+        // Methodref: (nat_idx << 16) | class_idx
+        newSlots[P+E+5] = (uint64_t)(((uint32_t)(P+E+4) << 16) | (uint32_t)(P+E+3));
+        unboxMethodrefCpOff = E + 5;
+        E += 6;
+    }
+
+    FVM_LOG("new CP entries (P=%u, newPoolLength=%u, totalNew=%u):", P, newPoolLength, totalNewEntries);
 
     // Update tags array
     int64_t tagsOff = structOffset("ConstantPool", "_tags");
@@ -1156,16 +1257,25 @@ int applyTransform(const char* className, const char* methodName, const char* pa
                 memcpy(newTags.data() + tagArrayLenOff, &newTagLen, 4);
 
                 uint8_t* td = newTags.data() + tagArrayDataOff;
+                // Base 20 entries: 10 Utf8, 2 Class, 4 NameAndType, 4 Methodref
                 for (int i = 0; i < 10; i++) td[P+i] = 1;   // Utf8
-                td[P+10] = 7;  td[P+11] = 7;                 // Class (pre-resolved)
+                td[P+10] = 7;  td[P+11] = 7;                 // Class
                 td[P+12] = 12; td[P+13] = 12; td[P+14] = 12; td[P+15] = 12; // NameAndType
                 td[P+16] = 10; td[P+17] = 10; td[P+18] = 10; td[P+19] = 10; // Methodref
 
+                // Tag optional entries using the same running offset logic
+                uint32_t tagE = 20;
+                if (hasArgCapture) {
+                    td[P+tagE] = 1;     // Utf8 (Object name)
+                    td[P+tagE+1] = 7;   // Class (Object)
+                    tagE += 2;
+                }
                 if (unbox.needsUnbox) {
-                    td[P+20] = 1;  td[P+21] = 1;  td[P+22] = 1;  // Utf8
-                    td[P+23] = 7;  // Class
-                    td[P+24] = 12; // NameAndType
-                    td[P+25] = 10; // Methodref
+                    td[P+tagE] = 1;  td[P+tagE+1] = 1;  td[P+tagE+2] = 1;  // Utf8
+                    td[P+tagE+3] = 7;  // Class
+                    td[P+tagE+4] = 12; // NameAndType
+                    td[P+tagE+5] = 10; // Methodref
+                    tagE += 6;
                 }
 
                 writeRemoteMem(proc, newTagsAddr, newTags.data(), newTagSize);
@@ -1240,7 +1350,8 @@ int applyTransform(const char* className, const char* methodName, const char* pa
             if (flagsFieldOff < 0) flagsFieldOff = 24;
 
             // CP indices for each Methodref entry
-            int cpIdxTable[] = { (int)(P+16), (int)(P+17), (int)(P+18), (int)(P+19), (int)(P+25) };
+            int cpIdxTable[] = { (int)(P+16), (int)(P+17), (int)(P+18), (int)(P+19),
+                                 unbox.needsUnbox ? (int)(P+unboxMethodrefCpOff) : 0 };
 
             // Bytecodes: invokestatic for hook, invokespecial for all others
             // All use bytecode_1 (invokevirtual would use bytecode_2, but we avoid it)
@@ -1255,7 +1366,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
             // param_size: invokestatic counts args only; invokespecial counts this + args
             int64_t flagsTable[5];
             flagsTable[0] = ((int64_t)9 << 28) | 1;  // hook(FvmCallback)V: void, 1 param
-            flagsTable[1] = ((int64_t)9 << 28) | 2;  // <init>(Object)V:    void, 2 params (this+arg)
+            flagsTable[1] = ((int64_t)9 << 28) | 3;  // <init>(Object,Object[])V: void, 3 params (this+instance+args)
             flagsTable[2] = ((int64_t)4 << 28) | 1;  // isCancelled()Z:     int,  1 param  (this)
             flagsTable[3] = ((int64_t)8 << 28) | 1;  // getReturnValue()O:  obj,  1 param  (this)
             flagsTable[4] = 0;                         // unbox: computed below
@@ -1322,7 +1433,7 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     uint16_t initCacheIdx16   = (uint16_t)initCacheIdx;        // invokespecial <init>
     uint16_t cancelCacheIdx16 = (uint16_t)cancelCacheIdx;      // invokespecial isCancelled
     uint16_t retValCacheIdx16 = (uint16_t)retValCacheIdx;      // invokespecial getReturnValue
-    uint16_t unboxClassCpIdx  = unbox.needsUnbox ? (uint16_t)(P + 23) : 0; // wrapper Class (for checkcast)
+    uint16_t unboxClassCpIdx  = unbox.needsUnbox ? (uint16_t)(P + unboxMethodrefCpOff - 2) : 0; // wrapper Class (for checkcast)
     uint16_t unboxCacheIdx16  = unbox.needsUnbox ? (uint16_t)unboxCacheIdx : 0;
 
     FVM_LOG("bytecode operand indices:");
@@ -1386,15 +1497,59 @@ int applyTransform(const char* className, const char* methodName, const char* pa
     std::string injectAtStr(injectAt);
 
     auto emitCallbackPrologue = [&](std::vector<uint8_t>& bc) {
-        // Stack trace:
-        bc.push_back(0xBB); emitIdx(bc, cbClassCpIdx);           // new FvmCallback (CP idx, big-endian) → [cbU]
+        // new FvmCallback(instance, args)
+        bc.push_back(0xBB); emitIdx(bc, cbClassCpIdx);           // new FvmCallback → [cbU]
         bc.push_back(0x59);                                        // dup → [cbU, cbU]
-        bc.push_back(0x2A);                                        // aload_0 → [cbU, cbU, this]
-        bc.push_back(0xB7); emitNativeIdx(bc, initCacheIdx16);    // invokespecial <init> (cache idx, native) → [cb]
+
+        // Push instance: this for instance methods, null for static
+        if (targetIsStatic) {
+            bc.push_back(0x01);                                    // aconst_null → [cbU, cbU, null]
+        } else {
+            bc.push_back(0x2A);                                    // aload_0 → [cbU, cbU, this]
+        }
+
+        // Build Object[] args (or null if no params / arg capture disabled)
+        if (!hasArgCapture || targetParams.empty()) {
+            bc.push_back(0x01);                                    // aconst_null → [cbU, cbU, inst, null]
+        } else {
+            int n = (int)targetParams.size();
+            // Push array size
+            if (n <= 5) {
+                bc.push_back((uint8_t)(0x03 + n));                 // iconst_0..iconst_5
+            } else {
+                bc.push_back(0x10); bc.push_back((uint8_t)n);     // bipush N
+            }
+            // anewarray java/lang/Object (CP idx, big-endian)
+            bc.push_back(0xBD); emitIdx(bc, (uint16_t)objClassCpIdx);
+            // Fill array with method arguments
+            for (int i = 0; i < n; i++) {
+                bc.push_back(0x59);                                // dup array ref
+                // Push array index
+                if (i <= 5) {
+                    bc.push_back((uint8_t)(0x03 + i));             // iconst_0..iconst_5
+                } else {
+                    bc.push_back(0x10); bc.push_back((uint8_t)i); // bipush
+                }
+                // Load parameter value
+                if (targetParams[i].isRef) {
+                    int slot = targetParams[i].slot;
+                    if (slot <= 3) {
+                        bc.push_back((uint8_t)(0x2A + slot));      // aload_0..aload_3
+                    } else {
+                        bc.push_back(0x19); bc.push_back((uint8_t)slot); // aload N
+                    }
+                } else {
+                    bc.push_back(0x01);                            // aconst_null (primitive, boxing TODO)
+                }
+                bc.push_back(0x53);                                // aastore
+            }
+        }
+
+        bc.push_back(0xB7); emitNativeIdx(bc, initCacheIdx16);    // invokespecial <init>(Object, Object[]) → [cb]
         bc.push_back(0x59);                                        // dup → [cb, cb]
         bc.push_back(0x59);                                        // dup → [cb, cb, cb]
-        bc.push_back(0xB8); emitNativeIdx(bc, hookCacheIdx16);    // invokestatic hook (cache idx, native) → [cb, cb]
-        bc.push_back(0xB7); emitNativeIdx(bc, cancelCacheIdx16);  // invokespecial isCancelled (cache idx, native) → [cb, int]
+        bc.push_back(0xB8); emitNativeIdx(bc, hookCacheIdx16);    // invokestatic hook → [cb, cb]
+        bc.push_back(0xB7); emitNativeIdx(bc, cancelCacheIdx16);  // invokespecial isCancelled → [cb, int]
         bc.push_back(0x99);                                        // ifeq (branch offset, big-endian)
         bc.push_back((uint8_t)(ifeqOffset >> 8));
         bc.push_back((uint8_t)(ifeqOffset & 0xFF));
@@ -1484,14 +1639,14 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         memcpy(newConstMethodBytes.data() + codeSizeOff, &newCodeSize, 2);
     }
 
-    // Update _max_stack: our prologue needs at least 4 stack slots
-    // (new, dup, dup, dup = 3 copies + this = 4 max depth)
-    // Ensure max_stack >= max(original, 4)
+    // Update _max_stack: our prologue needs stack slots for FvmCallback + args array construction.
+    // Without args: peak 4 (cbU, cbU, inst, null → init consumed).
+    // With args:    peak 7 during aastore (cbU, cbU, inst, arr, arr, idx, val).
     int64_t maxStackOff = structOffset("ConstMethod", "_max_stack");
     if (maxStackOff >= 0) {
         uint16_t origMaxStack = 0;
         memcpy(&origMaxStack, newConstMethodBytes.data() + maxStackOff, 2);
-        uint16_t needed = 4; // our prologue peak: [cb, cb, cb, this]
+        uint16_t needed = (hasArgCapture && !targetParams.empty()) ? 7 : 4;
         if (origMaxStack < needed) {
             FVM_LOG("max_stack: %u -> %u (bumped)", origMaxStack, needed);
             memcpy(newConstMethodBytes.data() + maxStackOff, &needed, 2);
@@ -1782,6 +1937,221 @@ int restoreTransform(const char* className, const char* methodName, const char* 
 // ============================================================
 // Exported DLL functions
 // ============================================================
+
+// ============================================================
+// Purge Agent — disable a loaded Java agent entirely
+//
+// 1. Find agent Klass, locate its static Instrumentation field
+// 2. Read the InstrumentationImpl OOP
+// 3. Null the mTransformerManager field (stops future transforms)
+// 4. Null the agent's static instrumentation field
+// 5. Overwrite agentmain/premain bytecode with bare return (0xB1)
+// ============================================================
+
+static bool nullifyStaticField(uint64_t klassAddr, const std::string& fieldName) {
+    HANDLE proc = g_target.handle;
+
+    ResolvedField rf = {};
+    // Try common descriptor for object references
+    if (!resolveFieldInKlass(klassAddr, fieldName, "", &rf)) {
+        return false;
+    }
+    if (!rf.isStatic || rf.staticAddress == 0) {
+        setError("field_not_static:" + fieldName);
+        return false;
+    }
+
+    // Write null (zero) to the static field
+    uint64_t zero = 0;
+    size_t writeSize = g_target.useCompressedOops ? 4 : 8;
+    if (!writeRemoteMem(proc, rf.staticAddress, &zero, writeSize)) {
+        setError("write_null_failed:" + fieldName);
+        return false;
+    }
+    FVM_LOG("purge_agent: nullified static field '%s' at 0x%llX", fieldName.c_str(), rf.staticAddress);
+    return true;
+}
+
+static bool readStaticOop(uint64_t klassAddr, const std::string& fieldName, uint64_t* outOop) {
+    HANDLE proc = g_target.handle;
+
+    ResolvedField rf = {};
+    if (!resolveFieldInKlass(klassAddr, fieldName, "", &rf)) {
+        return false;
+    }
+    if (!rf.isStatic || rf.staticAddress == 0) {
+        setError("field_not_static:" + fieldName);
+        return false;
+    }
+
+    *outOop = readOop(proc, rf.staticAddress, g_target.useCompressedOops);
+    return (*outOop != 0);
+}
+
+static bool clearMethodBody(uint64_t klassAddr, const char* methodName) {
+    HANDLE proc = g_target.handle;
+    uint64_t methodAddr = 0;
+    // Try to find the method — empty paramDesc matches any signature
+    if (!findMethodInKlass(klassAddr, methodName, "", &methodAddr) || methodAddr == 0) {
+        FVM_LOG("purge_agent: method '%s' not found (may not exist)", methodName);
+        return false; // not an error — method may not exist in this agent
+    }
+
+    // Read ConstMethod* from Method
+    int64_t constMethodOff = structOffset("Method", "_constMethod");
+    if (constMethodOff < 0) constMethodOff = 8;
+
+    uint64_t constMethodAddr = 0;
+    if (!readRemotePointer(proc, methodAddr + (uint64_t)constMethodOff, &constMethodAddr) || constMethodAddr == 0) {
+        setError("constmethod_read_failed");
+        return false;
+    }
+
+    // Read bytecode size
+    uint32_t codeSize = 0;
+    std::vector<uint8_t> bytecode;
+    uint64_t bytecodeStart = 0;
+    if (!readConstMethodBytecode(constMethodAddr, &bytecode, &bytecodeStart, &codeSize)) {
+        setError("bytecode_read_failed");
+        return false;
+    }
+
+    if (codeSize == 0 || bytecodeStart == 0) {
+        setError("bytecode_empty");
+        return false;
+    }
+
+    // Write a single 'return' (0xB1) at the start, fill rest with nop (0x00)
+    std::vector<uint8_t> cleared(codeSize, 0x00);
+    cleared[0] = 0xB1; // return void
+
+    if (!writeRemoteMem(proc, bytecodeStart, cleared.data(), codeSize)) {
+        setError("bytecode_write_failed");
+        return false;
+    }
+
+    FVM_LOG("purge_agent: cleared method '%s' bytecode (%u bytes) at 0x%llX",
+            methodName, codeSize, bytecodeStart);
+    return true;
+}
+
+static int doPurgeAgent(const char* agentClassName) {
+    HANDLE proc = g_target.handle;
+    if (proc == NULL) {
+        setError("no_target_process");
+        return 0;
+    }
+
+    std::string internalName = std::string(agentClassName);
+    for (char& c : internalName) { if (c == '.') c = '/'; }
+
+    FVM_LOG("=== PURGE AGENT: %s ===", internalName.c_str());
+
+    // Step 1: Find the agent Klass
+    uint64_t agentKlass = 0;
+    if (!findInstanceKlassByName(internalName, &agentKlass)) {
+        setError("agent_class_not_found:" + internalName);
+        return 0;
+    }
+    FVM_LOG("purge_agent: found agent Klass at 0x%llX", agentKlass);
+
+    // Step 2: Suspend all threads for safe memory writes
+    std::vector<DWORD> threads;
+    suspendTargetThreads(g_target.pid, threads);
+
+    bool success = true;
+    int steps = 0;
+
+    // Step 3: Read the static Instrumentation field OOP from the agent class
+    // Common field names used by Java agents for their Instrumentation reference
+    static const char* instFieldNames[] = {
+        "instrumentation", "inst", "INST", "INSTRUMENTATION",
+        "sInstrumentation", "sInst", nullptr
+    };
+
+    uint64_t instOop = 0;
+    const char* foundFieldName = nullptr;
+    for (int i = 0; instFieldNames[i] != nullptr; i++) {
+        if (readStaticOop(agentKlass, instFieldNames[i], &instOop)) {
+            foundFieldName = instFieldNames[i];
+            FVM_LOG("purge_agent: found Instrumentation OOP=0x%llX in field '%s'",
+                    instOop, foundFieldName);
+            break;
+        }
+    }
+
+    // Step 4: If we found an Instrumentation OOP, null the TransformerManager inside it
+    if (instOop != 0 && foundFieldName != nullptr) {
+        // Read the Klass of the InstrumentationImpl object
+        int64_t oopKlassOff = 0; // object header offset for klass
+        uint64_t instKlass = readKlass(proc, instOop + oopKlassOff,
+                                        g_target.useCompressedClassPointers);
+
+        if (instKlass != 0) {
+            FVM_LOG("purge_agent: InstrumentationImpl Klass at 0x%llX", instKlass);
+
+            // Null the mTransformerManager field
+            ResolvedField tmField = {};
+            if (resolveFieldInKlass(instKlass, "mTransformerManager", "", &tmField)) {
+                if (!tmField.isStatic && tmField.offset > 0) {
+                    uint64_t tmAddr = instOop + tmField.offset;
+                    uint64_t zero = 0;
+                    size_t writeSize = g_target.useCompressedOops ? 4 : 8;
+                    if (writeRemoteMem(proc, tmAddr, &zero, writeSize)) {
+                        FVM_LOG("purge_agent: nullified mTransformerManager at OOP+%d", tmField.offset);
+                        steps++;
+                    }
+                }
+            }
+
+            // Also null mRetransfomerManager (yes, JDK has this typo in some versions)
+            ResolvedField rtmField = {};
+            if (resolveFieldInKlass(instKlass, "mRetransfomerManager", "", &rtmField)) {
+                if (!rtmField.isStatic && rtmField.offset > 0) {
+                    uint64_t rtmAddr = instOop + rtmField.offset;
+                    uint64_t zero = 0;
+                    size_t writeSize = g_target.useCompressedOops ? 4 : 8;
+                    if (writeRemoteMem(proc, rtmAddr, &zero, writeSize)) {
+                        FVM_LOG("purge_agent: nullified mRetransfomerManager at OOP+%d", rtmField.offset);
+                        steps++;
+                    }
+                }
+            }
+        }
+
+        // Step 5: Null the agent's static instrumentation field
+        if (nullifyStaticField(agentKlass, foundFieldName)) {
+            steps++;
+        }
+    } else {
+        FVM_LOG("purge_agent: no Instrumentation field found — skipping Instrumentation cleanup");
+    }
+
+    // Step 6: Clear agentmain and premain method bodies
+    if (clearMethodBody(agentKlass, "agentmain")) steps++;
+    if (clearMethodBody(agentKlass, "premain")) steps++;
+
+    // Resume threads
+    resumeTargetThreads(threads);
+
+    // Force deoptimization so JIT-compiled code picks up the changes
+    FVM_LOG("purge_agent: starting deoptimization sweep...");
+    forceDeoptimizeAll();
+
+    if (steps > 0) {
+        FVM_LOG("=== PURGE AGENT SUCCESS: %s (%d steps) ===", internalName.c_str(), steps);
+        setError("ok");
+        return 1;
+    } else {
+        FVM_LOG("=== PURGE AGENT: no operations succeeded for %s ===", internalName.c_str());
+        setError("no_operations_succeeded");
+        return 0;
+    }
+}
+
+extern "C" __declspec(dllexport) int forgevm_purge_agent(const char* agentClassName) {
+    return doPurgeAgent(agentClassName);
+}
 
 extern "C" __declspec(dllexport) int forgevm_transform_load(
     const char* className, const char* methodName, const char* paramDesc,

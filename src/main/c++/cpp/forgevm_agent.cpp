@@ -63,6 +63,8 @@ typedef int(__cdecl* PutFieldBatchFn)(const unsigned long long*, unsigned long l
 typedef void(__cdecl* SetLogDirFn)(const char*);
 typedef int(__cdecl* TransformLoadFn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*);
 typedef int(__cdecl* TransformUnloadFn)(const char*, const char*, const char*);
+typedef int(__cdecl* PurgeAgentFn)(const char*);
+typedef int(__cdecl* PutFieldPathFn)(const char*, const char*, const unsigned char*, unsigned long long);
 
 namespace {
 struct NativeApi {
@@ -84,6 +86,8 @@ struct NativeApi {
     SetLogDirFn setLogDir = NULL;
     TransformLoadFn transformLoad = NULL;
     TransformUnloadFn transformUnload = NULL;
+    PurgeAgentFn purgeAgent = NULL;
+    PutFieldPathFn putFieldPath = NULL;
 };
 
 struct AgentLockState {
@@ -91,6 +95,7 @@ struct AgentLockState {
     ULONGLONG lockUntilTick = 0;
     unsigned long long ownerPid = 0ULL;
 };
+
 
 // Parent process watchdog: exits agent when parent JVM dies
 static std::atomic<DWORD> g_parentPid{0};
@@ -348,6 +353,8 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->dumpCardStructs = reinterpret_cast<ProbeFn>(GetProcAddress(module, "forgevm_dump_card_structs"));
     api->transformLoad   = reinterpret_cast<TransformLoadFn>(GetProcAddress(module, "forgevm_transform_load"));
     api->transformUnload = reinterpret_cast<TransformUnloadFn>(GetProcAddress(module, "forgevm_transform_unload"));
+    api->purgeAgent      = reinterpret_cast<PurgeAgentFn>(GetProcAddress(module, "forgevm_purge_agent"));
+    api->putFieldPath    = reinterpret_cast<PutFieldPathFn>(GetProcAddress(module, "forgevm_put_field_path"));
 
     if (api->probe == NULL || api->init == NULL) { *reason = "missing_export"; return false; }
     return true;
@@ -677,6 +684,61 @@ void handleTransformUnload(const NativeApi& api, const std::string& line, const 
     }
 }
 
+void handlePutFieldPath(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    if (api.putFieldPath == NULL) {
+        printResult("fallback", "JVM_FALLBACK", dllPath, "put_field_path_not_exported");
+        return;
+    }
+    std::string className  = getJsonStringField(line, "className");
+    std::string fieldChain = getJsonStringField(line, "fieldChain");
+    std::string valueHex   = getJsonStringField(line, "valueHex");
+
+    if (className.empty() || fieldChain.empty() || valueHex.empty()) {
+        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_put_field_path_params");
+        return;
+    }
+
+    std::vector<unsigned char> valueBytes = fromHex(valueHex);
+    if (valueBytes.empty()) {
+        printResult("fallback", "JVM_FALLBACK", dllPath, "empty_value_bytes");
+        return;
+    }
+
+    AGENT_LOG("put_field_path: %s -> %s", className.c_str(), fieldChain.c_str());
+
+    int result = api.putFieldPath(className.c_str(), fieldChain.c_str(),
+                                   valueBytes.data(), static_cast<unsigned long long>(valueBytes.size()));
+    std::string reason = copyReason(api, result == 1 ? "ok" : "put_field_path_failed");
+    if (result == 1) {
+        printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
+    } else {
+        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+    }
+}
+
+void handlePurgeAgent(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    if (api.purgeAgent == NULL) {
+        printResult("fallback", "JVM_FALLBACK", dllPath, "purge_agent_not_exported");
+        return;
+    }
+    std::string agentClass = getJsonStringField(line, "agentClass");
+    if (agentClass.empty()) {
+        printResult("fallback", "JVM_FALLBACK", dllPath, "missing_agent_class");
+        return;
+    }
+
+    AGENT_LOG("purge_agent: %s", agentClass.c_str());
+
+    int result = api.purgeAgent(agentClass.c_str());
+    std::string reason = copyReason(api, result == 1 ? "ok" : "purge_agent_failed");
+    AGENT_LOG("purge_agent result=%d reason=%s", result, reason.c_str());
+    if (result == 1) {
+        printResult("ok", "NATIVE_FULL", dllPath, reason.c_str());
+    } else {
+        printResult("fallback", "JVM_FALLBACK", dllPath, reason.c_str());
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -762,6 +824,10 @@ int main(int argc, char** argv) {
             handleTransformLoad(api, line, dllPath);
         } else if (cmd == "transform_unload") {
             handleTransformUnload(api, line, dllPath);
+        } else if (cmd == "purge_agent") {
+            handlePurgeAgent(api, line, dllPath);
+        } else if (cmd == "put_field_path") {
+            handlePutFieldPath(api, line, dllPath);
         } else if (cmd == "dump_card_structs") {
             if (api.dumpCardStructs != NULL) {
                 api.dumpCardStructs();
