@@ -1,11 +1,15 @@
 #include <windows.h>
 #include <shellapi.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
 
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
 #include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <cstdarg>
 
@@ -67,6 +71,7 @@ typedef int(__cdecl* PurgeAgentFn)(const char*);
 typedef int(__cdecl* PutFieldPathFn)(const char*, const char*, const unsigned char*, unsigned long long);
 typedef int(__cdecl* ForgeSubclassLoadFn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*);
 typedef int(__cdecl* ForgeSubclassUnloadFn)(const char*, const char*, const char*);
+typedef int(__cdecl* PutObjectFieldPathFn)(const char*, const char*, const char*, const char*);
 
 namespace {
 struct NativeApi {
@@ -92,6 +97,7 @@ struct NativeApi {
     PutFieldPathFn putFieldPath = NULL;
     ForgeSubclassLoadFn forgeSubLoad = NULL;
     ForgeSubclassUnloadFn forgeSubUnload = NULL;
+    PutObjectFieldPathFn putObjectFieldPath = NULL;
 };
 
 struct AgentLockState {
@@ -211,31 +217,60 @@ std::string escapeJson(const std::string& value) {
     return out;
 }
 
+// Thread-local socket for the current client connection.
+// When set to INVALID_SOCKET, output goes to stdout (bootstrap / one-shot mode).
+static thread_local SOCKET tl_clientSocket = INVALID_SOCKET;
+
+static bool sendLine(SOCKET sock, const std::string& line) {
+    std::string data = line + "\n";
+    int total = static_cast<int>(data.size());
+    int sent = 0;
+    while (sent < total) {
+        int n = ::send(sock, data.c_str() + sent, total - sent, 0);
+        if (n <= 0) return false;
+        sent += n;
+    }
+    return true;
+}
+
 void printResultWithFields(const char* status,
                            const char* capability,
                            const std::string& dllPath,
                            const char* reason,
                            const std::vector<std::pair<std::string, std::string>>& fields) {
-    std::cout << "{\"status\":\"" << escapeJson(status)
-              << "\",\"capability\":\"" << escapeJson(capability)
-              << "\",\"dllPath\":\"" << escapeJson(dllPath)
-              << "\",\"reason\":\"" << escapeJson(reason) << "\"";
+    std::ostringstream oss;
+    oss << "{\"status\":\"" << escapeJson(status)
+        << "\",\"capability\":\"" << escapeJson(capability)
+        << "\",\"dllPath\":\"" << escapeJson(dllPath)
+        << "\",\"reason\":\"" << escapeJson(reason) << "\"";
     for (size_t i = 0; i < fields.size(); ++i) {
-        std::cout << ",\"" << escapeJson(fields[i].first)
-                  << "\":\"" << escapeJson(fields[i].second) << "\"";
+        oss << ",\"" << escapeJson(fields[i].first)
+            << "\":\"" << escapeJson(fields[i].second) << "\"";
     }
-    std::cout << "}" << std::endl;
+    oss << "}";
+
+    if (tl_clientSocket != INVALID_SOCKET) {
+        sendLine(tl_clientSocket, oss.str());
+    } else {
+        std::cout << oss.str() << std::endl;
+    }
 }
 
 void printResult(const char* status,
                  const char* capability,
                  const std::string& dllPath,
                  const char* reason) {
-    std::cout << "{\"status\":\"" << escapeJson(status)
-              << "\",\"capability\":\"" << escapeJson(capability)
-              << "\",\"dllPath\":\"" << escapeJson(dllPath)
-              << "\",\"reason\":\"" << escapeJson(reason)
-              << "\"}" << std::endl;
+    std::ostringstream oss;
+    oss << "{\"status\":\"" << escapeJson(status)
+        << "\",\"capability\":\"" << escapeJson(capability)
+        << "\",\"dllPath\":\"" << escapeJson(dllPath)
+        << "\",\"reason\":\"" << escapeJson(reason) << "\"}";
+
+    if (tl_clientSocket != INVALID_SOCKET) {
+        sendLine(tl_clientSocket, oss.str());
+    } else {
+        std::cout << oss.str() << std::endl;
+    }
 }
 
 std::string getJsonStringField(const std::string& line, const std::string& key) {
@@ -361,6 +396,7 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->putFieldPath    = reinterpret_cast<PutFieldPathFn>(GetProcAddress(module, "forgevm_put_field_path"));
     api->forgeSubLoad    = reinterpret_cast<ForgeSubclassLoadFn>(GetProcAddress(module, "forgevm_forge_load_subclasses"));
     api->forgeSubUnload  = reinterpret_cast<ForgeSubclassUnloadFn>(GetProcAddress(module, "forgevm_forge_unload_subclasses"));
+    api->putObjectFieldPath = reinterpret_cast<PutObjectFieldPathFn>(GetProcAddress(module, "forgevm_put_object_field_path"));
 
     if (api->probe == NULL || api->init == NULL) { *reason = "missing_export"; return false; }
     return true;
@@ -768,6 +804,205 @@ void handlePurgeAgent(const NativeApi& api, const std::string& line, const std::
     }
 }
 
+void handlePutObjectFieldPath(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    if (api.putObjectFieldPath == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "put_object_field_path_not_exported");
+        return;
+    }
+    std::string targetClass = getJsonStringField(line, "targetClass");
+    std::string targetField = getJsonStringField(line, "targetField");
+    std::string sourceClass = getJsonStringField(line, "sourceClass");
+    std::string sourceField = getJsonStringField(line, "sourceField");
+
+    if (targetClass.empty() || targetField.empty() || sourceClass.empty() || sourceField.empty()) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_put_object_field_path_params");
+        return;
+    }
+
+    AGENT_LOG("put_object_field_path: %s.%s <- %s.%s",
+              targetClass.c_str(), targetField.c_str(),
+              sourceClass.c_str(), sourceField.c_str());
+
+    int result = api.putObjectFieldPath(targetClass.c_str(), targetField.c_str(),
+                                         sourceClass.c_str(), sourceField.c_str());
+    std::string reason = copyReason(api, result == 1 ? "ok" : "put_object_field_path_failed");
+    AGENT_LOG("put_object_field_path result=%d reason=%s", result, reason.c_str());
+    if (result == 1) {
+        printResult("ok", "FULL", dllPath, reason.c_str());
+    } else {
+        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
+    }
+}
+
+// Global lock for DLL calls that modify target process memory.
+// Multiple client threads share one DLL instance — serialize writes.
+static std::mutex g_dllMutex;
+
+// Read one newline-terminated line from a socket.
+// Returns false on disconnect or error.
+static bool recvLine(SOCKET sock, std::string* out) {
+    out->clear();
+    char c;
+    while (true) {
+        int n = ::recv(sock, &c, 1, 0);
+        if (n <= 0) return false;
+        if (c == '\n') return true;
+        if (c != '\r') out->push_back(c);
+    }
+}
+
+// Process one command from a client connection.
+// Returns false if the connection should be closed.
+bool dispatchCommand(const NativeApi& api, const std::string& policy,
+                     const std::string& dllPath, AgentLockState* lockState,
+                     const std::string& line) {
+    refreshLockIfExpired(lockState);
+    std::string cmd = getJsonStringField(line, "cmd");
+    AGENT_LOG("cmd=%s", cmd.c_str());
+
+    if (cmd == "bootstrap") {
+        std::lock_guard<std::mutex> lock(g_dllMutex);
+        handleBootstrap(api, policy, dllPath, line);
+    } else if (cmd == "exit_jvm") {
+        std::lock_guard<std::mutex> lock(g_dllMutex);
+        handleExitJvm(api, line, dllPath);
+    } else if (cmd == "put_field") {
+        std::lock_guard<std::mutex> lock(g_dllMutex);
+        handlePutField(api, line, dllPath);
+    } else if (cmd == "put_field_batch") {
+        std::lock_guard<std::mutex> lock(g_dllMutex);
+        handlePutFieldBatch(api, line, dllPath);
+    } else if (cmd == "put_ref_field") {
+        std::lock_guard<std::mutex> lock(g_dllMutex);
+        handlePutRefField(api, line, dllPath);
+    } else if (cmd == "put_ref_field_batch") {
+        std::lock_guard<std::mutex> lock(g_dllMutex);
+        handlePutRefFieldBatch(api, line, dllPath);
+    } else if (cmd == "forge_load") {
+        std::lock_guard<std::mutex> lock(g_dllMutex);
+        handleForgeLoad(api, line, dllPath);
+    } else if (cmd == "forge_unload") {
+        std::lock_guard<std::mutex> lock(g_dllMutex);
+        handleForgeUnload(api, line, dllPath);
+    } else if (cmd == "purge_agent") {
+        std::lock_guard<std::mutex> lock(g_dllMutex);
+        handlePurgeAgent(api, line, dllPath);
+    } else if (cmd == "put_field_path") {
+        std::lock_guard<std::mutex> lock(g_dllMutex);
+        handlePutFieldPath(api, line, dllPath);
+    } else if (cmd == "put_object_field_path") {
+        std::lock_guard<std::mutex> lock(g_dllMutex);
+        handlePutObjectFieldPath(api, line, dllPath);
+    } else if (cmd == "dump_card_structs") {
+        std::lock_guard<std::mutex> lock(g_dllMutex);
+        if (api.dumpCardStructs != NULL) {
+            api.dumpCardStructs();
+            printResult("ok", "FULL", dllPath, api.lastError ? api.lastError() : "no_data");
+        } else {
+            printResult("fallback", "UNAVAILABLE", dllPath, "dump_card_structs_not_exported");
+        }
+    } else if (cmd == "ping") {
+        printResult("ok", "RESTRICTED", dllPath, lockState->locked ? "pong_locked" : "pong_unlocked");
+    } else if (cmd == "lock_agent") {
+        handleLockAgent(lockState, line, dllPath);
+    } else if (cmd == "unlock_agent") {
+        handleUnlockAgent(lockState, dllPath);
+    } else if (cmd == "rebind_jvm") {
+        handleRebindJvm(lockState, line, dllPath);
+    } else if (cmd == "shutdown") {
+        printResult("ok", "RESTRICTED", dllPath, "bye");
+        return false; // close this connection
+    } else {
+        printResult("fallback", "UNAVAILABLE", dllPath, "unknown_command");
+    }
+    return true;
+}
+
+struct ClientThreadArgs {
+    SOCKET clientSocket;
+    const NativeApi* api;
+    std::string policy;
+    std::string dllPath;
+};
+
+DWORD WINAPI clientThread(LPVOID param) {
+    ClientThreadArgs* args = reinterpret_cast<ClientThreadArgs*>(param);
+    SOCKET sock = args->clientSocket;
+    const NativeApi& api = *args->api;
+    std::string policy = args->policy;
+    std::string dllPath = args->dllPath;
+    delete args;
+
+    tl_clientSocket = sock;
+    AGENT_LOG("client connected: socket=%llu", (unsigned long long)sock);
+
+    AgentLockState lockState;
+    std::string line;
+    while (recvLine(sock, &line)) {
+        if (line.empty()) continue;
+        if (!dispatchCommand(api, policy, dllPath, &lockState, line)) {
+            break;
+        }
+    }
+
+    AGENT_LOG("client disconnected: socket=%llu", (unsigned long long)sock);
+    closesocket(sock);
+    tl_clientSocket = INVALID_SOCKET;
+    return 0;
+}
+
+// Write the port file so Java clients can discover the Agent.
+// File: {logDir}/../runtime/agent_{jvmPid}.port  (or ForgeVM/runtime/agent_{pid}.port)
+static void writePortFile(int port, const std::string& logDir, unsigned long long jvmPid) {
+    // Derive runtime dir from logDir (logDir = .../ForgeVM/logs -> runtime = .../ForgeVM/runtime)
+    std::string runtimeDir;
+    if (!logDir.empty()) {
+        std::string base = logDir;
+        // Remove trailing slash
+        while (!base.empty() && (base.back() == '\\' || base.back() == '/')) base.pop_back();
+        // Go up one level (from "logs" to "ForgeVM")
+        size_t sep = base.find_last_of("\\/");
+        if (sep != std::string::npos) {
+            runtimeDir = base.substr(0, sep) + "\\runtime";
+        } else {
+            runtimeDir = "ForgeVM\\runtime";
+        }
+    } else {
+        runtimeDir = "ForgeVM\\runtime";
+    }
+
+    CreateDirectoryA(runtimeDir.c_str(), NULL);
+    std::string portFile = runtimeDir + "\\agent_" + std::to_string(jvmPid) + ".port";
+
+    FILE* f = fopen(portFile.c_str(), "w");
+    if (f) {
+        fprintf(f, "%d", port);
+        fclose(f);
+        AGENT_LOG("port file written: %s (port=%d)", portFile.c_str(), port);
+    } else {
+        AGENT_LOG("WARN: failed to write port file: %s", portFile.c_str());
+    }
+}
+
+static void deletePortFile(const std::string& logDir, unsigned long long jvmPid) {
+    std::string runtimeDir;
+    if (!logDir.empty()) {
+        std::string base = logDir;
+        while (!base.empty() && (base.back() == '\\' || base.back() == '/')) base.pop_back();
+        size_t sep = base.find_last_of("\\/");
+        if (sep != std::string::npos) {
+            runtimeDir = base.substr(0, sep) + "\\runtime";
+        } else {
+            runtimeDir = "ForgeVM\\runtime";
+        }
+    } else {
+        runtimeDir = "ForgeVM\\runtime";
+    }
+    std::string portFile = runtimeDir + "\\agent_" + std::to_string(jvmPid) + ".port";
+    DeleteFileA(portFile.c_str());
+    AGENT_LOG("port file deleted: %s", portFile.c_str());
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -826,64 +1061,86 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // ---- TCP serve mode ----
+
+    // Initialize Winsock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        AGENT_LOG("WSAStartup failed");
+        printResult("fallback", "UNAVAILABLE", dllPath, "winsock_init_failed");
+        return 4;
+    }
+
+    // Create listening socket on localhost, random port
+    SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock == INVALID_SOCKET) {
+        AGENT_LOG("socket() failed: %d", WSAGetLastError());
+        printResult("fallback", "UNAVAILABLE", dllPath, "socket_create_failed");
+        WSACleanup();
+        return 4;
+    }
+
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1 only
+    addr.sin_port = 0; // random port
+
+    if (bind(listenSock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+        AGENT_LOG("bind() failed: %d", WSAGetLastError());
+        closesocket(listenSock);
+        WSACleanup();
+        return 4;
+    }
+
+    // Get assigned port
+    struct sockaddr_in boundAddr = {};
+    int boundLen = sizeof(boundAddr);
+    getsockname(listenSock, reinterpret_cast<struct sockaddr*>(&boundAddr), &boundLen);
+    int listenPort = ntohs(boundAddr.sin_port);
+
+    if (listen(listenSock, 8) == SOCKET_ERROR) {
+        AGENT_LOG("listen() failed: %d", WSAGetLastError());
+        closesocket(listenSock);
+        WSACleanup();
+        return 4;
+    }
+
+    AGENT_LOG("TCP listening on 127.0.0.1:%d", listenPort);
+
+    // Report port to stdout so the launching Java process can read it.
+    // Format: {"port":12345}
+    std::cout << "{\"port\":" << listenPort << "}" << std::endl;
+
     // Start parent process watchdog thread
     CreateThread(NULL, 0, parentWatchdogThread, NULL, 0, NULL);
-    AGENT_LOG("serve mode: entering command loop");
 
-    AgentLockState lockState;
-    std::string line;
-    while (std::getline(std::cin, line)) {
-        refreshLockIfExpired(&lockState);
-        std::string cmd = getJsonStringField(line, "cmd");
-        AGENT_LOG("cmd=%s", cmd.c_str());
-
-        if (cmd == "bootstrap") {
-            handleBootstrap(api, policy, dllPath, line);
-        } else if (cmd == "exit_jvm") {
-            handleExitJvm(api, line, dllPath);
-        } else if (cmd == "put_field") {
-            handlePutField(api, line, dllPath);
-        } else if (cmd == "put_field_batch") {
-            handlePutFieldBatch(api, line, dllPath);
-        } else if (cmd == "put_ref_field") {
-            handlePutRefField(api, line, dllPath);
-        } else if (cmd == "put_ref_field_batch") {
-            handlePutRefFieldBatch(api, line, dllPath);
-        } else if (cmd == "forge_load") {
-            handleForgeLoad(api, line, dllPath);
-        } else if (cmd == "forge_unload") {
-            handleForgeUnload(api, line, dllPath);
-        } else if (cmd == "purge_agent") {
-            handlePurgeAgent(api, line, dllPath);
-        } else if (cmd == "put_field_path") {
-            handlePutFieldPath(api, line, dllPath);
-        } else if (cmd == "dump_card_structs") {
-            if (api.dumpCardStructs != NULL) {
-                api.dumpCardStructs();
-                printResult("ok", "FULL", dllPath, api.lastError ? api.lastError() : "no_data");
-            } else {
-                printResult("fallback", "UNAVAILABLE", dllPath, "dump_card_structs_not_exported");
-            }
-        } else if (cmd == "ping") {
-            printResult("ok", "RESTRICTED", dllPath, lockState.locked ? "pong_locked" : "pong_unlocked");
-        } else if (cmd == "lock_agent") {
-            handleLockAgent(&lockState, line, dllPath);
-        } else if (cmd == "unlock_agent") {
-            handleUnlockAgent(&lockState, dllPath);
-        } else if (cmd == "rebind_jvm") {
-            handleRebindJvm(&lockState, line, dllPath);
-        } else if (cmd == "shutdown") {
-            printResult("ok", "RESTRICTED", dllPath, "bye");
+    // Accept loop — each client gets its own thread
+    AGENT_LOG("serve mode: entering accept loop");
+    while (true) {
+        SOCKET clientSock = accept(listenSock, NULL, NULL);
+        if (clientSock == INVALID_SOCKET) {
+            AGENT_LOG("accept() failed: %d", WSAGetLastError());
             break;
+        }
+
+        ClientThreadArgs* args = new ClientThreadArgs();
+        args->clientSocket = clientSock;
+        args->api = &api;
+        args->policy = policy;
+        args->dllPath = dllPath;
+
+        HANDLE hThread = CreateThread(NULL, 0, clientThread, args, 0, NULL);
+        if (hThread != NULL) {
+            CloseHandle(hThread); // detach
         } else {
-            printResult("fallback", "UNAVAILABLE", dllPath, "unknown_command");
+            AGENT_LOG("CreateThread failed for client");
+            closesocket(clientSock);
+            delete args;
         }
     }
 
-    while (lockState.locked && !lockExpired(lockState)) {
-        Sleep(100);
-    }
-
+    closesocket(listenSock);
+    WSACleanup();
     if (api.module != NULL) FreeLibrary(api.module);
     return 0;
 }

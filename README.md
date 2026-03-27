@@ -69,6 +69,7 @@ ForgeVM.forge().load(new MyIngot());
 // JVM Control
 ForgeVM.exit();                                         // TerminateProcess, no Java API
 ForgeVM.banJavaAgent();                                 // block agent attachment
+ForgeVM.banNativeLoad();                                // block native library loading
 ForgeVM.purgeAgent("com.example.agent.EvilAgent");      // disable a loaded agent
 ```
 
@@ -110,7 +111,7 @@ Native Backend (C++, Win32 API)
 | `forgevm.core` | Lifecycle, Agent launch, status detection |
 | `forgevm.memory` | Field write API — path-based navigation, zero Unsafe |
 | `forgevm.forge` | Runtime bytecode rewriting — method interception |
-| `forgevm.jvm` | JVM control — exit, Agent lock, Java Agent blocking/purging |
+| `forgevm.jvm` | JVM control — exit, Agent lock, Java Agent blocking/purging, native load blocking |
 | `forgevm.util` | Logging, JSON utilities |
 
 ## Agent Status
@@ -161,6 +162,12 @@ ForgeVM.banJavaAgent(AgentFilter.JarBlacklist("*evil*"));      // block by JAR p
 ForgeVM.banJavaAgent(AgentFilter.JarWhitelist("*trusted*"));   // only allow matching JARs
 ForgeVM.unbanJavaAgent();                                      // allow again
 
+// Block native library loading (System.load / System.loadLibrary)
+ForgeVM.banNativeLoad();                                       // block all
+ForgeVM.banNativeLoad(NativeFilter.Blacklist("*cheat*"));      // block by name/path glob
+ForgeVM.banNativeLoad(NativeFilter.Whitelist("lwjgl*"));       // only allow matching
+ForgeVM.unbanNativeLoad();                                     // allow again
+
 // Purge a loaded Java agent entirely
 ForgeVM.purgeAgent("com.example.agent.MyAgent");
 
@@ -173,6 +180,8 @@ ForgeVM.rebindAgentToCurrentJvm();
 2. Nullifies the agent's static `Instrumentation` reference
 3. Overwrites `agentmain`/`premain` bytecode with bare `return`
 4. Forces JIT deoptimization
+
+**`banNativeLoad`** hooks `Runtime.load0()` and `Runtime.loadLibrary0()` — the internal entry points for all Java-side native library loading (`System.load`, `System.loadLibrary`, `Runtime.load`, `Runtime.loadLibrary` all flow through these). ForgeVM's own DLL is not affected — it loads via the external Agent process, not through Java's `System.load`.
 
 ### Forge Module
 
@@ -304,6 +313,7 @@ ForgeVM.forge().load(new MyIngot());
 // JVM 控制
 ForgeVM.exit();                                         // TerminateProcess，不涉及 Java API
 ForgeVM.banJavaAgent();                                 // 拦截 Agent 附着
+ForgeVM.banNativeLoad();                                // 拦截原生库加载
 ForgeVM.purgeAgent("com.example.agent.EvilAgent");      // 禁用已加载的 Agent
 ```
 
@@ -345,7 +355,7 @@ ForgeVM Agent（forgevm_agent.exe，独立进程）
 | `forgevm.core` | 生命周期、Agent 启动、状态检测 |
 | `forgevm.memory` | 字段写入 API — 基于路径导航，零 Unsafe |
 | `forgevm.forge` | 运行时字节码重写 — 方法拦截 |
-| `forgevm.jvm` | JVM 控制 — 退出、Agent 锁定、Java Agent 拦截/清除 |
+| `forgevm.jvm` | JVM 控制 — 退出、Agent 锁定、Java Agent 拦截/清除、原生库加载拦截 |
 | `forgevm.util` | 日志、JSON 工具 |
 
 ## Agent 状态
@@ -396,6 +406,12 @@ ForgeVM.banJavaAgent(AgentFilter.JarBlacklist("*evil*"));      // 按 JAR 路径
 ForgeVM.banJavaAgent(AgentFilter.JarWhitelist("*trusted*"));   // 仅放行匹配的 JAR
 ForgeVM.unbanJavaAgent();                                      // 解除拦截
 
+// 拦截原生库加载（System.load / System.loadLibrary）
+ForgeVM.banNativeLoad();                                       // 全部拦截
+ForgeVM.banNativeLoad(NativeFilter.Blacklist("*cheat*"));      // 按名称/路径模式拦截
+ForgeVM.banNativeLoad(NativeFilter.Whitelist("lwjgl*"));       // 仅放行匹配的
+ForgeVM.unbanNativeLoad();                                     // 解除拦截
+
 // 清除已加载的 Java Agent
 ForgeVM.purgeAgent("com.example.agent.MyAgent");
 
@@ -408,6 +424,8 @@ ForgeVM.rebindAgentToCurrentJvm();
 2. 将 Agent 的静态 `Instrumentation` 引用置为 null
 3. 用空 `return` 覆写 `agentmain`/`premain` 方法字节码
 4. 强制 JIT 反优化
+
+**`banNativeLoad`** 通过 hook `Runtime.load0()` 和 `Runtime.loadLibrary0()` 实现 — 这是所有 Java 侧原生库加载的内部入口（`System.load`、`System.loadLibrary`、`Runtime.load`、`Runtime.loadLibrary` 全部经过这里）。ForgeVM 自身的 DLL 不受影响 — 它通过外部 Agent 进程加载，不走 Java 的 `System.load`。
 
 ### Forge 模块
 

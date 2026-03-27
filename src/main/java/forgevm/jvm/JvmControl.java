@@ -85,6 +85,18 @@ public final class JvmControl {
         return AttachGuard.deactivate();
     }
 
+    public static boolean banNativeLoad() {
+        return NativeGuard.activate(null);
+    }
+
+    public static boolean banNativeLoad(NativeFilter filter) {
+        return NativeGuard.activate(filter);
+    }
+
+    public static boolean unbanNativeLoad() {
+        return NativeGuard.deactivate();
+    }
+
     public static boolean rebindAgentToCurrentJvm() {
         AgentLockController controller = agentLockController;
         if (controller == null || !controller.isAvailable()) {

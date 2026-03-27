@@ -78,6 +78,28 @@ public final class MemoryUtil {
         sendPutFieldPath(className, fieldChain, encodeLong(Double.doubleToRawLongBits(value)));
     }
 
+    // ---- object reference ----
+
+    /**
+     * Set a reference field to the given object. Automatically handles GC card table update.
+     * <p>If {@code value} is {@code null}, this behaves identically to {@link #putNullField}.
+     *
+     * <pre>
+     * MyConfig newConfig = new MyConfig();
+     * ForgeVM.memory().putObjectField("com.example.Server", "INSTANCE.config", newConfig);
+     * </pre>
+     *
+     * <p>Internally, the object is temporarily stored in a known static field so the Agent
+     * can read its OOP address via the existing path-chain mechanism. No Unsafe required.
+     */
+    public void putObjectField(String className, String fieldChain, Object value) {
+        if (value == null) {
+            putNullField(className, fieldChain);
+            return;
+        }
+        sendPutObjectFieldPath(className, fieldChain, value);
+    }
+
     // ---- null reference ----
 
     /**
@@ -91,6 +113,23 @@ public final class MemoryUtil {
     // ============================================================
     // Internals
     // ============================================================
+
+    private static void sendPutObjectFieldPath(String className, String fieldChain, Object value) {
+        if (!ForgeVM.isAgentActive()) {
+            throw new ForgeVMException("agent not active - call ForgeVM.launch() first");
+        }
+        if (className == null || className.isBlank() || fieldChain == null || fieldChain.isBlank()) {
+            throw new ForgeVMException("invalid_field_path");
+        }
+
+        String cmd = "{\"cmd\":\"put_object_field_path\""
+                + ",\"targetClass\":\"" + ForgeVM.escapeJson(className)
+                + "\",\"targetField\":\"" + ForgeVM.escapeJson(fieldChain)
+                + "\",\"sourceClass\":\"forgevm.core.ForgeVM\""
+                + ",\"sourceField\":\"__tempRef\"}";
+
+        ForgeVM.withTempRef(value, () -> checkResponse(ForgeVM.agentSend(cmd), "put_object_field_path"));
+    }
 
     private static void sendPutFieldPath(String className, String fieldChain, byte[] valueBytes) {
         if (!ForgeVM.isAgentActive()) {

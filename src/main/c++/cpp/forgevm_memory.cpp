@@ -1183,6 +1183,207 @@ extern "C" __declspec(dllexport) int forgevm_put_field_path(
 }
 
 // ============================================================
+// put_object_field_path: read OOP from source path, write to target path
+//
+// Reads the OOP at sourceClass.sourceField, then writes it to
+// targetClass.targetField. Handles compressed oops and GC card dirty.
+// ============================================================
+
+extern "C" __declspec(dllexport) int forgevm_put_object_field_path(
+        const char* targetClass, const char* targetField,
+        const char* sourceClass, const char* sourceField) {
+    if (!g_target.structMapReady || g_target.handle == NULL) {
+        setError("agent_not_bootstrapped");
+        return 0;
+    }
+    if (targetClass == NULL || targetField == NULL || sourceClass == NULL || sourceField == NULL) {
+        setError("invalid_params");
+        return 0;
+    }
+
+    HANDLE proc = g_target.handle;
+
+    FVM_LOG("put_object_field_path: %s.%s <- %s.%s",
+            targetClass, targetField, sourceClass, sourceField);
+
+    // ---- Step 1: Read the source OOP ----
+
+    std::string srcInternal = toInternalClassName(sourceClass);
+    std::vector<std::string> srcFields = splitDots(sourceField);
+    if (srcFields.empty()) {
+        setError("empty_source_field");
+        return 0;
+    }
+
+    uint64_t srcKlass = 0;
+    if (!findInstanceKlassByName(srcInternal, &srcKlass)) {
+        setError("source_class_not_found");
+        return 0;
+    }
+
+    uint64_t srcObj = 0;
+    for (size_t i = 0; i < srcFields.size(); i++) {
+        const std::string& fname = srcFields[i];
+        ResolvedField rf = {};
+        if (!resolveFieldInKlass(srcKlass, fname, "", &rf)) {
+            setError("source_field_not_found:" + fname);
+            return 0;
+        }
+
+        uint64_t fieldAddr = 0;
+        if (rf.isStatic) {
+            fieldAddr = rf.staticAddress;
+        } else {
+            if (srcObj == 0) {
+                setError("source_instance_field_without_object:" + fname);
+                return 0;
+            }
+            fieldAddr = srcObj + rf.offset;
+        }
+
+        if (fieldAddr == 0) {
+            setError("source_field_addr_zero:" + fname);
+            return 0;
+        }
+
+        // Read the OOP at this field
+        uint64_t nextObj = readOop(proc, fieldAddr, g_target.useCompressedOops);
+        if (nextObj == 0) {
+            setError("source_null_ref:" + fname);
+            return 0;
+        }
+
+        if (i < srcFields.size() - 1) {
+            // Intermediate field: follow the chain
+            uint64_t nextKlass = readKlass(proc, nextObj, g_target.useCompressedClassPointers);
+            if (nextKlass == 0) {
+                setError("source_klass_read_failed:" + fname);
+                return 0;
+            }
+            srcObj = nextObj;
+            srcKlass = nextKlass;
+        } else {
+            // Last field: this OOP is the value we want to write
+            srcObj = nextObj;
+        }
+    }
+
+    uint64_t sourceOop = srcObj;
+    FVM_LOG("put_object_field_path: source OOP = 0x%llX", sourceOop);
+
+    // ---- Step 2: Resolve target field address ----
+
+    std::string tgtInternal = toInternalClassName(targetClass);
+    std::vector<std::string> tgtFields = splitDots(targetField);
+    if (tgtFields.empty()) {
+        setError("empty_target_field");
+        return 0;
+    }
+
+    uint64_t tgtKlass = 0;
+    if (!findInstanceKlassByName(tgtInternal, &tgtKlass)) {
+        setError("target_class_not_found");
+        return 0;
+    }
+
+    uint64_t tgtObj = 0;
+    for (size_t i = 0; i < tgtFields.size(); i++) {
+        bool isLast = (i == tgtFields.size() - 1);
+        const std::string& fname = tgtFields[i];
+
+        ResolvedField rf = {};
+        if (!resolveFieldInKlass(tgtKlass, fname, "", &rf)) {
+            setError("target_field_not_found:" + fname);
+            return 0;
+        }
+
+        if (isLast) {
+            // Write the source OOP to this field
+            uint64_t writeAddr = 0;
+            if (rf.isStatic) {
+                writeAddr = rf.staticAddress;
+            } else {
+                if (tgtObj == 0) {
+                    setError("target_instance_field_without_object:" + fname);
+                    return 0;
+                }
+                writeAddr = tgtObj + rf.offset;
+            }
+
+            if (writeAddr == 0) {
+                setError("target_write_addr_zero:" + fname);
+                return 0;
+            }
+
+            // Encode the OOP value (compressed or raw)
+            bool success = false;
+            if (g_target.useCompressedOops) {
+                uint32_t narrowOop = 0;
+                if (sourceOop != 0) {
+                    narrowOop = static_cast<uint32_t>(
+                        (sourceOop - g_target.narrowOopBase) >> g_target.narrowOopShift);
+                }
+                success = writeRemoteMem(proc, writeAddr, &narrowOop, sizeof(narrowOop));
+                FVM_LOG("put_object_field_path: wrote compressed oop 0x%08X to 0x%llX",
+                        narrowOop, writeAddr);
+            } else {
+                success = writeRemoteMem(proc, writeAddr, &sourceOop, sizeof(sourceOop));
+                FVM_LOG("put_object_field_path: wrote raw oop 0x%llX to 0x%llX",
+                        sourceOop, writeAddr);
+            }
+
+            if (!success) {
+                setError("write_failed:" + fname);
+                return 0;
+            }
+
+            // Dirty GC card table
+            resolveCardTableBase();
+            dirtyCard(writeAddr);
+
+            FVM_LOG("put_object_field_path: success");
+            setError("ok");
+            return 1;
+        }
+
+        // Not last field: navigate
+        uint64_t fieldAddr = 0;
+        if (rf.isStatic) {
+            fieldAddr = rf.staticAddress;
+        } else {
+            if (tgtObj == 0) {
+                setError("target_instance_field_without_object:" + fname);
+                return 0;
+            }
+            fieldAddr = tgtObj + rf.offset;
+        }
+
+        if (fieldAddr == 0) {
+            setError("target_field_addr_zero:" + fname);
+            return 0;
+        }
+
+        uint64_t nextObj = readOop(proc, fieldAddr, g_target.useCompressedOops);
+        if (nextObj == 0) {
+            setError("target_null_ref_in_chain:" + fname);
+            return 0;
+        }
+
+        uint64_t nextKlass = readKlass(proc, nextObj, g_target.useCompressedClassPointers);
+        if (nextKlass == 0) {
+            setError("target_klass_read_failed:" + fname);
+            return 0;
+        }
+
+        tgtObj = nextObj;
+        tgtKlass = nextKlass;
+    }
+
+    setError("unexpected_end_of_chain");
+    return 0;
+}
+
+// ============================================================
 // Diagnostic: dump barrier/card related structMap entries
 // ============================================================
 
