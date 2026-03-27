@@ -89,10 +89,13 @@ Java Application
     ▼
 ForgeVM Java Library (in-process)
     │  Extracts & starts the native Agent executable
-    │  Communicates via stdin/stdout JSON protocol
+    │  Communicates via TCP localhost (127.0.0.1) JSON protocol
     │  Sends only string descriptors — zero JVM native API
+    │  Cross-ClassLoader: multiple ClassLoaders share one Agent
     ▼
 ForgeVM Agent (forgevm_agent.exe, separate process)
+    │  Listens on 127.0.0.1 (random port)
+    │  Accepts multiple client connections (one per ClassLoader)
     │  Loads forgevm_native.dll
     │  Opens target JVM process handle
     │  Reads HotSpot VMStructs to build internal layout map
@@ -139,9 +142,13 @@ ForgeVM.memory().putFloatField("com.example.Server", "INSTANCE.config.timeout", 
 
 // Set a reference field to null
 ForgeVM.memory().putNullField("com.example.Server", "INSTANCE.cache");
+
+// Set a reference field to a new object (zero Unsafe)
+MyConfig newConfig = new MyConfig();
+ForgeVM.memory().putObjectField("com.example.Server", "INSTANCE.config", newConfig);
 ```
 
-Supported types: `boolean`, `byte`, `char`, `short`, `int`, `float`, `long`, `double`, null reference.
+Supported types: `boolean`, `byte`, `char`, `short`, `int`, `float`, `long`, `double`, object reference, null reference.
 
 ### JVM Control Module
 
@@ -235,6 +242,8 @@ public boolean includeSubclasses() { return true; }
 - `callback.setReturnValue(value)` — skip original method, return given value
 - `callback.cancel()` — skip original method (void)
 - `callback.getInstance()` — get `this` reference
+- `callback.getArgument(index)` — get method argument by index
+- `callback.argumentCount()` — get number of arguments
 
 ## Logging
 
@@ -333,7 +342,7 @@ Java 应用程序
     ▼
 ForgeVM Java 库（进程内）
     │  解压并启动原生 Agent 可执行文件
-    │  通过 stdin/stdout JSON 协议通信
+    │  通过 TCP localhost JSON 协议通信（支持跨 ClassLoader）
     │  仅发送字符串描述符 — 零 JVM 原生 API
     ▼
 ForgeVM Agent（forgevm_agent.exe，独立进程）
@@ -383,9 +392,13 @@ ForgeVM.memory().putFloatField("com.example.Server", "INSTANCE.config.timeout", 
 
 // 将引用字段设为 null
 ForgeVM.memory().putNullField("com.example.Server", "INSTANCE.cache");
+
+// 将引用字段设为新对象（零 Unsafe）
+MyConfig newConfig = new MyConfig();
+ForgeVM.memory().putObjectField("com.example.Server", "INSTANCE.config", newConfig);
 ```
 
-支持类型：`boolean`、`byte`、`char`、`short`、`int`、`float`、`long`、`double`、null 引用。
+支持类型：`boolean`、`byte`、`char`、`short`、`int`、`float`、`long`、`double`、对象引用、null 引用。
 
 ### JVM 控制模块
 
@@ -479,6 +492,8 @@ public boolean includeSubclasses() { return true; }
 - `callback.setReturnValue(value)` — 跳过原始方法，返回指定值
 - `callback.cancel()` — 跳过原始方法（void）
 - `callback.getInstance()` — 获取 `this` 引用
+- `callback.getArgument(index)` — 按索引获取方法参数
+- `callback.argumentCount()` — 获取参数数量
 
 ## 日志
 
