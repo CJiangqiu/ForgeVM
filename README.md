@@ -31,7 +31,7 @@ repositories {
 
 // build.gradle
 dependencies {
-    implementation 'com.github.CJiangqiu:ForgeVM:v0.5.0'
+    implementation 'com.github.CJiangqiu:ForgeVM:v0.6.1'
 }
 ```
 
@@ -93,8 +93,7 @@ ForgeVM Java Library (in-process)
     │  Sends only string descriptors — zero JVM native API
     ▼
 ForgeVM Agent (forgevm_agent.exe, separate process)
-    │  Listens on 127.0.0.1 (random port)
-    │  Accepts multiple client connections (one per ClassLoader)
+    │  Communicates via stdin/stdout JSON protocol
     │  Loads forgevm_native.dll
     │  Opens target JVM process handle
     │  Reads HotSpot VMStructs to build internal layout map
@@ -283,7 +282,7 @@ repositories {
 
 // build.gradle
 dependencies {
-    implementation 'com.github.CJiangqiu:ForgeVM:v0.5.0'
+    implementation 'com.github.CJiangqiu:ForgeVM:v0.6.1'
 }
 ```
 
@@ -345,6 +344,7 @@ ForgeVM Java 库（进程内）
     │  仅发送字符串描述符 — 零 JVM 原生 API
     ▼
 ForgeVM Agent（forgevm_agent.exe，独立进程）
+    │  通过 stdin/stdout JSON 协议接收命令
     │  加载 forgevm_native.dll
     │  打开目标 JVM 进程句柄
     │  读取 HotSpot VMStructs 构建内部布局映射
