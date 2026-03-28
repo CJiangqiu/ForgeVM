@@ -89,9 +89,8 @@ Java Application
     ▼
 ForgeVM Java Library (in-process)
     │  Extracts & starts the native Agent executable
-    │  Communicates via TCP localhost (127.0.0.1) JSON protocol
+    │  Communicates via stdin/stdout JSON protocol
     │  Sends only string descriptors — zero JVM native API
-    │  Cross-ClassLoader: multiple ClassLoaders share one Agent
     ▼
 ForgeVM Agent (forgevm_agent.exe, separate process)
     │  Listens on 127.0.0.1 (random port)
@@ -342,7 +341,7 @@ Java 应用程序
     ▼
 ForgeVM Java 库（进程内）
     │  解压并启动原生 Agent 可执行文件
-    │  通过 TCP localhost JSON 协议通信（支持跨 ClassLoader）
+    │  通过 stdin/stdout JSON 协议通信
     │  仅发送字符串描述符 — 零 JVM 原生 API
     ▼
 ForgeVM Agent（forgevm_agent.exe，独立进程）

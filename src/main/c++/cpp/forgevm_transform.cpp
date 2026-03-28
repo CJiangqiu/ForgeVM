@@ -9,6 +9,11 @@
 
 std::unordered_map<std::string, TransformBackup> g_transformBackups;
 
+// Cached adapter offsets (probed empirically in forgeDeoptimizeAll)
+// -1 = not yet probed, >=0 = valid offset
+static int64_t g_adapterOff = -1;
+static int64_t g_c2iEntryOff = -1;
+
 static std::string makeTransformKey(const char* className, const char* methodName, const char* paramDesc) {
     return std::string(className) + "#" + methodName + "#" + paramDesc;
 }
@@ -445,6 +450,9 @@ static void forceDeoptimizeAll() {
                                             && candidate == c2iTarget && candidate != 0) {
                                             adapterOff = off;
                                             c2iEntryOff = inner;
+                                            // Cache globally so applyTransform/restoreTransform can use them
+                                            g_adapterOff = off;
+                                            g_c2iEntryOff = inner;
                                             FVM_LOG("deopt: FOUND _adapter offset=%d, c2i_entry offset=%d "
                                                     "(probed from Method=0x%llX, c2i=0x%llX, adapter=0x%llX)",
                                                     off, inner, (unsigned long long)mps[mi],
@@ -1424,6 +1432,20 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         }
     }
 
+    // Guard: if resolved_klasses or CP cache expansion failed, the class is likely loaded
+    // but not yet linked. Injecting bytecode with index 0 would cause VerifyError
+    // when the JVM later verifies/interprets the method. Abort this transform.
+    if (newRKAddr == 0) {
+        FVM_LOG("TRANSFORM ABORTED: resolved_klasses expansion failed (class may not be linked yet)");
+        setError("resolved_klasses_not_available");
+        return 0;
+    }
+    if (newCacheAddr == 0) {
+        FVM_LOG("TRANSFORM ABORTED: ConstantPoolCache expansion failed (class may not be linked yet)");
+        setError("cache_not_available");
+        return 0;
+    }
+
     // 12. Build new bytecode
     //
     // IMPORTANT: invoke operands = CP CACHE indices (not CP indices)
@@ -1980,20 +2002,137 @@ int applyTransform(const char* className, const char* methodName, const char* pa
             (unsigned long long)origConstMethodAddr, (unsigned long long)newConstMethodAlloc);
     writeRemoteMem(proc, methodAddr + (uint64_t)constMethodOff, &newConstMethodAlloc, 8);
 
-    // Clear Method::_code to force deoptimization (interpreter will use new bytecode)
+    // Read _code and _from_compiled_entry BEFORE clearing, so we can determine
+    // the correct c2i entry. For uncompiled methods (_code==NULL), _from_compiled_entry
+    // is already the c2i adapter entry — we just need to preserve it after clearing _code.
     int64_t codeOff = structOffset("Method", "_code");
+    int64_t fromCompiledOff = structOffset("Method", "_from_compiled_entry");
+    uint64_t origCode = 0;
+    uint64_t origFromCompiled = 0;
+    if (codeOff >= 0) readRemotePointer(proc, methodAddr + (uint64_t)codeOff, &origCode);
+    if (fromCompiledOff >= 0) readRemotePointer(proc, methodAddr + (uint64_t)fromCompiledOff, &origFromCompiled);
+    FVM_LOG("pre-clear: _code=0x%llX, _from_compiled_entry=0x%llX",
+            (unsigned long long)origCode, (unsigned long long)origFromCompiled);
+
+    // Clear Method::_code to force deoptimization (interpreter will use new bytecode)
     if (codeOff >= 0) {
         uint64_t nullCode = 0;
         writeRemoteMem(proc, methodAddr + (uint64_t)codeOff, &nullCode, 8);
         FVM_LOG("cleared Method::_code (offset %lld)", (long long)codeOff);
     }
 
-    // Clear Method::_from_compiled_entry to prevent JIT-compiled code from running
-    int64_t fromCompiledOff = structOffset("Method", "_from_compiled_entry");
+    // Redirect Method::_from_compiled_entry to c2i adapter (compiled-to-interpreter bridge).
+    // CRITICAL: Must NOT write 0 or _i2i_entry here. C2-compiled callers use register-based
+    // calling convention; _i2i_entry expects interpreter stack layout → stack corruption.
+    // Only c2i_entry correctly bridges compiled→interpreted calling conventions.
     if (fromCompiledOff >= 0) {
-        uint64_t zero = 0;
-        writeRemoteMem(proc, methodAddr + (uint64_t)fromCompiledOff, &zero, 8);
-        FVM_LOG("cleared Method::_from_compiled_entry (offset %lld)", (long long)fromCompiledOff);
+        uint64_t c2iEntry = 0;
+        bool redirected = false;
+
+        // Strategy 1: If method was uncompiled, _from_compiled_entry was already c2i. Reuse it.
+        if (origCode == 0 && origFromCompiled != 0) {
+            c2iEntry = origFromCompiled;
+            FVM_LOG("method was uncompiled, reusing existing _from_compiled_entry as c2i (0x%llX)",
+                    (unsigned long long)c2iEntry);
+            // No need to write — it's already correct
+            redirected = true;
+        }
+
+        // Strategy 2: Use adapter via VMStructs or cached globals from deopt sweep
+        if (!redirected) {
+            int64_t adapterOff = structOffset("Method", "_adapter");
+            if (adapterOff < 0 && g_adapterOff >= 0) adapterOff = g_adapterOff;
+            int64_t c2iOff = structOffset("AdapterHandlerEntry", "_c2i_entry");
+            if (c2iOff < 0 && g_c2iEntryOff >= 0) c2iOff = g_c2iEntryOff;
+            if (c2iOff < 0) c2iOff = 32; // common default for JDK 17
+
+            if (adapterOff >= 0) {
+                uint64_t adapterAddr = 0;
+                if (readRemotePointer(proc, methodAddr + (uint64_t)adapterOff, &adapterAddr) && adapterAddr != 0) {
+                    if (readRemotePointer(proc, adapterAddr + (uint64_t)c2iOff, &c2iEntry) && c2iEntry != 0) {
+                        writeRemoteMem(proc, methodAddr + (uint64_t)fromCompiledOff, &c2iEntry, 8);
+                        FVM_LOG("redirected _from_compiled_entry to c2i_entry (0x%llX) via adapter",
+                                (unsigned long long)c2iEntry);
+                        redirected = true;
+                    }
+                }
+            }
+        }
+
+        // Strategy 3: Inline empirical probe — scan this method's fields to find adapter
+        if (!redirected && origFromCompiled != 0) {
+            FVM_LOG("c2i adapter offset unknown, probing from this method...");
+            // For a compiled method, _from_compiled_entry = compiled code entry (not c2i).
+            // We need to find a sibling method that's uncompiled to get c2i.
+            // Read the method array from the klass to find an uncompiled sibling.
+            uint64_t constPoolAddr = 0;
+            int64_t constPoolOff = structOffset("ConstMethod", "_constants");
+            if (constPoolOff < 0) constPoolOff = 8;
+            // Read from the ORIGINAL constmethod (before swap)
+            readRemotePointer(proc, origConstMethodAddr + (uint64_t)constPoolOff, &constPoolAddr);
+            if (constPoolAddr != 0) {
+                int64_t poolHolderOff = structOffset("ConstantPool", "_pool_holder");
+                uint64_t klassAddr = 0;
+                if (poolHolderOff >= 0) readRemotePointer(proc, constPoolAddr + (uint64_t)poolHolderOff, &klassAddr);
+                if (klassAddr != 0) {
+                    int64_t methodsOff = structOffset("InstanceKlass", "_methods");
+                    if (methodsOff >= 0) {
+                        uint64_t mArr = 0;
+                        readRemotePointer(proc, klassAddr + (uint64_t)methodsOff, &mArr);
+                        if (mArr != 0) {
+                            int64_t arrLenOff = structOffset("Array<int>", "_length");
+                            if (arrLenOff < 0) arrLenOff = 0;
+                            int64_t arrDataOff = structOffset("Array<int>", "_data");
+                            if (arrDataOff < 0) arrDataOff = arrLenOff + 4;
+                            if (arrDataOff < 8) arrDataOff = 8;
+                            int32_t mc = 0;
+                            readRemoteI32(proc, mArr + (uint64_t)arrLenOff, &mc);
+                            if (mc > 0 && mc < 10000) {
+                                std::vector<uint64_t> mps(mc);
+                                if (readRemoteMem(proc, mArr + (uint64_t)arrDataOff, mps.data(), mc * 8)) {
+                                    for (int mi = 0; mi < mc && !redirected; mi++) {
+                                        if (mps[mi] == 0 || mps[mi] == methodAddr) continue;
+                                        uint64_t sibCode = 0;
+                                        readRemotePointer(proc, mps[mi] + (uint64_t)codeOff, &sibCode);
+                                        if (sibCode != 0) continue; // skip compiled
+                                        uint64_t sibC2i = 0;
+                                        readRemotePointer(proc, mps[mi] + (uint64_t)fromCompiledOff, &sibC2i);
+                                        if (sibC2i != 0) {
+                                            writeRemoteMem(proc, methodAddr + (uint64_t)fromCompiledOff, &sibC2i, 8);
+                                            FVM_LOG("redirected _from_compiled_entry to c2i (0x%llX) from sibling method[%d]",
+                                                    (unsigned long long)sibC2i, mi);
+                                            redirected = true;
+                                            // Also probe adapter offset for global cache
+                                            for (int off = 0; off <= 88; off += 8) {
+                                                if (off == (int)fromCompiledOff || off == (int)codeOff) continue;
+                                                uint64_t fv = 0;
+                                                readRemotePointer(proc, mps[mi] + off, &fv);
+                                                if (fv == 0 || fv < 0x10000) continue;
+                                                for (int inner = 0; inner <= 32; inner += 8) {
+                                                    uint64_t cand = 0;
+                                                    if (readRemotePointer(proc, fv + inner, &cand) && cand == sibC2i) {
+                                                        g_adapterOff = off;
+                                                        g_c2iEntryOff = inner;
+                                                        FVM_LOG("  probed adapter offset=%d, c2i_entry offset=%d", off, inner);
+                                                        break;
+                                                    }
+                                                }
+                                                if (g_adapterOff >= 0) break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!redirected) {
+            FVM_LOG("WARN: could not find c2i entry, _from_compiled_entry left as 0x%llX",
+                    (unsigned long long)origFromCompiled);
+        }
     }
 
     // Reset Method::_from_interpreted_entry so the interpreter picks up the new bytecode.
@@ -2128,10 +2267,30 @@ int restoreTransform(const char* className, const char* methodName, const char* 
         writeRemoteMem(proc, backup.methodAddr + (uint64_t)codeOff, &nullCode, 8);
     }
 
+    // Redirect _from_compiled_entry to c2i adapter (same fix as applyTransform)
     int64_t fromCompiledOff = structOffset("Method", "_from_compiled_entry");
     if (fromCompiledOff >= 0) {
-        uint64_t zero = 0;
-        writeRemoteMem(proc, backup.methodAddr + (uint64_t)fromCompiledOff, &zero, 8);
+        int64_t adapterOff = structOffset("Method", "_adapter");
+        if (adapterOff < 0 && g_adapterOff >= 0) adapterOff = g_adapterOff;
+        int64_t c2iOff = structOffset("AdapterHandlerEntry", "_c2i_entry");
+        if (c2iOff < 0 && g_c2iEntryOff >= 0) c2iOff = g_c2iEntryOff;
+        if (c2iOff < 0) c2iOff = 32;
+
+        bool redirected = false;
+        if (adapterOff >= 0) {
+            uint64_t adapterAddr = 0;
+            if (readRemotePointer(proc, backup.methodAddr + (uint64_t)adapterOff, &adapterAddr) && adapterAddr != 0) {
+                uint64_t c2iEntry = 0;
+                if (readRemotePointer(proc, adapterAddr + (uint64_t)c2iOff, &c2iEntry) && c2iEntry != 0) {
+                    writeRemoteMem(proc, backup.methodAddr + (uint64_t)fromCompiledOff, &c2iEntry, 8);
+                    FVM_LOG("redirected _from_compiled_entry to c2i_entry (0x%llX)", (unsigned long long)c2iEntry);
+                    redirected = true;
+                }
+            }
+        }
+        if (!redirected) {
+            FVM_LOG("WARN: could not redirect _from_compiled_entry in restore");
+        }
     }
 
     // Reset _from_interpreted_entry (same logic as in applyTransform)

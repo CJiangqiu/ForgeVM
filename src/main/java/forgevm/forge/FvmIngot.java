@@ -219,7 +219,8 @@ public abstract class FvmIngot {
 
     /**
      * Parses "a_56(F),applyDamage(F)" into [["a_56","(F)"], ["applyDamage","(F)"]]
-     * Parses "processOrder" into [["processOrder","()"]]
+     * Parses "processOrder" into [["processOrder",""]]  (empty = match by name only)
+     * Parses "m_6469_,hurt(DamageSource;F)" into [["m_6469_",""], ["hurt","(DamageSource;F)"]]
      */
     private static String[][] parseMethodDescriptor(String descriptor) {
         String[] parts = descriptor.split(",");
@@ -236,7 +237,7 @@ public abstract class FvmIngot {
                 result[i][1] = paramPart;
             } else {
                 result[i][0] = part;
-                result[i][1] = "()";
+                result[i][1] = "";
             }
         }
         return result;

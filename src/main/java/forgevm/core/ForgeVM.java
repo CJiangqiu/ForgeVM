@@ -16,7 +16,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
-import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -39,8 +38,6 @@ public final class ForgeVM {
     private static final String RESOURCE_AGENT_PATH = "/native/win-x64/forgevm_agent.exe";
     private static final String RESOURCE_DLL_PATH = "/native/win-x64/forgevm_native.dll";
     private static final long AGENT_IO_TIMEOUT_SECONDS = 120L;
-    private static final String PORT_FILE_PREFIX = "agent_";
-    private static final String PORT_FILE_SUFFIX = ".port";
 
     private static volatile LaunchResult state;
     private static volatile AgentSession agentSession;
@@ -88,9 +85,8 @@ public final class ForgeVM {
     public static synchronized LaunchResult launch(LaunchPermissionPolicy policy) {
         LaunchPermissionPolicy effectivePolicy = policy == null ? LaunchPermissionPolicy.SILENT : policy;
 
-        // Check if we already have a working session (same ClassLoader)
         AgentSession currentSession = agentSession;
-        if (currentSession != null && !isSessionAlive(currentSession)) {
+        if (currentSession != null && !currentSession.process().isAlive()) {
             clearAgentExitSender();
             clearAgentLockController();
             closeAgentSession(currentSession);
@@ -98,50 +94,22 @@ public final class ForgeVM {
         }
 
         if (state != null) {
-            if (state.nativeDllActive() && agentSession != null && isSessionAlive(agentSession)) {
+            if (state.nativeDllActive() && agentSession != null && agentSession.process().isAlive()) {
                 return state;
             }
-            if (effectivePolicy == LaunchPermissionPolicy.SILENT && agentSession != null) {
+            if (effectivePolicy == LaunchPermissionPolicy.SILENT) {
                 return state;
             }
         }
 
-        // Try to connect to an existing Agent (started by another ClassLoader)
-        int existingPort = readPortFile();
-        if (existingPort > 0) {
-            LaunchResult result = tryConnectExistingAgent(existingPort);
-            if (result != null) {
-                state = result;
-                return result;
-            }
-        }
-
-        // No existing Agent — start a new one
         LaunchResult result = launchInternal(effectivePolicy);
         state = result;
         return result;
     }
 
-    /**
-     * Check if the Agent process is reachable.
-     * <p>Does NOT depend on static fields — tries the TCP port file,
-     * so it works across ClassLoaders.
-     */
     public static boolean isAgentActive() {
-        // Fast path: check current session
         AgentSession session = agentSession;
-        if (session != null && isSessionAlive(session)) {
-            return true;
-        }
-        // Slow path: check port file for cross-ClassLoader discovery
-        int port = readPortFile();
-        if (port > 0) {
-            try (Socket probe = new Socket("127.0.0.1", port)) {
-                return true;
-            } catch (IOException ignored) {
-            }
-        }
-        return false;
+        return session != null && session.process().isAlive();
     }
 
     // -- memory API --
@@ -217,7 +185,7 @@ public final class ForgeVM {
             return false;
         }
         AgentSession session = agentSession;
-        if (session == null || !isSessionAlive(session)) {
+        if (session == null || !session.process().isAlive()) {
             return false;
         }
         try {
@@ -234,53 +202,6 @@ public final class ForgeVM {
     }
 
     // -- launch internals --
-
-    /**
-     * Try to connect to an already-running Agent via port file.
-     * Returns a successful LaunchResult, or null if connection failed.
-     */
-    private static LaunchResult tryConnectExistingAgent(int port) {
-        try {
-            Socket socket = new Socket("127.0.0.1", port);
-            AgentSession session = new AgentSession(
-                    null, // no Process — agent was started by another ClassLoader
-                    new BufferedReader(new InputStreamReader(socket.getInputStream())),
-                    new BufferedWriter(new OutputStreamWriter(socket.getOutputStream())),
-                    new ReentrantLock(),
-                    socket
-            );
-
-            String responseLine = sendCommand(session,
-                    "{\"cmd\":\"bootstrap\",\"pid\":" + ProcessHandle.current().pid() + "}");
-            if (responseLine == null || responseLine.isBlank()) {
-                closeAgentSession(session);
-                return null;
-            }
-
-            Map<String, String> fields = JsonUtils.parseFlatJsonObject(responseLine);
-            String status = fields.getOrDefault("status", "fallback");
-            String capability = fields.getOrDefault("capability", "UNAVAILABLE");
-            AgentStatus level = parseAgentStatus(capability);
-
-            if (!"ok".equalsIgnoreCase(status) || level == AgentStatus.UNAVAILABLE) {
-                closeAgentSession(session);
-                return null;
-            }
-
-            agentSession = session;
-            registerAgentExitSender(session);
-            registerAgentLockController(session);
-            AttachGuard.install();
-            NativeGuard.install();
-
-            String dllPath = fields.getOrDefault("dllPath", "");
-            FvmLog.info("connected to existing Agent on port " + port);
-            return new LaunchResult(level, true, dllPath, "connected_existing");
-        } catch (Exception e) {
-            // Agent not reachable — port file is stale or connection failed
-            return null;
-        }
-    }
 
     private static LaunchResult launchInternal(LaunchPermissionPolicy policy) {
         Path dllPath = resolveNativeDllPath();
@@ -307,46 +228,12 @@ public final class ForgeVM {
                     "--policy=" + policy.name().toLowerCase(),
                     "--dll=" + dllPath.toAbsolutePath(),
                     "--logdir=" + logDir
-            ).redirectErrorStream(false).start();
+            ).redirectErrorStream(true).start();
 
-            // Agent prints {"port":XXXXX} to stdout, then accepts TCP connections
-            BufferedReader processReader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream()));
-
-            String portLine = null;
-            try {
-                CompletableFuture<String> portFuture = CompletableFuture.supplyAsync(() -> {
-                    try { return processReader.readLine(); } catch (IOException e) { return null; }
-                });
-                portLine = portFuture.get(10, TimeUnit.SECONDS);
-            } catch (Exception ignored) {}
-
-            if (portLine == null || portLine.isBlank()) {
-                process.destroy();
-                return agentUnavailable("agent_no_port_response", dllPath.toAbsolutePath().toString());
-            }
-
-            Map<String, String> portFields = JsonUtils.parseFlatJsonObject(portLine);
-            String portStr = portFields.get("port");
-            if (portStr == null || portStr.isBlank()) {
-                process.destroy();
-                return agentUnavailable("agent_invalid_port_response", dllPath.toAbsolutePath().toString());
-            }
-
-            int port = Integer.parseInt(portStr);
-            FvmLog.info("Agent listening on port " + port);
-
-            // Write port file for cross-ClassLoader discovery
-            writePortFile(port);
-
-            // Connect via TCP
-            Socket socket = new Socket("127.0.0.1", port);
             AgentSession session = new AgentSession(
                     process,
-                    new BufferedReader(new InputStreamReader(socket.getInputStream())),
-                    new BufferedWriter(new OutputStreamWriter(socket.getOutputStream())),
-                    new ReentrantLock(),
-                    socket
+                    new BufferedReader(new InputStreamReader(process.getInputStream())),
+                    new BufferedWriter(new OutputStreamWriter(process.getOutputStream()))
             );
 
             String responseLine = sendCommand(session,
@@ -379,47 +266,7 @@ public final class ForgeVM {
         }
     }
 
-    // -- port file --
-
-    private static Path portFilePath() {
-        long pid = ProcessHandle.current().pid();
-        Path runtimeDir = Paths.get("ForgeVM", "runtime").toAbsolutePath();
-        return runtimeDir.resolve(PORT_FILE_PREFIX + pid + PORT_FILE_SUFFIX);
-    }
-
-    private static void writePortFile(int port) {
-        try {
-            Path path = portFilePath();
-            Files.createDirectories(path.getParent());
-            Files.writeString(path, String.valueOf(port));
-            FvmLog.info("port file written: " + path);
-        } catch (IOException e) {
-            FvmLog.warn("failed to write port file: " + e.getMessage());
-        }
-    }
-
-    private static int readPortFile() {
-        try {
-            Path path = portFilePath();
-            if (!Files.exists(path)) return -1;
-            String content = Files.readString(path).trim();
-            if (content.isEmpty()) return -1;
-            return Integer.parseInt(content);
-        } catch (Exception ignored) {
-            return -1;
-        }
-    }
-
     // -- agent session lifecycle --
-
-    private static boolean isSessionAlive(AgentSession session) {
-        // If we have the process handle, check it
-        if (session.process() != null) {
-            return session.process().isAlive();
-        }
-        // No process handle (connected to existing agent) — check socket
-        return session.socket() != null && !session.socket().isClosed();
-    }
 
     private static void registerAgentExitSender(AgentSession session) {
         clearAgentExitSender();
@@ -427,7 +274,7 @@ public final class ForgeVM {
         JvmControl.ExitCommandSender sender = new JvmControl.ExitCommandSender() {
             @Override
             public boolean isAvailable() {
-                return isSessionAlive(session);
+                return session.process().isAlive();
             }
 
             @Override
@@ -435,9 +282,7 @@ public final class ForgeVM {
                 long pid = ProcessHandle.current().pid();
                 String command = "{\"cmd\":\"exit_jvm\",\"pid\":" + pid + ",\"code\":" + exitCode + "}";
                 sendCommand(session, command);
-                if (session.process() != null) {
-                    session.process().waitFor(500, TimeUnit.MILLISECONDS);
-                }
+                session.process().waitFor(500, TimeUnit.MILLISECONDS);
             }
         };
 
@@ -459,7 +304,7 @@ public final class ForgeVM {
         JvmControl.AgentLockController controller = new JvmControl.AgentLockController() {
             @Override
             public boolean isAvailable() {
-                return isSessionAlive(session);
+                return session.process().isAlive();
             }
 
             @Override
@@ -498,7 +343,7 @@ public final class ForgeVM {
 
     public static String agentSend(String commandJson) {
         AgentSession session = agentSession;
-        if (session == null || !isSessionAlive(session)) {
+        if (session == null || !session.process().isAlive()) {
             throw new IllegalStateException("agent_not_active");
         }
         try {
@@ -715,19 +560,21 @@ public final class ForgeVM {
             }
             try { session.writer().close(); } catch (Throwable ignored) {}
             try { session.reader().close(); } catch (Throwable ignored) {}
-            try { if (session.socket() != null) session.socket().close(); } catch (Throwable ignored) {}
-            try { if (session.process() != null && session.process().isAlive()) session.process().destroy(); } catch (Throwable ignored) {}
+            try { if (session.process().isAlive()) session.process().destroy(); } catch (Throwable ignored) {}
         } catch (Throwable ignored) {
         }
     }
 
     private record AgentSession(
-            Process process,   // null if connected to an existing agent
+            Process process,
             BufferedReader reader,
             BufferedWriter writer,
-            ReentrantLock ioLock,
-            Socket socket
-    ) {}
+            ReentrantLock ioLock
+    ) {
+        private AgentSession(Process process, BufferedReader reader, BufferedWriter writer) {
+            this(process, reader, writer, new ReentrantLock());
+        }
+    }
 
     public enum AgentStatus {
         /** Agent is active with full privileges. */
