@@ -1,10 +1,8 @@
 package forgevm.core;
 
 import forgevm.jvm.AgentFilter;
-import forgevm.jvm.AttachGuard;
 import forgevm.jvm.JvmControl;
 import forgevm.jvm.NativeFilter;
-import forgevm.jvm.NativeGuard;
 import forgevm.memory.MemoryUtil;
 import forgevm.forge.ForgeManager;
 import forgevm.util.FvmLog;
@@ -20,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.List;
 import java.util.Map;
 import java.util.StringJoiner;
 import java.util.concurrent.CompletableFuture;
@@ -66,25 +65,12 @@ public final class ForgeVM {
         }
     }
 
-    public static final LaunchPermissionPolicy SILENT = LaunchPermissionPolicy.SILENT;
-    public static final LaunchPermissionPolicy PROMPT = LaunchPermissionPolicy.PROMPT;
-
     private ForgeVM() {
     }
 
     // -- launch --
 
-    public static LaunchResult launch() {
-        return launch(LaunchPermissionPolicy.SILENT);
-    }
-
-    public static LaunchResult launchPrompt() {
-        return launch(LaunchPermissionPolicy.PROMPT);
-    }
-
-    public static synchronized LaunchResult launch(LaunchPermissionPolicy policy) {
-        LaunchPermissionPolicy effectivePolicy = policy == null ? LaunchPermissionPolicy.SILENT : policy;
-
+    public static synchronized LaunchResult launch() {
         AgentSession currentSession = agentSession;
         if (currentSession != null && !currentSession.process().isAlive()) {
             clearAgentExitSender();
@@ -93,17 +79,16 @@ public final class ForgeVM {
             agentSession = null;
         }
 
-        if (state != null) {
-            if (state.nativeDllActive() && agentSession != null && agentSession.process().isAlive()) {
-                return state;
-            }
-            if (effectivePolicy == LaunchPermissionPolicy.SILENT) {
-                return state;
-            }
+        if (state != null && state.nativeDllActive()
+                && agentSession != null && agentSession.process().isAlive()) {
+            return state;
         }
 
-        LaunchResult result = launchInternal(effectivePolicy);
+        LaunchResult result = launchInternal();
         state = result;
+        if (result.agentStatus() == AgentStatus.UNAVAILABLE) {
+            FvmLog.error("ForgeVM launch failed: " + result.reason());
+        }
         return result;
     }
 
@@ -156,28 +141,72 @@ public final class ForgeVM {
         return JvmControl.unlockAgent();
     }
 
+    // -- java agent guard (native-level, patches JVM_EnqueueOperation in jvm.dll) --
+
+    /** Block all Java agent attach attempts. */
     public static boolean banJavaAgent() {
-        return JvmControl.banJavaAgent();
+        return sendFilterCommand("ban_java_agent", null, null);
     }
 
+    /** Block Java agent attach attempts matching the filter. */
     public static boolean banJavaAgent(AgentFilter filter) {
-        return JvmControl.banJavaAgent(filter);
+        return sendFilterCommand("ban_java_agent",
+                filter == null ? null : filter.mode().name(),
+                filter == null ? null : filter.patterns());
     }
 
     public static boolean unbanJavaAgent() {
-        return JvmControl.unbanJavaAgent();
+        return sendFilterCommand("unban_java_agent", null, null);
     }
 
+    // -- native load guard (loader-level, patches ntdll!LdrLoadDll) --
+
+    /** Block all native library loads (System.load / System.loadLibrary / Runtime.load*). */
     public static boolean banNativeLoad() {
-        return JvmControl.banNativeLoad();
+        return sendFilterCommand("ban_native_load", null, null);
     }
 
+    /** Block native library loads matching the filter. */
     public static boolean banNativeLoad(NativeFilter filter) {
-        return JvmControl.banNativeLoad(filter);
+        return sendFilterCommand("ban_native_load",
+                filter == null ? null : filter.mode().name(),
+                filter == null ? null : filter.patterns());
     }
 
     public static boolean unbanNativeLoad() {
-        return JvmControl.unbanNativeLoad();
+        return sendFilterCommand("unban_native_load", null, null);
+    }
+
+    private static boolean sendFilterCommand(String cmd, String mode, List<String> patterns) {
+        AgentSession session = agentSession;
+        if (session == null || !session.process().isAlive()) {
+            return false;
+        }
+        try {
+            String command = buildFilterCommand(cmd, mode, patterns);
+            String response = sendCommand(session, command);
+            return isOkResponse(response);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static String buildFilterCommand(String cmd, String mode, List<String> patterns) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"cmd\":\"").append(escapeJson(cmd)).append("\"");
+        if (mode != null) {
+            sb.append(",\"mode\":\"").append(escapeJson(mode.toLowerCase())).append("\"");
+        }
+        if (patterns != null && !patterns.isEmpty()) {
+            sb.append(",\"patterns\":[");
+            for (int i = 0; i < patterns.size(); i++) {
+                if (i > 0) sb.append(',');
+                sb.append('"').append(escapeJson(patterns.get(i))).append('"');
+            }
+            sb.append(']');
+        }
+        sb.append('}');
+        return sb.toString();
     }
 
     public static boolean purgeAgent(String agentClassName) {
@@ -203,7 +232,7 @@ public final class ForgeVM {
 
     // -- launch internals --
 
-    private static LaunchResult launchInternal(LaunchPermissionPolicy policy) {
+    private static LaunchResult launchInternal() {
         Path dllPath = resolveNativeDllPath();
         if (dllPath == null || !Files.exists(dllPath)) {
             clearAgentExitSender();
@@ -225,7 +254,6 @@ public final class ForgeVM {
             Process process = new ProcessBuilder(
                     agentPath.toAbsolutePath().toString(),
                     "--serve",
-                    "--policy=" + policy.name().toLowerCase(),
                     "--dll=" + dllPath.toAbsolutePath(),
                     "--logdir=" + logDir
             ).redirectErrorStream(true).start();
@@ -250,8 +278,6 @@ public final class ForgeVM {
                 agentSession = session;
                 registerAgentExitSender(session);
                 registerAgentLockController(session);
-                AttachGuard.install();
-                NativeGuard.install();
                 return result;
             }
 
@@ -558,9 +584,9 @@ public final class ForgeVM {
                 }
             } catch (Throwable ignored) {
             }
+            try { session.process().waitFor(1500, TimeUnit.MILLISECONDS); } catch (Throwable ignored) {}
             try { session.writer().close(); } catch (Throwable ignored) {}
             try { session.reader().close(); } catch (Throwable ignored) {}
-            try { if (session.process().isAlive()) session.process().destroy(); } catch (Throwable ignored) {}
         } catch (Throwable ignored) {
         }
     }
@@ -583,13 +609,6 @@ public final class ForgeVM {
         RESTRICTED,
         /** Agent is unavailable — all operations will fail. */
         UNAVAILABLE
-    }
-
-    public enum LaunchPermissionPolicy {
-        /** Silent probe path without proactive elevation prompt. */
-        SILENT,
-        /** Prompt-capable probe path that may request elevated permission. */
-        PROMPT
     }
 
     public record LaunchResult(

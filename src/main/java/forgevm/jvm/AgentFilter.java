@@ -1,61 +1,59 @@
 package forgevm.jvm;
 
-public class AgentFilter {
+import java.util.List;
 
-    public enum Mode { BLOCK_ALL, BLACKLIST, WHITELIST }
+/**
+ * Filter for Java agent attachment attempts.
+ *
+ * <p>Matching is performed against the agent's library path (the first
+ * argument passed to {@code VirtualMachine.loadAgent} / {@code loadAgentPath}).
+ * Patterns use glob syntax: {@code *} matches any sequence, {@code ?} matches a single char.
+ *
+ * <pre>{@code
+ * // block only agents whose path contains "cheat-agent":
+ * ForgeVM.banJavaAgent(AgentFilter.Blacklist("*cheat-agent*"));
+ *
+ * // allow only monitoring agents, block everything else:
+ * ForgeVM.banJavaAgent(AgentFilter.Whitelist("*monitoring-*"));
+ *
+ * // multiple patterns:
+ * ForgeVM.banJavaAgent(AgentFilter.Blacklist("*evil*", "*trojan*.jar"));
+ * }</pre>
+ */
+public final class AgentFilter {
 
-    public enum Target { CLASS, JAR }
-
-    /** Sentinel instance for blocking all agents. */
-    static final AgentFilter BLOCK_ALL_INSTANCE = new AgentFilter(Mode.BLOCK_ALL, Target.CLASS);
+    public enum Mode { BLACKLIST, WHITELIST }
 
     private final Mode mode;
-    private final Target target;
-    private final String[] patterns;
+    private final List<String> patterns;
 
-    private AgentFilter(Mode mode, Target target, String... patterns) {
+    private AgentFilter(Mode mode, List<String> patterns) {
         this.mode = mode;
-        this.target = target;
-        this.patterns = patterns != null ? patterns : new String[0];
+        this.patterns = patterns;
     }
 
-    public static AgentFilter Blacklist(String... packagePrefixes) {
-        if (packagePrefixes == null || packagePrefixes.length == 0) {
-            throw new IllegalArgumentException("Blacklist requires at least one package prefix");
+    /** Block agents matching any of the given patterns. Allow everything else. */
+    public static AgentFilter Blacklist(String... patterns) {
+        return build(Mode.BLACKLIST, patterns);
+    }
+
+    /** Allow only agents matching any of the given patterns. Block everything else. */
+    public static AgentFilter Whitelist(String... patterns) {
+        return build(Mode.WHITELIST, patterns);
+    }
+
+    public Mode mode() { return mode; }
+    public List<String> patterns() { return patterns; }
+
+    private static AgentFilter build(Mode mode, String[] patterns) {
+        if (patterns == null || patterns.length == 0) {
+            throw new IllegalArgumentException("patterns must not be empty");
         }
-        return new AgentFilter(Mode.BLACKLIST, Target.CLASS, packagePrefixes);
-    }
-
-    public static AgentFilter Whitelist(String... packagePrefixes) {
-        if (packagePrefixes == null || packagePrefixes.length == 0) {
-            throw new IllegalArgumentException("Whitelist requires at least one package prefix");
+        for (String p : patterns) {
+            if (p == null || p.isBlank()) {
+                throw new IllegalArgumentException("pattern must not be null or blank");
+            }
         }
-        return new AgentFilter(Mode.WHITELIST, Target.CLASS, packagePrefixes);
-    }
-
-    public static AgentFilter JarBlacklist(String... jarGlobs) {
-        if (jarGlobs == null || jarGlobs.length == 0) {
-            throw new IllegalArgumentException("JarBlacklist requires at least one glob pattern");
-        }
-        return new AgentFilter(Mode.BLACKLIST, Target.JAR, jarGlobs);
-    }
-
-    public static AgentFilter JarWhitelist(String... jarGlobs) {
-        if (jarGlobs == null || jarGlobs.length == 0) {
-            throw new IllegalArgumentException("JarWhitelist requires at least one glob pattern");
-        }
-        return new AgentFilter(Mode.WHITELIST, Target.JAR, jarGlobs);
-    }
-
-    public Mode mode() {
-        return mode;
-    }
-
-    public Target target() {
-        return target;
-    }
-
-    public String[] patterns() {
-        return patterns;
+        return new AgentFilter(mode, List.of(patterns));
     }
 }

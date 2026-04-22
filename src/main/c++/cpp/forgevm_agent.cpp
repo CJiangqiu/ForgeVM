@@ -1,11 +1,13 @@
 #include <windows.h>
 #include <shellapi.h>
+#include <aclapi.h>
 
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
 #include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <cstdarg>
 
@@ -68,12 +70,15 @@ typedef int(__cdecl* PutFieldPathFn)(const char*, const char*, const unsigned ch
 typedef int(__cdecl* ForgeSubclassLoadFn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*);
 typedef int(__cdecl* ForgeSubclassUnloadFn)(const char*, const char*, const char*);
 typedef int(__cdecl* PutObjectFieldPathFn)(const char*, const char*, const char*, const char*);
+typedef int(__cdecl* BanJavaAgentFn)(const char*);
+typedef int(__cdecl* UnbanJavaAgentFn)();
+typedef int(__cdecl* BanNativeLoadFn)(const char*);
+typedef int(__cdecl* UnbanNativeLoadFn)();
 
 namespace {
 struct NativeApi {
     HMODULE module = NULL;
     ProbeFn probe = NULL;
-    ProbeFn probePrompt = NULL;
     InitFn init = NULL;
     LastErrorFn lastError = NULL;
     ExitByPidFn exitByPid = NULL;
@@ -94,6 +99,10 @@ struct NativeApi {
     ForgeSubclassLoadFn forgeSubLoad = NULL;
     ForgeSubclassUnloadFn forgeSubUnload = NULL;
     PutObjectFieldPathFn putObjectFieldPath = NULL;
+    BanJavaAgentFn banJavaAgent = NULL;
+    UnbanJavaAgentFn unbanJavaAgent = NULL;
+    BanNativeLoadFn banNativeLoad = NULL;
+    UnbanNativeLoadFn unbanNativeLoad = NULL;
 };
 
 struct AgentLockState {
@@ -102,6 +111,56 @@ struct AgentLockState {
     unsigned long long ownerPid = 0ULL;
 };
 
+
+// Self-DACL hardening: deny PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD
+// to Everyone on our own process object. Blocks same-user non-admin kills and injection.
+// Admin with TakeOwnership can still override.
+static bool hardenSelfProcessDACL() {
+    HANDLE hSelf = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(),
+                         GetCurrentProcess(), &hSelf,
+                         WRITE_DAC | READ_CONTROL, FALSE, 0)) {
+        return false;
+    }
+
+    PACL pOldDACL = NULL;
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    if (GetSecurityInfo(hSelf, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                        NULL, NULL, &pOldDACL, NULL, &pSD) != ERROR_SUCCESS) {
+        CloseHandle(hSelf);
+        return false;
+    }
+
+    PSID pEveryone = NULL;
+    SID_IDENTIFIER_AUTHORITY sia = SECURITY_WORLD_SID_AUTHORITY;
+    if (!AllocateAndInitializeSid(&sia, 1, SECURITY_WORLD_RID,
+                                  0, 0, 0, 0, 0, 0, 0, &pEveryone)) {
+        if (pSD) LocalFree(pSD);
+        CloseHandle(hSelf);
+        return false;
+    }
+
+    EXPLICIT_ACCESSW ea = {};
+    ea.grfAccessPermissions = PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD;
+    ea.grfAccessMode = DENY_ACCESS;
+    ea.grfInheritance = NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(pEveryone);
+
+    PACL pNewDACL = NULL;
+    bool ok = false;
+    if (SetEntriesInAclW(1, &ea, pOldDACL, &pNewDACL) == ERROR_SUCCESS) {
+        ok = SetSecurityInfo(hSelf, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                             NULL, NULL, pNewDACL, NULL) == ERROR_SUCCESS;
+    }
+
+    if (pNewDACL) LocalFree(pNewDACL);
+    if (pEveryone) FreeSid(pEveryone);
+    if (pSD) LocalFree(pSD);
+    CloseHandle(hSelf);
+    return ok;
+}
 
 // Parent process watchdog: exits agent when parent JVM dies
 static std::atomic<DWORD> g_parentPid{0};
@@ -191,9 +250,7 @@ std::string wideToUtf8(const std::wstring& wide) {
 }
 
 const char* capFromCode(int code) {
-    if (code >= 2) return "FULL";
-    if (code == 1) return "RESTRICTED";
-    return "UNAVAILABLE";
+    return code >= 1 ? "FULL" : "UNAVAILABLE";
 }
 
 std::string escapeJson(const std::string& value) {
@@ -346,7 +403,6 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
 
     api->module = module;
     api->probe           = reinterpret_cast<ProbeFn>(GetProcAddress(module, "forgevm_probe_capability"));
-    api->probePrompt     = reinterpret_cast<ProbeFn>(GetProcAddress(module, "forgevm_probe_capability_prompt"));
     api->init            = reinterpret_cast<InitFn>(GetProcAddress(module, "forgevm_init"));
     api->lastError       = reinterpret_cast<LastErrorFn>(GetProcAddress(module, "forgevm_last_error"));
     api->exitByPid       = reinterpret_cast<ExitByPidFn>(GetProcAddress(module, "forgevm_exit_process"));
@@ -367,6 +423,10 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->forgeSubLoad    = reinterpret_cast<ForgeSubclassLoadFn>(GetProcAddress(module, "forgevm_forge_load_subclasses"));
     api->forgeSubUnload  = reinterpret_cast<ForgeSubclassUnloadFn>(GetProcAddress(module, "forgevm_forge_unload_subclasses"));
     api->putObjectFieldPath = reinterpret_cast<PutObjectFieldPathFn>(GetProcAddress(module, "forgevm_put_object_field_path"));
+    api->banJavaAgent    = reinterpret_cast<BanJavaAgentFn>(GetProcAddress(module, "forgevm_ban_java_agent"));
+    api->unbanJavaAgent  = reinterpret_cast<UnbanJavaAgentFn>(GetProcAddress(module, "forgevm_unban_java_agent"));
+    api->banNativeLoad   = reinterpret_cast<BanNativeLoadFn>(GetProcAddress(module, "forgevm_ban_native_load"));
+    api->unbanNativeLoad = reinterpret_cast<UnbanNativeLoadFn>(GetProcAddress(module, "forgevm_unban_native_load"));
 
     if (api->probe == NULL || api->init == NULL) { *reason = "missing_export"; return false; }
     return true;
@@ -381,16 +441,9 @@ std::string copyReason(const NativeApi& api, const char* fallback) {
     return reason;
 }
 
-void handleBootstrap(const NativeApi& api, const std::string& policy,
+void handleBootstrap(const NativeApi& api,
                      const std::string& dllPath, const std::string& line) {
-    AGENT_LOG("bootstrap: policy=%s", policy.c_str());
-    bool prompt = policy == "prompt";
-    int capability = 0;
-    if (prompt && api.probePrompt != NULL) {
-        capability = api.probePrompt();
-    } else {
-        capability = api.probe();
-    }
+    int capability = api.probe ? api.probe() : 0;
     AGENT_LOG("bootstrap: capability=%d (%s)", capability, capFromCode(capability));
 
     if (capability <= 0) {
@@ -804,13 +857,430 @@ void handlePutObjectFieldPath(const NativeApi& api, const std::string& line, con
     }
 }
 
+// ============================================================
+// Load-filter state (Java agent attach + native library load)
+//
+// Filter storage is Agent-local — enforcement arrives in later steps:
+//   step 3: JVM_EnqueueOperation trampoline consults g_javaAgentFilter
+//   step 4: ntdll!LdrLoadDll trampoline consults g_nativeLoadFilter
+// ============================================================
+
+enum class FilterMode { None, Blacklist, Whitelist };
+
+struct LoadFilter {
+    FilterMode mode = FilterMode::None;
+    std::vector<std::string> patterns;
+    bool active = false;
+};
+
+LoadFilter g_javaAgentFilter;
+LoadFilter g_nativeLoadFilter;
+std::mutex g_filterMutex;
+std::atomic<bool> g_filterPipeStarted{false};
+
+const char* filterModeName(FilterMode m) {
+    switch (m) {
+        case FilterMode::None:      return "none";
+        case FilterMode::Blacklist: return "blacklist";
+        case FilterMode::Whitelist: return "whitelist";
+    }
+    return "unknown";
+}
+
+std::vector<std::string> parseJsonStringArray(const std::string& line, const std::string& key) {
+    std::vector<std::string> result;
+    std::string header = "\"" + key + "\":[";
+    size_t start = line.find(header);
+    if (start == std::string::npos) return result;
+    size_t i = start + header.size();
+
+    while (i < line.size()) {
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t' || line[i] == ',')) i++;
+        if (i >= line.size() || line[i] == ']') break;
+        if (line[i] != '"') break;
+        i++;
+
+        std::string value;
+        bool escaped = false;
+        while (i < line.size()) {
+            char c = line[i];
+            if (escaped) {
+                switch (c) {
+                    case 'n':  value += '\n'; break;
+                    case 'r':  value += '\r'; break;
+                    case 't':  value += '\t'; break;
+                    case '"':  value += '"';  break;
+                    case '\\': value += '\\'; break;
+                    default:   value += c;    break;
+                }
+                escaped = false;
+                i++;
+                continue;
+            }
+            if (c == '\\') { escaped = true; i++; continue; }
+            if (c == '"') break;
+            value += c;
+            i++;
+        }
+        if (i < line.size() && line[i] == '"') {
+            result.push_back(value);
+            i++;
+        } else {
+            break;
+        }
+    }
+    return result;
+}
+
+void applyFilterFromJson(LoadFilter* filter, const std::string& line) {
+    std::string mode = getJsonStringField(line, "mode");
+    std::vector<std::string> patterns = parseJsonStringArray(line, "patterns");
+
+    // Normalize to lowercase for comparison
+    std::string modeLower = mode;
+    for (char& c : modeLower) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+
+    if (modeLower == "blacklist" && !patterns.empty()) {
+        filter->mode = FilterMode::Blacklist;
+        filter->patterns = std::move(patterns);
+    } else if (modeLower == "whitelist" && !patterns.empty()) {
+        filter->mode = FilterMode::Whitelist;
+        filter->patterns = std::move(patterns);
+    } else {
+        filter->mode = FilterMode::None;
+        filter->patterns.clear();
+    }
+    filter->active = true;
+}
+
+// Case-insensitive glob match: '*' any run, '?' single char. '\\' and '/' are equivalent.
+bool globMatch(const std::string& pattern, const std::string& text) {
+    auto norm = [](unsigned char c) -> unsigned char {
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+        if (c == '\\') c = '/';
+        return c;
+    };
+    size_t pi = 0, ti = 0;
+    size_t starPi = std::string::npos, starTi = 0;
+    while (ti < text.size()) {
+        if (pi < pattern.size() && pattern[pi] == '*') {
+            starPi = pi++;
+            starTi = ti;
+        } else if (pi < pattern.size() &&
+                   (pattern[pi] == '?' ||
+                    norm((unsigned char)pattern[pi]) == norm((unsigned char)text[ti]))) {
+            pi++;
+            ti++;
+        } else if (starPi != std::string::npos) {
+            pi = starPi + 1;
+            ti = ++starTi;
+        } else {
+            return false;
+        }
+    }
+    while (pi < pattern.size() && pattern[pi] == '*') pi++;
+    return pi == pattern.size();
+}
+
+// true = allow the load, false = block it.
+// Semantics:
+//   filter inactive           → allow (ForgeVM never installed a filter)
+//   active + mode==None       → block everything (global ban, no patterns)
+//   active + Blacklist+match  → block; otherwise allow
+//   active + Whitelist+match  → allow; otherwise block
+bool filterAllows(const LoadFilter& f, const std::string& path) {
+    if (!f.active) return true;
+    if (f.mode == FilterMode::None) return false;
+    bool matched = false;
+    for (const auto& pat : f.patterns) {
+        if (globMatch(pat, path)) { matched = true; break; }
+    }
+    return (f.mode == FilterMode::Blacklist) ? !matched : matched;
+}
+
+// ============================================================
+// Named-pipe server: trampolines in the target JVM connect here
+// to ask "is this path allowed?" before calling the real JVM entry.
+//
+// Protocol (one request per connection, blocking):
+//   request : <kind:1 byte 'A'|'N'> <path:UTF-8 bytes> <0x0A>
+//   reply   : <decision:1 byte '1'=allow | '0'=block>
+//
+// 'A' queries g_javaAgentFilter, 'N' queries g_nativeLoadFilter.
+// Pipe name: \\.\pipe\forgevm_<jvm_pid>_filter
+// ============================================================
+
+DWORD WINAPI filterPipeHandlerThread(LPVOID param) {
+    HANDLE pipe = (HANDLE)param;
+    std::string buf;
+    buf.reserve(512);
+
+    // Read until newline (or pipe close / limit hit).
+    const size_t kMaxRequest = 4 * 1024;
+    char chunk[256];
+    bool haveLine = false;
+    while (buf.size() < kMaxRequest) {
+        DWORD got = 0;
+        BOOL ok = ReadFile(pipe, chunk, sizeof(chunk), &got, NULL);
+        if (!ok || got == 0) break;
+        for (DWORD i = 0; i < got; i++) {
+            if (chunk[i] == '\n') {
+                buf.append(chunk, chunk + i);
+                haveLine = true;
+                break;
+            }
+        }
+        if (haveLine) break;
+        buf.append(chunk, chunk + got);
+    }
+
+    char decision = '1'; // default allow on malformed input — fail-open keeps JVM healthy
+    if (haveLine && !buf.empty()) {
+        char kind = buf[0];
+        std::string path = buf.substr(1);
+        bool allow = true;
+        {
+            std::lock_guard<std::mutex> g(g_filterMutex);
+            if (kind == 'A') {
+                allow = filterAllows(g_javaAgentFilter, path);
+            } else if (kind == 'N') {
+                allow = filterAllows(g_nativeLoadFilter, path);
+            }
+        }
+        decision = allow ? '1' : '0';
+        AGENT_LOG("filter query kind=%c path=%s -> %s",
+                  kind, path.c_str(), allow ? "ALLOW" : "BLOCK");
+    } else {
+        AGENT_LOG("filter query malformed (len=%zu haveLine=%d)", buf.size(), (int)haveLine);
+    }
+
+    DWORD wrote = 0;
+    WriteFile(pipe, &decision, 1, &wrote, NULL);
+    FlushFileBuffers(pipe);
+    DisconnectNamedPipe(pipe);
+    CloseHandle(pipe);
+    return 0;
+}
+
+struct FilterPipeStartup {
+    HANDLE firstPipe;
+    std::string pipeName;
+};
+
+DWORD WINAPI filterPipeAcceptLoopThread(LPVOID param) {
+    auto* startup = static_cast<FilterPipeStartup*>(param);
+    std::string pipeName = startup->pipeName;
+    HANDLE pipe = startup->firstPipe;
+    delete startup;
+    AGENT_LOG("filter pipe accept loop: %s", pipeName.c_str());
+
+    for (;;) {
+        if (pipe == NULL || pipe == INVALID_HANDLE_VALUE) {
+            pipe = CreateNamedPipeA(
+                pipeName.c_str(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                /*outBuf*/ 512, /*inBuf*/ 4096,
+                /*defaultTimeout*/ 0,
+                /*sa*/ NULL);
+            if (pipe == INVALID_HANDLE_VALUE) {
+                AGENT_LOG("CreateNamedPipe failed: %lu", GetLastError());
+                pipe = NULL;
+                Sleep(200);
+                continue;
+            }
+        }
+        BOOL connected = ConnectNamedPipe(pipe, NULL)
+                             ? TRUE
+                             : (GetLastError() == ERROR_PIPE_CONNECTED);
+        if (!connected) {
+            CloseHandle(pipe);
+            pipe = NULL;
+            continue;
+        }
+        HANDLE th = CreateThread(NULL, 0, filterPipeHandlerThread, pipe, 0, NULL);
+        if (th == NULL) {
+            AGENT_LOG("filter handler thread create failed: %lu", GetLastError());
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+            pipe = NULL;
+            continue;
+        }
+        CloseHandle(th);
+        pipe = NULL;  // handler thread owns it; next iteration creates another instance
+    }
+    return 0;
+}
+
+std::string g_filterPipeName;
+
+// Start the filter pipe server (idempotent). Synchronously creates the
+// first pipe instance before spawning the accept thread so that the
+// trampoline's CreateFileA can never race the server's first listen.
+// Returns the pipe name on success, or an empty string if start failed.
+std::string ensureFilterPipeStarted() {
+    if (g_filterPipeStarted.load()) {
+        return g_filterPipeName;
+    }
+    bool expected = false;
+    if (!g_filterPipeStarted.compare_exchange_strong(expected, true)) {
+        return g_filterPipeName;
+    }
+
+    DWORD pid = g_parentPid.load();
+    if (pid == 0) {
+        AGENT_LOG("ensureFilterPipeStarted: parent pid unknown");
+        g_filterPipeStarted.store(false);
+        return "";
+    }
+
+    char buf[64];
+    sprintf_s(buf, sizeof(buf), "\\\\.\\pipe\\forgevm_%lu_filter", (unsigned long)pid);
+    std::string name(buf);
+
+    HANDLE firstPipe = CreateNamedPipeA(
+        name.c_str(),
+        PIPE_ACCESS_DUPLEX,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES,
+        /*outBuf*/ 512, /*inBuf*/ 4096,
+        /*defaultTimeout*/ 0,
+        /*sa*/ NULL);
+    if (firstPipe == INVALID_HANDLE_VALUE) {
+        AGENT_LOG("first CreateNamedPipe failed: %lu", GetLastError());
+        g_filterPipeStarted.store(false);
+        return "";
+    }
+
+    auto* startup = new FilterPipeStartup{firstPipe, name};
+    HANDLE th = CreateThread(NULL, 0, filterPipeAcceptLoopThread, startup, 0, NULL);
+    if (th == NULL) {
+        AGENT_LOG("filter accept thread create failed: %lu", GetLastError());
+        CloseHandle(firstPipe);
+        delete startup;
+        g_filterPipeStarted.store(false);
+        return "";
+    }
+    CloseHandle(th);
+
+    g_filterPipeName = name;
+    return name;
+}
+
+void handleBanJavaAgent(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    bool wasActive;
+    {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        wasActive = g_javaAgentFilter.active;
+        applyFilterFromJson(&g_javaAgentFilter, line);
+        AGENT_LOG("ban_java_agent: mode=%s patterns=%zu%s",
+                  filterModeName(g_javaAgentFilter.mode),
+                  g_javaAgentFilter.patterns.size(),
+                  wasActive ? " (updated)" : "");
+    }
+    std::string pipeName = ensureFilterPipeStarted();
+    if (pipeName.empty()) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "filter_pipe_start_failed");
+        return;
+    }
+    // Trampoline already installed; new filter takes effect on next attach
+    // via the pipe — no need to re-patch jvm.dll.
+    if (wasActive) {
+        printResult("ok", "FULL", dllPath, "filter_updated");
+        return;
+    }
+    if (api.banJavaAgent == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "ban_java_agent_not_exported");
+        return;
+    }
+    int r = api.banJavaAgent(pipeName.c_str());
+    printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
+                api.lastError ? api.lastError() : "unknown");
+}
+
+void handleUnbanJavaAgent(const NativeApi& api, const std::string& dllPath) {
+    bool wasActive;
+    {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        wasActive = g_javaAgentFilter.active;
+        g_javaAgentFilter = LoadFilter{};
+    }
+    AGENT_LOG("unban_java_agent: filter cleared (wasActive=%d)", (int)wasActive);
+
+    if (!wasActive) {
+        printResult("ok", "FULL", dllPath, "already_unbanned");
+        return;
+    }
+    if (api.unbanJavaAgent == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "unban_java_agent_not_exported");
+        return;
+    }
+    int r = api.unbanJavaAgent();
+    printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
+                api.lastError ? api.lastError() : "unknown");
+}
+
+void handleBanNativeLoad(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    bool wasActive;
+    {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        wasActive = g_nativeLoadFilter.active;
+        applyFilterFromJson(&g_nativeLoadFilter, line);
+        AGENT_LOG("ban_native_load: mode=%s patterns=%zu%s",
+                  filterModeName(g_nativeLoadFilter.mode),
+                  g_nativeLoadFilter.patterns.size(),
+                  wasActive ? " (updated)" : "");
+    }
+    std::string pipeName = ensureFilterPipeStarted();
+    if (pipeName.empty()) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "filter_pipe_start_failed");
+        return;
+    }
+    if (wasActive) {
+        printResult("ok", "FULL", dllPath, "filter_updated");
+        return;
+    }
+    if (api.banNativeLoad == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "ban_native_load_not_exported");
+        return;
+    }
+    int r = api.banNativeLoad(pipeName.c_str());
+    printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
+                api.lastError ? api.lastError() : "unknown");
+}
+
+void handleUnbanNativeLoad(const NativeApi& api, const std::string& dllPath) {
+    bool wasActive;
+    {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        wasActive = g_nativeLoadFilter.active;
+        g_nativeLoadFilter = LoadFilter{};
+    }
+    AGENT_LOG("unban_native_load: filter cleared (wasActive=%d)", (int)wasActive);
+
+    if (!wasActive) {
+        printResult("ok", "FULL", dllPath, "already_unbanned");
+        return;
+    }
+    if (api.unbanNativeLoad == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "unban_native_load_not_exported");
+        return;
+    }
+    int r = api.unbanNativeLoad();
+    printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
+                api.lastError ? api.lastError() : "unknown");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    // Parse policy and serve flag from narrow args (ASCII, safe)
-    std::string policy  = parseArg("--policy=", argc, argv);
+    // Harden own process: deny PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD
+    hardenSelfProcessDACL();
+
     bool serve = hasFlag("--serve", argc, argv);
-    if (policy.empty()) policy = "silent";
 
     // Parse DLL path from wide command line to handle non-ASCII paths correctly
     int wargc = 0;
@@ -838,8 +1308,8 @@ int main(int argc, char** argv) {
     NativeApi api;
     std::string loadReason;
     agentLogInit(logDir);
-    AGENT_LOG("agent starting: dll=%s, policy=%s, serve=%d, logdir=%s",
-              dllPath.c_str(), policy.c_str(), (int)serve, logDir.c_str());
+    AGENT_LOG("agent starting: dll=%s, serve=%d, logdir=%s",
+              dllPath.c_str(), (int)serve, logDir.c_str());
 
     if (!loadNativeApi(dllPathWide, dllPath, &api, &loadReason)) {
         AGENT_LOG("loadNativeApi FAILED: %s", loadReason.c_str());
@@ -857,7 +1327,7 @@ int main(int argc, char** argv) {
 
     if (!serve) {
         AGENT_LOG("one-shot mode: bootstrap");
-        handleBootstrap(api, policy, dllPath, "");
+        handleBootstrap(api, dllPath, "");
         if (api.module != NULL) FreeLibrary(api.module);
         return 0;
     }
@@ -874,7 +1344,7 @@ int main(int argc, char** argv) {
         AGENT_LOG("cmd=%s", cmd.c_str());
 
         if (cmd == "bootstrap") {
-            handleBootstrap(api, policy, dllPath, line);
+            handleBootstrap(api, dllPath, line);
         } else if (cmd == "exit_jvm") {
             handleExitJvm(api, line, dllPath);
         } else if (cmd == "put_field") {
@@ -910,6 +1380,14 @@ int main(int argc, char** argv) {
             handleUnlockAgent(&lockState, dllPath);
         } else if (cmd == "rebind_jvm") {
             handleRebindJvm(&lockState, line, dllPath);
+        } else if (cmd == "ban_java_agent") {
+            handleBanJavaAgent(api, line, dllPath);
+        } else if (cmd == "unban_java_agent") {
+            handleUnbanJavaAgent(api, dllPath);
+        } else if (cmd == "ban_native_load") {
+            handleBanNativeLoad(api, line, dllPath);
+        } else if (cmd == "unban_native_load") {
+            handleUnbanNativeLoad(api, dllPath);
         } else if (cmd == "shutdown") {
             printResult("ok", "RESTRICTED", dllPath, "bye");
             break;

@@ -73,29 +73,6 @@ public final class JvmControl {
         }
     }
 
-    public static boolean banJavaAgent() {
-        return AttachGuard.activate(null);
-    }
-
-    public static boolean banJavaAgent(AgentFilter filter) {
-        return AttachGuard.activate(filter);
-    }
-
-    public static boolean unbanJavaAgent() {
-        return AttachGuard.deactivate();
-    }
-
-    public static boolean banNativeLoad() {
-        return NativeGuard.activate(null);
-    }
-
-    public static boolean banNativeLoad(NativeFilter filter) {
-        return NativeGuard.activate(filter);
-    }
-
-    public static boolean unbanNativeLoad() {
-        return NativeGuard.deactivate();
-    }
 
     public static boolean rebindAgentToCurrentJvm() {
         AgentLockController controller = agentLockController;

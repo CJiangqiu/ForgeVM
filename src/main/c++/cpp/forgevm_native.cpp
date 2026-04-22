@@ -92,7 +92,6 @@ void fvm_log_hex(const char* label, const void* data, size_t len) {
 // ============================================================
 
 std::string g_lastError = "ok";
-bool g_promptApproved = false;
 TargetProcess g_target;
 
 std::unordered_map<StructMapKey, StructMapEntry, StructMapKeyHash> g_structMap;
@@ -560,29 +559,6 @@ static bool readVMLongConstants(HANDLE proc, uint64_t tablePtr, const VMLongCons
 // Privilege helpers
 // ============================================================
 
-bool isAdmin() {
-    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
-    PSID adminGroup = NULL;
-    if (!AllocateAndInitializeSid(&ntAuthority, 2,
-                                  SECURITY_BUILTIN_DOMAIN_RID,
-                                  DOMAIN_ALIAS_RID_ADMINS,
-                                  0, 0, 0, 0, 0, 0,
-                                  &adminGroup)) {
-        setError("alloc_admin_sid_failed");
-        return false;
-    }
-
-    BOOL isMember = FALSE;
-    if (!CheckTokenMembership(NULL, adminGroup, &isMember)) {
-        FreeSid(adminGroup);
-        setError("check_admin_membership_failed");
-        return false;
-    }
-
-    FreeSid(adminGroup);
-    return isMember == TRUE;
-}
-
 bool enableDebugPrivilege() {
     HANDLE token = NULL;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
@@ -620,54 +596,36 @@ bool enableDebugPrivilege() {
     return true;
 }
 
-int resolveCapabilityByToken() {
-    if (isAdmin()) {
-        if (enableDebugPrivilege()) return 2;
-        return 1;
-    }
-    if (enableDebugPrivilege()) return 1;
-    setError("ok");
-    return 1;
-}
-
 // ============================================================
 // Exported functions
 // ============================================================
 
+// Probe: same-user OpenProcess does not require SeDebugPrivilege.
+// We opportunistically enable it (helps if target has a hostile DACL or
+// different integrity), but a normal-user JVM has no SeDebug in its token
+// and AdjustTokenPrivileges returns ERROR_NOT_ALL_ASSIGNED — that is NOT
+// a capability failure. The real capability gate is OpenProcess in
+// forgevm_bootstrap_target.
 extern "C" __declspec(dllexport) int forgevm_probe_capability() {
-    g_promptApproved = false;
-    return resolveCapabilityByToken();
-}
-
-extern "C" __declspec(dllexport) int forgevm_probe_capability_prompt() {
-    g_promptApproved = false;
-    int tokenCapability = resolveCapabilityByToken();
-    if (tokenCapability > 0) return tokenCapability;
-
-    HINSTANCE shellResult = ShellExecuteW(NULL, L"runas", L"powershell.exe",
-                                          L"-NoProfile -Command exit 0", NULL, SW_HIDE);
-    int resultCode = (int)(INT_PTR)shellResult;
-    if (resultCode <= 32) {
-        setError("elevation_prompt_rejected_or_failed");
-        return 0;
+    if (enableDebugPrivilege()) {
+        setError("ok");
+    } else {
+        FVM_LOG("probe: SeDebugPrivilege not available (%s) — continuing, not required for same-user access",
+                g_lastError.c_str());
+        setError("ok_no_sedebug");
     }
-
-    g_promptApproved = true;
-    setError("ok");
     return 1;
 }
 
 extern "C" __declspec(dllexport) int forgevm_init() {
     FVM_LOG("forgevm_init() called");
-    int capability = resolveCapabilityByToken();
-    FVM_LOG("forgevm_init: capability=%d, promptApproved=%d", capability, (int)g_promptApproved);
-    if (capability > 0 || g_promptApproved) {
-        g_promptApproved = false;
+    if (enableDebugPrivilege()) {
         setError("ok");
-        return 1;
+    } else {
+        FVM_LOG("init: SeDebugPrivilege not available (%s) — continuing", g_lastError.c_str());
+        setError("ok_no_sedebug");
     }
-    g_promptApproved = false;
-    return 0;
+    return 1;
 }
 
 extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long targetPid) {
@@ -805,4 +763,951 @@ extern "C" __declspec(dllexport) unsigned long long forgevm_typemap_count() {
 
 extern "C" __declspec(dllexport) const char* forgevm_compression_info() {
     return g_compressionDetectLog.c_str();
+}
+
+// ============================================================
+// Load-time filters.
+//
+//   Java agent attach:
+//     hook jvm.dll!JVM_EnqueueOperation — arg0 (rdx) is the agent
+//     library path as UTF-8. attach() uses CreateRemoteThread to
+//     reach this entry, so DisableAttachMechanism can't cover it.
+//
+//   Native library load:
+//     hook ntdll!LdrLoadDll — the bottom of every user-mode DLL
+//     load path (LoadLibraryW / LoadLibraryExW / kernelbase / JNI
+//     direct LoadLibrary / etc. all funnel here). The DLL name
+//     arrives in r8 as a UNICODE_STRING; the trampoline converts
+//     it to UTF-8 via WideCharToMultiByte before querying the
+//     filter pipe. On block we return STATUS_DLL_NOT_FOUND
+//     (0xC0000135) so callers see the normal "DLL not found"
+//     error path, not a crash.
+//
+//   Both hooks query a named pipe served by the Agent to decide
+//   allow/block per call. Pipe failure → fail-open, to keep the
+//   JVM healthy when the Agent exits unexpectedly.
+// ============================================================
+
+namespace {
+    struct PatchState {
+        uint64_t targetAddr = 0;
+        uint8_t  original[16] = {};
+        size_t   patchSize = 0;
+        bool     patched = false;
+        uint64_t trampolineAddr = 0;
+        size_t   trampolineSize = 0;
+        bool     trampolineInstalled = false;
+    };
+    PatchState g_javaAgentPatch;
+    PatchState g_nativeLoadPatch;
+}
+
+// Write to remote code section (handles VirtualProtectEx for .text pages)
+static bool writeRemoteCode(HANDLE proc, uint64_t addr, const void* buf, size_t size) {
+    DWORD oldProtect = 0;
+    if (!VirtualProtectEx(proc, reinterpret_cast<LPVOID>(addr), size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        FVM_LOG("ban_java_agent: VirtualProtectEx failed: %lu", GetLastError());
+        return false;
+    }
+    bool ok = writeRemoteMem(proc, addr, buf, size);
+    FlushInstructionCache(proc, reinterpret_cast<LPCVOID>(addr), size);
+    DWORD dummy;
+    VirtualProtectEx(proc, reinterpret_cast<LPVOID>(addr), size, oldProtect, &dummy);
+    return ok;
+}
+
+// Resolve a jvm.dll export in the target process. Fast path uses a local
+// DONT_RESOLVE_DLL_REFERENCES load + RVA translation; falls back to the
+// existing parsePEExport() which walks the remote PE export table.
+static uint64_t resolveJvmExport(HANDLE proc, const char* name) {
+    HMODULE localJvm = LoadLibraryExA("jvm.dll", NULL, DONT_RESOLVE_DLL_REFERENCES);
+    if (localJvm) {
+        FARPROC localAddr = GetProcAddress(localJvm, name);
+        if (localAddr) {
+            uint64_t rva = reinterpret_cast<uint64_t>(localAddr) - reinterpret_cast<uint64_t>(localJvm);
+            FreeLibrary(localJvm);
+            return g_target.jvmDllBase + rva;
+        }
+        FreeLibrary(localJvm);
+    }
+    uint64_t addr = 0;
+    if (parsePEExport(proc, g_target.jvmDllBase, name, &addr) && addr != 0) {
+        return addr;
+    }
+    return 0;
+}
+
+// Find free region within 2GB of `near` big enough for `size`.
+// A Windows E9 rel32 requires the trampoline to be reachable from the patch site.
+static uint64_t findFreeRegionNear(HANDLE proc, uint64_t anchor, size_t size) {
+    const uint64_t MAX_DELTA = (1ULL << 31) - (1ULL << 21); // a bit under 2GB to leave slack
+    const uint64_t GRANULARITY = 0x10000ULL;                // 64KB
+    uint64_t minAddr = (anchor > MAX_DELTA) ? (anchor - MAX_DELTA) : GRANULARITY;
+    uint64_t maxAddr = anchor + MAX_DELTA;
+
+    // Round up to allocation granularity
+    minAddr = (minAddr + GRANULARITY - 1) & ~(GRANULARITY - 1);
+
+    uint64_t addr = minAddr;
+    MEMORY_BASIC_INFORMATION mbi;
+    while (addr < maxAddr) {
+        if (VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0) {
+            break;
+        }
+        if (mbi.State == MEM_FREE) {
+            uint64_t base   = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+            uint64_t region = (base + GRANULARITY - 1) & ~(GRANULARITY - 1);
+            uint64_t end    = base + mbi.RegionSize;
+            if (region + size <= end && region + size <= maxAddr) {
+                return region;
+            }
+        }
+        addr = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (addr == 0) break;
+    }
+    return 0;
+}
+
+static void emitBytes(std::vector<uint8_t>& out, std::initializer_list<uint8_t> bytes) {
+    for (uint8_t b : bytes) out.push_back(b);
+}
+
+static void writeU64(std::vector<uint8_t>& out, size_t off, uint64_t v) {
+    for (int i = 0; i < 8; i++) out[off + i] = static_cast<uint8_t>(v >> (i * 8));
+}
+
+// Build the trampoline page (code + data). Layout:
+//   +0x000..0x300  executable code
+//   +0x300  qword  fn_CreateFileA
+//   +0x308  qword  fn_WriteFile
+//   +0x310  qword  fn_ReadFile
+//   +0x318  qword  fn_CloseHandle
+//   +0x320  qword  abs_orig_plus_5  (jmp target after saved prologue runs)
+//   +0x330  byte   kind_byte        ('A' = java agent, 'N' = native load)
+//   +0x340  char[] pipe_name        (NUL-terminated, <= 128 bytes)
+//
+// Entry: intercepted call saves rcx/rdx/r8/r9, early-allows if the
+// path pointer is null, else opens the pipe and writes "<kind><path>\n",
+// reads a 1-byte decision. '0' => block (return 0). Anything else (or
+// any IPC failure) => allow: restore regs, run saved prologue, jmp to
+// target+5. `pathInRdx` selects whether the path pointer is in rdx
+// (Java agent, EnqueueOperation arg0) or rcx (native load, LoadLibrary arg0).
+static std::vector<uint8_t> buildFilterTrampoline(const uint8_t* savedPrologue,
+                                                   uint64_t origPlus5,
+                                                   uint64_t fnCreateFileA,
+                                                   uint64_t fnWriteFile,
+                                                   uint64_t fnReadFile,
+                                                   uint64_t fnCloseHandle,
+                                                   char kindByte,
+                                                   const char* pipeName,
+                                                   bool pathInRdx) {
+    const size_t kPageSize = 0x400;
+    std::vector<uint8_t> buf(kPageSize, 0xCC); // INT3-fill unused bytes
+
+    // ---- Emit code (linear), then back-patch forward-jump displacements ----
+    std::vector<uint8_t> code;
+    code.reserve(0x200);
+
+    // 0x000: sub rsp, 0x478
+    emitBytes(code, {0x48, 0x81, 0xEC, 0x78, 0x04, 0x00, 0x00});
+    // 0x007: mov [rsp+0x458], rcx
+    emitBytes(code, {0x48, 0x89, 0x8C, 0x24, 0x58, 0x04, 0x00, 0x00});
+    // 0x00F: mov [rsp+0x460], rdx
+    emitBytes(code, {0x48, 0x89, 0x94, 0x24, 0x60, 0x04, 0x00, 0x00});
+    // 0x017: mov [rsp+0x468], r8
+    emitBytes(code, {0x4C, 0x89, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});
+    // 0x01F: mov [rsp+0x470], r9
+    emitBytes(code, {0x4C, 0x89, 0x8C, 0x24, 0x70, 0x04, 0x00, 0x00});
+    // 0x027: test rdx,rdx (path-in-rdx) or test rcx,rcx (path-in-rcx) — same 3 bytes
+    if (pathInRdx) emitBytes(code, {0x48, 0x85, 0xD2});
+    else           emitBytes(code, {0x48, 0x85, 0xC9});
+    // 0x02A: je _allow_direct (rel32 fixup to 0x155)
+    emitBytes(code, {0x0F, 0x84, 0x25, 0x01, 0x00, 0x00});
+
+    // 0x030: lea rcx, [rip+0x309]  -> pipe_name at 0x340
+    emitBytes(code, {0x48, 0x8D, 0x0D, 0x09, 0x03, 0x00, 0x00});
+    // 0x037: mov edx, 0xC0000000 (GENERIC_READ | GENERIC_WRITE)
+    emitBytes(code, {0xBA, 0x00, 0x00, 0x00, 0xC0});
+    // 0x03C: xor r8d, r8d
+    emitBytes(code, {0x45, 0x33, 0xC0});
+    // 0x03F: xor r9d, r9d
+    emitBytes(code, {0x45, 0x33, 0xC9});
+    // 0x042: mov dword [rsp+0x20], 3  (OPEN_EXISTING)
+    emitBytes(code, {0xC7, 0x44, 0x24, 0x20, 0x03, 0x00, 0x00, 0x00});
+    // 0x04A: mov dword [rsp+0x28], 0
+    emitBytes(code, {0xC7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00});
+    // 0x052: mov qword [rsp+0x30], 0
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00});
+    // 0x05B: mov rax, [rip+0x29E]  -> fn_CreateFileA at 0x300
+    emitBytes(code, {0x48, 0x8B, 0x05, 0x9E, 0x02, 0x00, 0x00});
+    // 0x062: call rax
+    emitBytes(code, {0xFF, 0xD0});
+
+    // 0x064: cmp rax, -1
+    emitBytes(code, {0x48, 0x83, 0xF8, 0xFF});
+    // 0x068: je _allow_direct (rel32 to 0x155, disp = 0xE7)
+    emitBytes(code, {0x0F, 0x84, 0xE7, 0x00, 0x00, 0x00});
+    // 0x06E: mov [rsp+0x440], rax  (save handle)
+    emitBytes(code, {0x48, 0x89, 0x84, 0x24, 0x40, 0x04, 0x00, 0x00});
+
+    // 0x076: movzx eax, byte [rip+0x2B3]  -> kind_byte at 0x330
+    emitBytes(code, {0x0F, 0xB6, 0x05, 0xB3, 0x02, 0x00, 0x00});
+    // 0x07D: mov [rsp+0x40], al
+    emitBytes(code, {0x88, 0x44, 0x24, 0x40});
+    // 0x081: mov r10, [rsp+0x460] (rdx slot) or [rsp+0x458] (rcx slot)
+    {
+        uint8_t disp = pathInRdx ? 0x60 : 0x58;
+        emitBytes(code, {0x4C, 0x8B, 0x94, 0x24, disp, 0x04, 0x00, 0x00});
+    }
+    // 0x089: xor r11d, r11d
+    emitBytes(code, {0x45, 0x33, 0xDB});
+
+    // _cpyloop at 0x08C
+    // 0x08C: cmp r11, 0x384 (900)
+    emitBytes(code, {0x49, 0x81, 0xFB, 0x84, 0x03, 0x00, 0x00});
+    // 0x093: jae _cpydone (rel8 +0x15 -> 0x0AA)
+    emitBytes(code, {0x73, 0x15});
+    // 0x095: mov al, [r10+r11]
+    emitBytes(code, {0x43, 0x8A, 0x04, 0x1A});
+    // 0x099: test al, al
+    emitBytes(code, {0x84, 0xC0});
+    // 0x09B: je _cpydone (rel8 +0x0D -> 0x0AA)
+    emitBytes(code, {0x74, 0x0D});
+    // 0x09D: mov [rsp+r11+0x41], al
+    emitBytes(code, {0x42, 0x88, 0x84, 0x1C, 0x41, 0x00, 0x00, 0x00});
+    // 0x0A5: inc r11
+    emitBytes(code, {0x49, 0xFF, 0xC3});
+    // 0x0A8: jmp _cpyloop (rel8 -0x1E -> 0x08C)
+    emitBytes(code, {0xEB, 0xE2});
+
+    // _cpydone at 0x0AA
+    // 0x0AA: mov byte [rsp+r11+0x41], 0x0A
+    emitBytes(code, {0x42, 0xC6, 0x84, 0x1C, 0x41, 0x00, 0x00, 0x00, 0x0A});
+
+    // 0x0B3: mov rcx, [rsp+0x440]  (handle)
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x40, 0x04, 0x00, 0x00});
+    // 0x0BB: lea rdx, [rsp+0x40]   (buf)
+    emitBytes(code, {0x48, 0x8D, 0x54, 0x24, 0x40});
+    // 0x0C0: lea r8, [r11+2]
+    emitBytes(code, {0x4D, 0x8D, 0x43, 0x02});
+    // 0x0C4: lea r9, [rsp+0x448]   (&wrote)
+    emitBytes(code, {0x4C, 0x8D, 0x8C, 0x24, 0x48, 0x04, 0x00, 0x00});
+    // 0x0CC: mov qword [rsp+0x20], 0
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00});
+    // 0x0D5: mov rax, [rip+0x22C]  -> fn_WriteFile at 0x308
+    emitBytes(code, {0x48, 0x8B, 0x05, 0x2C, 0x02, 0x00, 0x00});
+    // 0x0DC: call rax
+    emitBytes(code, {0xFF, 0xD0});
+
+    // 0x0DE: test eax, eax
+    emitBytes(code, {0x85, 0xC0});
+    // 0x0E0: je _close_and_allow (rel32 to 0x144, disp = 0x5E)
+    emitBytes(code, {0x0F, 0x84, 0x5E, 0x00, 0x00, 0x00});
+
+    // 0x0E6: mov rcx, [rsp+0x440]
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x40, 0x04, 0x00, 0x00});
+    // 0x0EE: lea rdx, [rsp+0x450]  (&reply)
+    emitBytes(code, {0x48, 0x8D, 0x94, 0x24, 0x50, 0x04, 0x00, 0x00});
+    // 0x0F6: mov r8d, 1
+    emitBytes(code, {0x41, 0xB8, 0x01, 0x00, 0x00, 0x00});
+    // 0x0FC: lea r9, [rsp+0x44C]   (&got)
+    emitBytes(code, {0x4C, 0x8D, 0x8C, 0x24, 0x4C, 0x04, 0x00, 0x00});
+    // 0x104: mov qword [rsp+0x20], 0
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00});
+    // 0x10D: mov rax, [rip+0x1FC]  -> fn_ReadFile at 0x310
+    emitBytes(code, {0x48, 0x8B, 0x05, 0xFC, 0x01, 0x00, 0x00});
+    // 0x114: call rax
+    emitBytes(code, {0xFF, 0xD0});
+
+    // 0x116: test eax, eax
+    emitBytes(code, {0x85, 0xC0});
+    // 0x118: je _close_and_allow (rel32 to 0x144, disp = 0x26)
+    emitBytes(code, {0x0F, 0x84, 0x26, 0x00, 0x00, 0x00});
+
+    // 0x11E: mov rcx, [rsp+0x440]
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x40, 0x04, 0x00, 0x00});
+    // 0x126: mov rax, [rip+0x1EB]  -> fn_CloseHandle at 0x318
+    emitBytes(code, {0x48, 0x8B, 0x05, 0xEB, 0x01, 0x00, 0x00});
+    // 0x12D: call rax
+    emitBytes(code, {0xFF, 0xD0});
+
+    // 0x12F: movzx eax, byte [rsp+0x450]  (reply)
+    emitBytes(code, {0x0F, 0xB6, 0x84, 0x24, 0x50, 0x04, 0x00, 0x00});
+    // 0x137: cmp al, '0'
+    emitBytes(code, {0x3C, 0x30});
+    // 0x139: je _block (rel32 to 0x187, disp = 0x48)
+    emitBytes(code, {0x0F, 0x84, 0x48, 0x00, 0x00, 0x00});
+    // 0x13F: jmp _allow_direct (rel32 to 0x155, disp = 0x11)
+    emitBytes(code, {0xE9, 0x11, 0x00, 0x00, 0x00});
+
+    // _close_and_allow at 0x144
+    // 0x144: mov rcx, [rsp+0x440]
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x40, 0x04, 0x00, 0x00});
+    // 0x14C: mov rax, [rip+0x1C5]  -> fn_CloseHandle at 0x318
+    emitBytes(code, {0x48, 0x8B, 0x05, 0xC5, 0x01, 0x00, 0x00});
+    // 0x153: call rax
+    emitBytes(code, {0xFF, 0xD0});
+    // fallthrough to _allow_direct
+
+    // _allow_direct at 0x155
+    // 0x155: mov rcx, [rsp+0x458]
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x58, 0x04, 0x00, 0x00});
+    // 0x15D: mov rdx, [rsp+0x460]
+    emitBytes(code, {0x48, 0x8B, 0x94, 0x24, 0x60, 0x04, 0x00, 0x00});
+    // 0x165: mov r8, [rsp+0x468]
+    emitBytes(code, {0x4C, 0x8B, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});
+    // 0x16D: mov r9, [rsp+0x470]
+    emitBytes(code, {0x4C, 0x8B, 0x8C, 0x24, 0x70, 0x04, 0x00, 0x00});
+    // 0x175: add rsp, 0x478
+    emitBytes(code, {0x48, 0x81, 0xC4, 0x78, 0x04, 0x00, 0x00});
+    // 0x17C: <5 saved prologue bytes>
+    for (int i = 0; i < 5; i++) code.push_back(savedPrologue[i]);
+    // 0x181: jmp qword [rip+0x199]  -> abs_orig_plus_5 at 0x320
+    emitBytes(code, {0xFF, 0x25, 0x99, 0x01, 0x00, 0x00});
+
+    // _block at 0x187
+    // 0x187: add rsp, 0x478
+    emitBytes(code, {0x48, 0x81, 0xC4, 0x78, 0x04, 0x00, 0x00});
+    // 0x18E: xor eax, eax
+    emitBytes(code, {0x33, 0xC0});
+    // 0x190: ret
+    emitBytes(code, {0xC3});
+
+    // Sanity: the code section must fit below the data region at 0x300
+    if (code.size() > 0x300) {
+        FVM_LOG("buildFilterTrampoline: code too large (%zu bytes)", code.size());
+        return {};
+    }
+
+    // Copy code into page-buffer
+    for (size_t i = 0; i < code.size(); i++) buf[i] = code[i];
+
+    // Data section
+    writeU64(buf, 0x300, fnCreateFileA);
+    writeU64(buf, 0x308, fnWriteFile);
+    writeU64(buf, 0x310, fnReadFile);
+    writeU64(buf, 0x318, fnCloseHandle);
+    writeU64(buf, 0x320, origPlus5);
+    buf[0x330] = static_cast<uint8_t>(kindByte);
+
+    // Pipe name (bounded copy, NUL-terminate)
+    size_t pn = 0;
+    if (pipeName != nullptr) {
+        while (pipeName[pn] != '\0' && pn < 127) {
+            buf[0x340 + pn] = static_cast<uint8_t>(pipeName[pn]);
+            pn++;
+        }
+    }
+    buf[0x340 + pn] = 0;
+
+    return buf;
+}
+
+// Core install routine shared by ban_java_agent and ban_native_load.
+// Looks up `exportName` in jvm.dll, saves the first 5 bytes, allocates
+// a nearby trampoline page, writes the trampoline image, and redirects
+// the export's prologue via E9 rel32. On any failure, frees the page.
+static int installFilterTrampoline(PatchState& state,
+                                    const char* exportName,
+                                    bool pathInRdx,
+                                    char kindByte,
+                                    const char* pipeName,
+                                    const char* logTag) {
+    if (!g_target.structMapReady) {
+        setError("not_bootstrapped");
+        return 0;
+    }
+    if (state.patched) {
+        setError("already_patched");
+        return 0;
+    }
+    if (pipeName == nullptr || pipeName[0] == '\0') {
+        setError("missing_pipe_name");
+        return 0;
+    }
+
+    HANDLE proc = g_target.handle;
+
+    uint64_t addr = resolveJvmExport(proc, exportName);
+    if (addr == 0) {
+        setError("export_not_found");
+        return 0;
+    }
+    FVM_LOG("%s: %s @ 0x%llX", logTag, exportName, (unsigned long long)addr);
+
+    uint8_t saved5[5] = {};
+    if (!readRemoteMem(proc, addr, saved5, 5)) {
+        setError("read_original_failed");
+        return 0;
+    }
+    FVM_LOG("%s: original prologue: %02X %02X %02X %02X %02X", logTag,
+            saved5[0], saved5[1], saved5[2], saved5[3], saved5[4]);
+
+    // Refuse dangerous starters (rel jumps/calls we can't safely relocate).
+    uint8_t b0 = saved5[0];
+    bool dangerous = (b0 == 0xE8) || (b0 == 0xE9) || (b0 == 0xEB) ||
+                     (b0 >= 0x70 && b0 <= 0x7F) || (b0 == 0xFF);
+    if (dangerous) {
+        setError("unsafe_prologue");
+        return 0;
+    }
+
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (!k32) {
+        setError("kernel32_not_loaded");
+        return 0;
+    }
+    uint64_t fnCreate = reinterpret_cast<uint64_t>(GetProcAddress(k32, "CreateFileA"));
+    uint64_t fnWrite  = reinterpret_cast<uint64_t>(GetProcAddress(k32, "WriteFile"));
+    uint64_t fnRead   = reinterpret_cast<uint64_t>(GetProcAddress(k32, "ReadFile"));
+    uint64_t fnClose  = reinterpret_cast<uint64_t>(GetProcAddress(k32, "CloseHandle"));
+    if (!fnCreate || !fnWrite || !fnRead || !fnClose) {
+        setError("kernel32_resolve_failed");
+        return 0;
+    }
+
+    const size_t kPage = 0x400;
+    uint64_t allocHint = findFreeRegionNear(proc, addr, kPage);
+    if (allocHint == 0) {
+        setError("no_nearby_free_region");
+        return 0;
+    }
+    void* allocated = VirtualAllocEx(proc, reinterpret_cast<LPVOID>(allocHint), kPage,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!allocated) {
+        setError("virtual_alloc_failed");
+        return 0;
+    }
+    uint64_t trampAddr = reinterpret_cast<uint64_t>(allocated);
+
+    int64_t delta = static_cast<int64_t>(trampAddr) - static_cast<int64_t>(addr + 5);
+    if (delta < static_cast<int64_t>(INT32_MIN) || delta > static_cast<int64_t>(INT32_MAX)) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("tramp_out_of_rel32_range");
+        return 0;
+    }
+    FVM_LOG("%s: trampoline @ 0x%llX (delta=%lld)", logTag,
+            (unsigned long long)trampAddr, (long long)delta);
+
+    std::vector<uint8_t> image = buildFilterTrampoline(
+        saved5, addr + 5, fnCreate, fnWrite, fnRead, fnClose,
+        kindByte, pipeName, pathInRdx);
+    if (image.empty()) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("trampoline_build_failed");
+        return 0;
+    }
+    if (!writeRemoteMem(proc, trampAddr, image.data(), image.size())) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("trampoline_write_failed");
+        return 0;
+    }
+    FlushInstructionCache(proc, reinterpret_cast<LPCVOID>(trampAddr), image.size());
+
+    uint8_t patch[5];
+    patch[0] = 0xE9;
+    int32_t rel = static_cast<int32_t>(delta);
+    patch[1] = static_cast<uint8_t>(rel);
+    patch[2] = static_cast<uint8_t>(rel >> 8);
+    patch[3] = static_cast<uint8_t>(rel >> 16);
+    patch[4] = static_cast<uint8_t>(rel >> 24);
+
+    if (!writeRemoteCode(proc, addr, patch, sizeof(patch))) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("write_patch_failed");
+        return 0;
+    }
+
+    uint8_t verify[5] = {};
+    readRemoteMem(proc, addr, verify, sizeof(verify));
+    if (memcmp(verify, patch, sizeof(patch)) != 0) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("verify_failed");
+        return 0;
+    }
+
+    state.targetAddr = addr;
+    state.patchSize = 5;
+    memcpy(state.original, saved5, 5);
+    state.patched = true;
+    state.trampolineAddr = trampAddr;
+    state.trampolineSize = kPage;
+    state.trampolineInstalled = true;
+
+    FVM_LOG("%s: installed trampoline + E9 patch (verified)", logTag);
+    setError("ok");
+    return 1;
+}
+
+static int uninstallFilterTrampoline(PatchState& state, const char* logTag) {
+    if (!g_target.structMapReady) {
+        setError("not_bootstrapped");
+        return 0;
+    }
+    if (!state.patched || state.targetAddr == 0) {
+        setError("not_patched");
+        return 0;
+    }
+
+    HANDLE proc = g_target.handle;
+    if (!writeRemoteCode(proc, state.targetAddr, state.original, state.patchSize)) {
+        setError("restore_failed");
+        return 0;
+    }
+
+    uint8_t verify[16] = {};
+    readRemoteMem(proc, state.targetAddr, verify, state.patchSize);
+    if (memcmp(verify, state.original, state.patchSize) != 0) {
+        setError("restore_verify_failed");
+        return 0;
+    }
+    state.patched = false;
+    FVM_LOG("%s: restored original bytes (verified)", logTag);
+
+    if (state.trampolineInstalled && state.trampolineAddr != 0) {
+        VirtualFreeEx(proc, reinterpret_cast<LPVOID>(state.trampolineAddr), 0, MEM_RELEASE);
+        FVM_LOG("%s: released trampoline @ 0x%llX", logTag,
+                (unsigned long long)state.trampolineAddr);
+        state.trampolineAddr = 0;
+        state.trampolineSize = 0;
+        state.trampolineInstalled = false;
+    }
+    setError("ok");
+    return 1;
+}
+
+// ============================================================
+// ntdll!LdrLoadDll hook — native library load filter (deeper sink)
+//
+// LdrLoadDll is the bottom of every user-mode DLL load path. All of
+// LoadLibraryA/W, LoadLibraryExA/W, kernelbase internals and JNI code
+// that calls LoadLibrary directly funnel here. Hooking jvm.dll's
+// JVM_LoadLibrary (our earlier approach) only caught System.load /
+// Runtime.load; it missed any DLL that JNI / malware loaded directly.
+// ============================================================
+
+static uint64_t resolveNtdllExport(HANDLE proc, const char* exportName) {
+    uint64_t base = 0, size = 0;
+    if (!findModuleBase(proc, L"ntdll.dll", &base, &size) || base == 0) {
+        return 0;
+    }
+    uint64_t addr = 0;
+    if (parsePEExport(proc, base, exportName, &addr) && addr != 0) {
+        return addr;
+    }
+    return 0;
+}
+
+// LdrLoadDll x64 signature:
+//   NTSTATUS NTAPI LdrLoadDll(PWSTR SearchPath,         // rcx  (may be NULL)
+//                             PULONG DllCharacteristics,// rdx
+//                             PUNICODE_STRING DllName,  // r8   ← the name
+//                             PHANDLE DllHandle);       // r9
+// UNICODE_STRING: { USHORT Length (+0); USHORT MaxLength (+2); PWSTR Buffer (+8); }
+//
+// Data layout (matches buildFilterTrampoline where possible; adds a
+// WideCharToMultiByte slot so the wchar name can be converted in-place):
+//   +0x300  fn_CreateFileA
+//   +0x308  fn_WriteFile
+//   +0x310  fn_ReadFile
+//   +0x318  fn_CloseHandle
+//   +0x320  abs_orig_plus_5
+//   +0x328  fn_WideCharToMultiByte
+//   +0x330  kind_byte ('N')
+//   +0x340  pipe_name (NUL-terminated, <=127 bytes)
+//
+// Stack frame after `sub rsp, 0x478`:
+//   +0x20..0x3F   shadow space + extra args for API calls
+//   +0x40         kind byte (copied from data at 0x330)
+//   +0x41..0x3F0  UTF-8 path buffer (WideCharToMultiByte output); we
+//                 cap at 400 wide chars in, 800 bytes out
+//   +0x440        saved pipe HANDLE
+//   +0x448        WriteFile bytes-written (DWORD)
+//   +0x44C        ReadFile bytes-read (DWORD)
+//   +0x450        reply byte
+//   +0x458..0x470 saved rcx/rdx/r8/r9
+//
+// Control flow: if the UNICODE_STRING or its Buffer is NULL, or if
+// WideCharToMultiByte fails, we fall through to _allow_direct (fail-open).
+// On pipe '0' reply we branch to _block and return STATUS_DLL_NOT_FOUND
+// (0xC0000135); the loader maps that to a normal "DLL not found" error.
+static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedPrologue,
+                                                      uint64_t origPlus5,
+                                                      uint64_t fnCreateFileA,
+                                                      uint64_t fnWriteFile,
+                                                      uint64_t fnReadFile,
+                                                      uint64_t fnCloseHandle,
+                                                      uint64_t fnWideCharToMultiByte,
+                                                      const char* pipeName) {
+    const size_t kPageSize = 0x400;
+    std::vector<uint8_t> buf(kPageSize, 0xCC);
+
+    std::vector<uint8_t> code;
+    code.reserve(0x200);
+
+    // 0x000: sub rsp, 0x478
+    emitBytes(code, {0x48, 0x81, 0xEC, 0x78, 0x04, 0x00, 0x00});
+    // 0x007: mov [rsp+0x458], rcx
+    emitBytes(code, {0x48, 0x89, 0x8C, 0x24, 0x58, 0x04, 0x00, 0x00});
+    // 0x00F: mov [rsp+0x460], rdx
+    emitBytes(code, {0x48, 0x89, 0x94, 0x24, 0x60, 0x04, 0x00, 0x00});
+    // 0x017: mov [rsp+0x468], r8
+    emitBytes(code, {0x4C, 0x89, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});
+    // 0x01F: mov [rsp+0x470], r9
+    emitBytes(code, {0x4C, 0x89, 0x8C, 0x24, 0x70, 0x04, 0x00, 0x00});
+    // 0x027: test r8, r8
+    emitBytes(code, {0x4D, 0x85, 0xC0});
+    // 0x02A: je _allow_direct (rel32 -> 0x1A4, disp=0x174)
+    emitBytes(code, {0x0F, 0x84, 0x74, 0x01, 0x00, 0x00});
+
+    // 0x030: movzx eax, word [r8]         ; UNICODE_STRING.Length (bytes)
+    emitBytes(code, {0x41, 0x0F, 0xB7, 0x00});
+    // 0x034: test eax, eax
+    emitBytes(code, {0x85, 0xC0});
+    // 0x036: je _allow_direct (rel32, disp=0x168)
+    emitBytes(code, {0x0F, 0x84, 0x68, 0x01, 0x00, 0x00});
+    // 0x03C: mov rdx, [r8+8]              ; UNICODE_STRING.Buffer (PWSTR)
+    emitBytes(code, {0x49, 0x8B, 0x50, 0x08});
+    // 0x040: test rdx, rdx
+    emitBytes(code, {0x48, 0x85, 0xD2});
+    // 0x043: je _allow_direct (rel32, disp=0x15B)
+    emitBytes(code, {0x0F, 0x84, 0x5B, 0x01, 0x00, 0x00});
+
+    // 0x049: shr eax, 1                    ; Length(bytes) -> wchar count
+    emitBytes(code, {0xD1, 0xE8});
+    // 0x04B: cmp eax, 400
+    emitBytes(code, {0x3D, 0x90, 0x01, 0x00, 0x00});
+    // 0x050: jbe _len_ok (rel8 +5 -> 0x57)
+    emitBytes(code, {0x76, 0x05});
+    // 0x052: mov eax, 400
+    emitBytes(code, {0xB8, 0x90, 0x01, 0x00, 0x00});
+
+    // _len_ok at 0x57
+    // 0x057: movzx ecx, byte [rip+kind_byte]   ; kind at 0x330, disp=0x2D2
+    emitBytes(code, {0x0F, 0xB6, 0x0D, 0xD2, 0x02, 0x00, 0x00});
+    // 0x05E: mov [rsp+0x40], cl
+    emitBytes(code, {0x88, 0x4C, 0x24, 0x40});
+    // 0x062: mov r11d, eax                 ; stash wchar count
+    emitBytes(code, {0x41, 0x89, 0xC3});
+
+    // --- WideCharToMultiByte(CP_UTF8, 0, Buffer, cchWide, outBuf, 800, NULL, NULL)
+    // 0x065: mov ecx, 65001                ; CP_UTF8
+    emitBytes(code, {0xB9, 0xE9, 0xFD, 0x00, 0x00});
+    // 0x06A: xor edx, edx                  ; flags = 0
+    emitBytes(code, {0x33, 0xD2});
+    // 0x06C: mov r8, [rsp+0x468]           ; PUNICODE_STRING
+    emitBytes(code, {0x4C, 0x8B, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});
+    // 0x074: mov r8, [r8+8]                ; Buffer
+    emitBytes(code, {0x4D, 0x8B, 0x40, 0x08});
+    // 0x078: mov r9d, r11d                 ; cchWideChar
+    emitBytes(code, {0x45, 0x89, 0xD9});
+    // 0x07B: lea rax, [rsp+0x41]           ; outBuf
+    emitBytes(code, {0x48, 0x8D, 0x44, 0x24, 0x41});
+    // 0x080: mov [rsp+0x20], rax
+    emitBytes(code, {0x48, 0x89, 0x44, 0x24, 0x20});
+    // 0x085: mov dword [rsp+0x28], 800     ; cbMultiByte
+    emitBytes(code, {0xC7, 0x44, 0x24, 0x28, 0x20, 0x03, 0x00, 0x00});
+    // 0x08D: mov qword [rsp+0x30], 0       ; lpDefaultChar
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00});
+    // 0x096: mov qword [rsp+0x38], 0       ; lpUsedDefaultChar
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x38, 0x00, 0x00, 0x00, 0x00});
+    // 0x09F: mov rax, [rip+fn_WideCharToMultiByte]   ; slot 0x328, disp=0x282
+    emitBytes(code, {0x48, 0x8B, 0x05, 0x82, 0x02, 0x00, 0x00});
+    // 0x0A6: call rax
+    emitBytes(code, {0xFF, 0xD0});
+
+    // 0x0A8: test eax, eax
+    emitBytes(code, {0x85, 0xC0});
+    // 0x0AA: je _allow_direct (rel32, disp=0xF4) — conversion failure → fail-open
+    emitBytes(code, {0x0F, 0x84, 0xF4, 0x00, 0x00, 0x00});
+
+    // 0x0B0: mov r11d, eax                 ; UTF-8 byte count
+    emitBytes(code, {0x41, 0x89, 0xC3});
+    // 0x0B3: mov byte [rsp+r11+0x41], 0x0A ; append newline terminator
+    emitBytes(code, {0x42, 0xC6, 0x84, 0x1C, 0x41, 0x00, 0x00, 0x00, 0x0A});
+
+    // --- CreateFileA(pipe, GENERIC_READ|WRITE, 0, NULL, OPEN_EXISTING, 0, NULL)
+    // 0x0BC: lea rcx, [rip+pipe_name]      ; pipe_name at 0x340, disp=0x27D
+    emitBytes(code, {0x48, 0x8D, 0x0D, 0x7D, 0x02, 0x00, 0x00});
+    // 0x0C3: mov edx, 0xC0000000
+    emitBytes(code, {0xBA, 0x00, 0x00, 0x00, 0xC0});
+    // 0x0C8: xor r8d, r8d
+    emitBytes(code, {0x45, 0x33, 0xC0});
+    // 0x0CB: xor r9d, r9d
+    emitBytes(code, {0x45, 0x33, 0xC9});
+    // 0x0CE: mov dword [rsp+0x20], 3       ; OPEN_EXISTING
+    emitBytes(code, {0xC7, 0x44, 0x24, 0x20, 0x03, 0x00, 0x00, 0x00});
+    // 0x0D6: mov dword [rsp+0x28], 0
+    emitBytes(code, {0xC7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00});
+    // 0x0DE: mov qword [rsp+0x30], 0
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00});
+    // 0x0E7: mov rax, [rip+fn_CreateFileA] ; slot 0x300, disp=0x212
+    emitBytes(code, {0x48, 0x8B, 0x05, 0x12, 0x02, 0x00, 0x00});
+    // 0x0EE: call rax
+    emitBytes(code, {0xFF, 0xD0});
+
+    // 0x0F0: cmp rax, -1
+    emitBytes(code, {0x48, 0x83, 0xF8, 0xFF});
+    // 0x0F4: je _allow_direct (rel32, disp=0xAA)
+    emitBytes(code, {0x0F, 0x84, 0xAA, 0x00, 0x00, 0x00});
+    // 0x0FA: mov [rsp+0x440], rax
+    emitBytes(code, {0x48, 0x89, 0x84, 0x24, 0x40, 0x04, 0x00, 0x00});
+
+    // --- WriteFile(handle, &buf[0x40], r11+2, &wrote, NULL)
+    // 0x102: mov rcx, [rsp+0x440]
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x40, 0x04, 0x00, 0x00});
+    // 0x10A: lea rdx, [rsp+0x40]
+    emitBytes(code, {0x48, 0x8D, 0x54, 0x24, 0x40});
+    // 0x10F: lea r8, [r11+2]                ; kind byte + path + '\n'
+    emitBytes(code, {0x4D, 0x8D, 0x43, 0x02});
+    // 0x113: lea r9, [rsp+0x448]
+    emitBytes(code, {0x4C, 0x8D, 0x8C, 0x24, 0x48, 0x04, 0x00, 0x00});
+    // 0x11B: mov qword [rsp+0x20], 0
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00});
+    // 0x124: mov rax, [rip+fn_WriteFile]    ; slot 0x308, disp=0x1DD
+    emitBytes(code, {0x48, 0x8B, 0x05, 0xDD, 0x01, 0x00, 0x00});
+    // 0x12B: call rax
+    emitBytes(code, {0xFF, 0xD0});
+
+    // 0x12D: test eax, eax
+    emitBytes(code, {0x85, 0xC0});
+    // 0x12F: je _close_and_allow (rel32 -> 0x193, disp=0x5E)
+    emitBytes(code, {0x0F, 0x84, 0x5E, 0x00, 0x00, 0x00});
+
+    // --- ReadFile(handle, &reply, 1, &got, NULL)
+    // 0x135: mov rcx, [rsp+0x440]
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x40, 0x04, 0x00, 0x00});
+    // 0x13D: lea rdx, [rsp+0x450]
+    emitBytes(code, {0x48, 0x8D, 0x94, 0x24, 0x50, 0x04, 0x00, 0x00});
+    // 0x145: mov r8d, 1
+    emitBytes(code, {0x41, 0xB8, 0x01, 0x00, 0x00, 0x00});
+    // 0x14B: lea r9, [rsp+0x44C]
+    emitBytes(code, {0x4C, 0x8D, 0x8C, 0x24, 0x4C, 0x04, 0x00, 0x00});
+    // 0x153: mov qword [rsp+0x20], 0
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00});
+    // 0x15C: mov rax, [rip+fn_ReadFile]     ; slot 0x310, disp=0x1AD
+    emitBytes(code, {0x48, 0x8B, 0x05, 0xAD, 0x01, 0x00, 0x00});
+    // 0x163: call rax
+    emitBytes(code, {0xFF, 0xD0});
+
+    // 0x165: test eax, eax
+    emitBytes(code, {0x85, 0xC0});
+    // 0x167: je _close_and_allow (rel32 -> 0x193, disp=0x26)
+    emitBytes(code, {0x0F, 0x84, 0x26, 0x00, 0x00, 0x00});
+
+    // 0x16D: mov rcx, [rsp+0x440]
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x40, 0x04, 0x00, 0x00});
+    // 0x175: mov rax, [rip+fn_CloseHandle]  ; slot 0x318, disp=0x19C
+    emitBytes(code, {0x48, 0x8B, 0x05, 0x9C, 0x01, 0x00, 0x00});
+    // 0x17C: call rax
+    emitBytes(code, {0xFF, 0xD0});
+
+    // 0x17E: movzx eax, byte [rsp+0x450]
+    emitBytes(code, {0x0F, 0xB6, 0x84, 0x24, 0x50, 0x04, 0x00, 0x00});
+    // 0x186: cmp al, '0'
+    emitBytes(code, {0x3C, 0x30});
+    // 0x188: je _block (rel32 -> 0x1D6, disp=0x48)
+    emitBytes(code, {0x0F, 0x84, 0x48, 0x00, 0x00, 0x00});
+    // 0x18E: jmp _allow_direct (rel32 -> 0x1A4, disp=0x11)
+    emitBytes(code, {0xE9, 0x11, 0x00, 0x00, 0x00});
+
+    // _close_and_allow at 0x193
+    // 0x193: mov rcx, [rsp+0x440]
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x40, 0x04, 0x00, 0x00});
+    // 0x19B: mov rax, [rip+fn_CloseHandle]  ; slot 0x318, disp=0x176
+    emitBytes(code, {0x48, 0x8B, 0x05, 0x76, 0x01, 0x00, 0x00});
+    // 0x1A2: call rax
+    emitBytes(code, {0xFF, 0xD0});
+    // fallthrough to _allow_direct
+
+    // _allow_direct at 0x1A4
+    // 0x1A4: mov rcx, [rsp+0x458]
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x58, 0x04, 0x00, 0x00});
+    // 0x1AC: mov rdx, [rsp+0x460]
+    emitBytes(code, {0x48, 0x8B, 0x94, 0x24, 0x60, 0x04, 0x00, 0x00});
+    // 0x1B4: mov r8, [rsp+0x468]
+    emitBytes(code, {0x4C, 0x8B, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});
+    // 0x1BC: mov r9, [rsp+0x470]
+    emitBytes(code, {0x4C, 0x8B, 0x8C, 0x24, 0x70, 0x04, 0x00, 0x00});
+    // 0x1C4: add rsp, 0x478
+    emitBytes(code, {0x48, 0x81, 0xC4, 0x78, 0x04, 0x00, 0x00});
+    // 0x1CB: <5 saved prologue bytes>
+    for (int i = 0; i < 5; i++) code.push_back(savedPrologue[i]);
+    // 0x1D0: jmp qword [rip+abs_orig_plus_5] ; slot 0x320, disp=0x14A
+    emitBytes(code, {0xFF, 0x25, 0x4A, 0x01, 0x00, 0x00});
+
+    // _block at 0x1D6
+    // 0x1D6: add rsp, 0x478
+    emitBytes(code, {0x48, 0x81, 0xC4, 0x78, 0x04, 0x00, 0x00});
+    // 0x1DD: mov eax, 0xC0000135            ; STATUS_DLL_NOT_FOUND
+    emitBytes(code, {0xB8, 0x35, 0x01, 0x00, 0xC0});
+    // 0x1E2: ret
+    emitBytes(code, {0xC3});
+
+    if (code.size() > 0x300) {
+        FVM_LOG("buildLdrLoadDllTrampoline: code too large (%zu bytes)", code.size());
+        return {};
+    }
+    for (size_t i = 0; i < code.size(); i++) buf[i] = code[i];
+
+    writeU64(buf, 0x300, fnCreateFileA);
+    writeU64(buf, 0x308, fnWriteFile);
+    writeU64(buf, 0x310, fnReadFile);
+    writeU64(buf, 0x318, fnCloseHandle);
+    writeU64(buf, 0x320, origPlus5);
+    writeU64(buf, 0x328, fnWideCharToMultiByte);
+    buf[0x330] = static_cast<uint8_t>('N');
+
+    size_t pn = 0;
+    if (pipeName != nullptr) {
+        while (pipeName[pn] != '\0' && pn < 127) {
+            buf[0x340 + pn] = static_cast<uint8_t>(pipeName[pn]);
+            pn++;
+        }
+    }
+    buf[0x340 + pn] = 0;
+
+    return buf;
+}
+
+static int installLdrLoadDllFilter(PatchState& state, const char* pipeName) {
+    if (!g_target.structMapReady) {
+        setError("not_bootstrapped");
+        return 0;
+    }
+    if (state.patched) {
+        setError("already_patched");
+        return 0;
+    }
+    if (pipeName == nullptr || pipeName[0] == '\0') {
+        setError("missing_pipe_name");
+        return 0;
+    }
+
+    HANDLE proc = g_target.handle;
+    uint64_t addr = resolveNtdllExport(proc, "LdrLoadDll");
+    if (addr == 0) {
+        setError("export_not_found");
+        return 0;
+    }
+    FVM_LOG("ban_native_load: ntdll!LdrLoadDll @ 0x%llX", (unsigned long long)addr);
+
+    uint8_t saved5[5] = {};
+    if (!readRemoteMem(proc, addr, saved5, 5)) {
+        setError("read_original_failed");
+        return 0;
+    }
+    FVM_LOG("ban_native_load: original prologue: %02X %02X %02X %02X %02X",
+            saved5[0], saved5[1], saved5[2], saved5[3], saved5[4]);
+
+    uint8_t b0 = saved5[0];
+    bool dangerous = (b0 == 0xE8) || (b0 == 0xE9) || (b0 == 0xEB) ||
+                     (b0 >= 0x70 && b0 <= 0x7F) || (b0 == 0xFF);
+    if (dangerous) {
+        setError("unsafe_prologue");
+        return 0;
+    }
+
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (!k32) {
+        setError("kernel32_not_loaded");
+        return 0;
+    }
+    uint64_t fnCreate = reinterpret_cast<uint64_t>(GetProcAddress(k32, "CreateFileA"));
+    uint64_t fnWrite  = reinterpret_cast<uint64_t>(GetProcAddress(k32, "WriteFile"));
+    uint64_t fnRead   = reinterpret_cast<uint64_t>(GetProcAddress(k32, "ReadFile"));
+    uint64_t fnClose  = reinterpret_cast<uint64_t>(GetProcAddress(k32, "CloseHandle"));
+    uint64_t fnWcm    = reinterpret_cast<uint64_t>(GetProcAddress(k32, "WideCharToMultiByte"));
+    if (!fnCreate || !fnWrite || !fnRead || !fnClose || !fnWcm) {
+        setError("kernel32_resolve_failed");
+        return 0;
+    }
+
+    const size_t kPage = 0x400;
+    uint64_t allocHint = findFreeRegionNear(proc, addr, kPage);
+    if (allocHint == 0) {
+        setError("no_nearby_free_region");
+        return 0;
+    }
+    void* allocated = VirtualAllocEx(proc, reinterpret_cast<LPVOID>(allocHint), kPage,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!allocated) {
+        setError("virtual_alloc_failed");
+        return 0;
+    }
+    uint64_t trampAddr = reinterpret_cast<uint64_t>(allocated);
+
+    int64_t delta = static_cast<int64_t>(trampAddr) - static_cast<int64_t>(addr + 5);
+    if (delta < static_cast<int64_t>(INT32_MIN) || delta > static_cast<int64_t>(INT32_MAX)) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("tramp_out_of_rel32_range");
+        return 0;
+    }
+    FVM_LOG("ban_native_load: trampoline @ 0x%llX (delta=%lld)",
+            (unsigned long long)trampAddr, (long long)delta);
+
+    std::vector<uint8_t> image = buildLdrLoadDllTrampoline(
+        saved5, addr + 5, fnCreate, fnWrite, fnRead, fnClose, fnWcm, pipeName);
+    if (image.empty()) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("trampoline_build_failed");
+        return 0;
+    }
+    if (!writeRemoteMem(proc, trampAddr, image.data(), image.size())) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("trampoline_write_failed");
+        return 0;
+    }
+    FlushInstructionCache(proc, reinterpret_cast<LPCVOID>(trampAddr), image.size());
+
+    uint8_t patch[5];
+    patch[0] = 0xE9;
+    int32_t rel = static_cast<int32_t>(delta);
+    patch[1] = static_cast<uint8_t>(rel);
+    patch[2] = static_cast<uint8_t>(rel >> 8);
+    patch[3] = static_cast<uint8_t>(rel >> 16);
+    patch[4] = static_cast<uint8_t>(rel >> 24);
+
+    if (!writeRemoteCode(proc, addr, patch, sizeof(patch))) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("write_patch_failed");
+        return 0;
+    }
+
+    uint8_t verify[5] = {};
+    readRemoteMem(proc, addr, verify, sizeof(verify));
+    if (memcmp(verify, patch, sizeof(patch)) != 0) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("verify_failed");
+        return 0;
+    }
+
+    state.targetAddr = addr;
+    state.patchSize = 5;
+    memcpy(state.original, saved5, 5);
+    state.patched = true;
+    state.trampolineAddr = trampAddr;
+    state.trampolineSize = kPage;
+    state.trampolineInstalled = true;
+
+    FVM_LOG("ban_native_load: installed LdrLoadDll trampoline + E9 patch (verified)");
+    setError("ok");
+    return 1;
+}
+
+extern "C" __declspec(dllexport) int forgevm_ban_java_agent(const char* pipeName) {
+    return installFilterTrampoline(g_javaAgentPatch, "JVM_EnqueueOperation",
+                                    /*pathInRdx=*/true, 'A', pipeName, "ban_java_agent");
+}
+
+extern "C" __declspec(dllexport) int forgevm_unban_java_agent() {
+    return uninstallFilterTrampoline(g_javaAgentPatch, "unban_java_agent");
+}
+
+extern "C" __declspec(dllexport) int forgevm_ban_native_load(const char* pipeName) {
+    return installLdrLoadDllFilter(g_nativeLoadPatch, pipeName);
+}
+
+extern "C" __declspec(dllexport) int forgevm_unban_native_load() {
+    return uninstallFilterTrampoline(g_nativeLoadPatch, "unban_native_load");
 }

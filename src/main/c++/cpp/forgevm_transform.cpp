@@ -803,6 +803,75 @@ static uint64_t allocateSymbolInTarget(const std::string& str) {
 }
 
 // ============================================================
+// Phase 1 invalidation: clear stale profiling state on Method*
+//
+// After replacing ConstMethod, the existing MDO is keyed against the
+// OLD bytecode's BCIs. If C1/C2 reads it during recompile, ciMethodData
+// hits ShouldNotReachHere(). Counters likewise reflect the old shape.
+//
+//   _method_data     = NULL  -> fresh MDO allocated on next compile
+//   _method_counters = NULL  -> invocation count restarts
+//   _flags |= 0x4 (_dont_inline) -> blocks stale inlines until callers
+//                                   are deopted (Phase 2)
+//
+// _flags is not always in VMStructs; skip silently if absent.
+// ============================================================
+static void clearMethodProfilingState(uint64_t methodAddr, bool setDontInline,
+                                      const char* logPrefix) {
+    HANDLE proc = g_target.handle;
+
+    int64_t mdoOff = structOffset("Method", "_method_data");
+    if (mdoOff >= 0) {
+        uint64_t zero = 0;
+        if (writeRemoteMem(proc, methodAddr + (uint64_t)mdoOff, &zero, 8)) {
+            FVM_LOG("%s: cleared Method::_method_data (offset %lld)",
+                    logPrefix, (long long)mdoOff);
+        } else {
+            FVM_LOG("%s: WARN failed to clear Method::_method_data", logPrefix);
+        }
+    } else {
+        FVM_LOG("%s: WARN Method::_method_data not in VMStructs, skipped", logPrefix);
+    }
+
+    int64_t mcOff = structOffset("Method", "_method_counters");
+    if (mcOff >= 0) {
+        uint64_t zero = 0;
+        if (writeRemoteMem(proc, methodAddr + (uint64_t)mcOff, &zero, 8)) {
+            FVM_LOG("%s: cleared Method::_method_counters (offset %lld)",
+                    logPrefix, (long long)mcOff);
+        } else {
+            FVM_LOG("%s: WARN failed to clear Method::_method_counters", logPrefix);
+        }
+    } else {
+        FVM_LOG("%s: WARN Method::_method_counters not in VMStructs, skipped", logPrefix);
+    }
+
+    if (setDontInline) {
+        int64_t flagsOff = structOffset("Method", "_flags");
+        if (flagsOff >= 0) {
+            uint16_t flags = 0;
+            if (readRemoteMem(proc, methodAddr + (uint64_t)flagsOff, &flags, 2)) {
+                uint16_t newFlags = (uint16_t)(flags | 0x4); // _dont_inline
+                if (newFlags == flags) {
+                    FVM_LOG("%s: _dont_inline already set (Method::_flags = 0x%X)",
+                            logPrefix, (unsigned)flags);
+                } else if (writeRemoteMem(proc, methodAddr + (uint64_t)flagsOff, &newFlags, 2)) {
+                    FVM_LOG("%s: set _dont_inline (Method::_flags 0x%X -> 0x%X, offset %lld)",
+                            logPrefix, (unsigned)flags, (unsigned)newFlags, (long long)flagsOff);
+                } else {
+                    FVM_LOG("%s: WARN failed to write Method::_flags", logPrefix);
+                }
+            } else {
+                FVM_LOG("%s: WARN failed to read Method::_flags", logPrefix);
+            }
+        } else {
+            FVM_LOG("%s: NOTE Method::_flags not in VMStructs, _dont_inline skipped",
+                    logPrefix);
+        }
+    }
+}
+
+// ============================================================
 // Apply transform
 // ============================================================
 
@@ -2161,6 +2230,10 @@ int applyTransform(const char* className, const char* methodName, const char* pa
         FVM_LOG("WARN: _from_interpreted_entry not in VMStructs, cannot reset");
     }
 
+    // Phase 1 invalidation: clear MDO/counters and set _dont_inline before
+    // resuming threads, so any compile triggered after resume sees a clean slate.
+    clearMethodProfilingState(methodAddr, /*setDontInline=*/true, "TRANSFORM");
+
     resumeTargetThreads(threadIds);
     FVM_LOG("resumed %zu threads", threadIds.size());
 
@@ -2312,6 +2385,11 @@ int restoreTransform(const char* className, const char* methodName, const char* 
             FVM_LOG("zeroed _from_interpreted_entry (offset %lld)", (long long)fromInterpOff);
         }
     }
+
+    // Phase 1 invalidation: profile recorded against the patched bytecode is
+    // also invalid for the restored original; clear MDO/counters. _dont_inline
+    // is left as-is (we don't track its original value).
+    clearMethodProfilingState(backup.methodAddr, /*setDontInline=*/false, "RESTORE");
 
     resumeTargetThreads(threadIds);
     FVM_LOG("resumed %zu threads", threadIds.size());

@@ -1,48 +1,59 @@
 package forgevm.jvm;
 
-public class NativeFilter {
+import java.util.List;
 
-    public enum Mode { BLOCK_ALL, BLACKLIST, WHITELIST }
+/**
+ * Filter for native library loading attempts.
+ *
+ * <p>Matching is performed against the library path passed to
+ * {@code System.load} / {@code System.loadLibrary} / {@code Runtime.load*}.
+ * Patterns use glob syntax: {@code *} matches any sequence, {@code ?} matches a single char.
+ *
+ * <pre>{@code
+ * // block any DLL whose path contains "cheat":
+ * ForgeVM.banNativeLoad(NativeFilter.Blacklist("*cheat*"));
+ *
+ * // allow only lwjgl natives, block everything else:
+ * ForgeVM.banNativeLoad(NativeFilter.Whitelist("lwjgl*", "*lwjgl*.dll"));
+ *
+ * // multiple patterns:
+ * ForgeVM.banNativeLoad(NativeFilter.Blacklist("*hack*.dll", "*inject*.dll"));
+ * }</pre>
+ */
+public final class NativeFilter {
 
-    /** Sentinel instance for blocking all native library loading. */
-    static final NativeFilter BLOCK_ALL_INSTANCE = new NativeFilter(Mode.BLOCK_ALL);
+    public enum Mode { BLACKLIST, WHITELIST }
 
     private final Mode mode;
-    private final String[] patterns;
+    private final List<String> patterns;
 
-    private NativeFilter(Mode mode, String... patterns) {
+    private NativeFilter(Mode mode, List<String> patterns) {
         this.mode = mode;
-        this.patterns = patterns != null ? patterns : new String[0];
+        this.patterns = patterns;
     }
 
-    /**
-     * Block native libraries whose path or name matches any of the given glob patterns.
-     * <p>Examples: {@code "badmod*"}, {@code "*cheat*.dll"}
-     */
-    public static NativeFilter Blacklist(String... globs) {
-        if (globs == null || globs.length == 0) {
-            throw new IllegalArgumentException("Blacklist requires at least one pattern");
+    /** Block libraries matching any of the given patterns. Allow everything else. */
+    public static NativeFilter Blacklist(String... patterns) {
+        return build(Mode.BLACKLIST, patterns);
+    }
+
+    /** Allow only libraries matching any of the given patterns. Block everything else. */
+    public static NativeFilter Whitelist(String... patterns) {
+        return build(Mode.WHITELIST, patterns);
+    }
+
+    public Mode mode() { return mode; }
+    public List<String> patterns() { return patterns; }
+
+    private static NativeFilter build(Mode mode, String[] patterns) {
+        if (patterns == null || patterns.length == 0) {
+            throw new IllegalArgumentException("patterns must not be empty");
         }
-        return new NativeFilter(Mode.BLACKLIST, globs);
-    }
-
-    /**
-     * Only allow native libraries whose path or name matches at least one of the given glob patterns.
-     * All others are blocked.
-     * <p>Examples: {@code "forgevm*"}, {@code "lwjgl*"}
-     */
-    public static NativeFilter Whitelist(String... globs) {
-        if (globs == null || globs.length == 0) {
-            throw new IllegalArgumentException("Whitelist requires at least one pattern");
+        for (String p : patterns) {
+            if (p == null || p.isBlank()) {
+                throw new IllegalArgumentException("pattern must not be null or blank");
+            }
         }
-        return new NativeFilter(Mode.WHITELIST, globs);
-    }
-
-    public Mode mode() {
-        return mode;
-    }
-
-    public String[] patterns() {
-        return patterns;
+        return new NativeFilter(mode, List.of(patterns));
     }
 }

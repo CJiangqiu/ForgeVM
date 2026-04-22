@@ -28,7 +28,6 @@ void fvm_log_hex(const char* label, const void* data, size_t len);
 // ============================================================
 
 extern std::string g_lastError;
-extern bool g_promptApproved;
 
 void setError(const char* value);
 void setError(const std::string& value);
@@ -190,9 +189,7 @@ bool resolveAndCacheField(const char* fieldName, uint64_t objAddr,
 // Privilege helpers
 // ============================================================
 
-bool isAdmin();
 bool enableDebugPrivilege();
-int resolveCapabilityByToken();
 
 // ============================================================
 // Module / PE helpers
