@@ -1,10 +1,10 @@
 package forgevm.forge;
 
 /**
- * Base class for ForgeVM bytecode ingots — code pieces forged into target methods.
+ * Base class for ForgeVM bytecode ingots -- code pieces forged into target methods.
  *
  * <p>An ingot intercepts a target method at runtime by rewriting its bytecode
- * in the target JVM's memory. No {@code java.lang.instrument}, no JVMTI — ForgeVM
+ * in the target JVM's memory. No {@code java.lang.instrument}, no JVMTI -- ForgeVM
  * operates entirely out-of-process through its native Agent.
  *
  * <h2>How to use</h2>
@@ -21,19 +21,19 @@ package forgevm.forge;
  *
  * <h2>Method string format</h2>
  * <ul>
- *   <li>{@code "processOrder"} — single no-arg method</li>
- *   <li>{@code "processOrder,a_42"} — multiple candidates (comma-separated, tried in order)</li>
- *   <li>{@code "attack(F)"} — method with a float parameter (JVM descriptor)</li>
- *   <li>{@code "a_56(F),applyDamage(F)"} — multiple candidates with params</li>
- *   <li>{@code "process(Ljava/lang/String;I)"} — String + int params</li>
+ *   <li>{@code "processOrder"} -- single no-arg method</li>
+ *   <li>{@code "processOrder,a_42"} -- multiple candidates (comma-separated, tried in order)</li>
+ *   <li>{@code "attack(F)"} -- method with a float parameter (JVM descriptor)</li>
+ *   <li>{@code "a_56(F),applyDamage(F)"} -- multiple candidates with params</li>
+ *   <li>{@code "process(Ljava/lang/String;I)"} -- String + int params</li>
  * </ul>
  *
  * <h2>Hook method behavior</h2>
  * <ul>
- *   <li>Call {@link FvmCallback#setReturnValue(Object)} — skip the original method
+ *   <li>Call {@link FvmCallback#setReturnValue(Object)} -- skip the original method
  *       and return the given value (boxed primitives for primitive return types).</li>
- *   <li>Call {@link FvmCallback#cancel()} — skip the original method (void methods).</li>
- *   <li>Call neither — the original method executes normally after the hook returns.</li>
+ *   <li>Call {@link FvmCallback#cancel()} -- skip the original method (void methods).</li>
+ *   <li>Call neither -- the original method executes normally after the hook returns.</li>
  * </ul>
  *
  * <h2>Subclass propagation</h2>
@@ -42,7 +42,7 @@ package forgevm.forge;
  *
  * <h2>Examples</h2>
  *
- * <p><b>Simplest form</b> — intercept a no-arg method at HEAD:
+ * <p><b>Simplest form</b> -- intercept a no-arg method at HEAD:
  * <pre>{@code
  * public class ProcessLogger extends FvmIngot {
  *     public ProcessLogger() {
@@ -55,7 +55,7 @@ package forgevm.forge;
  * }
  * }</pre>
  *
- * <p><b>Override return value</b> — with obfuscation candidates:
+ * <p><b>Override return value</b> -- with obfuscation candidates:
  * <pre>{@code
  * public class RetryCountOverride extends FvmIngot {
  *     public RetryCountOverride() {
@@ -158,7 +158,7 @@ public abstract class FvmIngot {
 
     /**
      * Whether to automatically forge all loaded subclasses that override the target method.
-     * Default is {@code false} — only the specified class is forged.
+     * Default is {@code false} -- only the specified class is forged.
      *
      * <p>Override to return {@code true} to enable subclass propagation:
      * <pre>{@code

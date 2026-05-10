@@ -7,11 +7,11 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 /**
- * ForgeVM field memory API — path-based, zero JVM native API dependency.
+ * ForgeVM field memory API -- path-based, zero JVM native API dependency.
  *
  * <p>All field resolution and memory writes are performed by the native Agent
  * process via ReadProcessMemory/WriteProcessMemory. Java side only sends
- * string descriptors — no Unsafe, no reflection, no JVM API.
+ * string descriptors -- no Unsafe, no reflection, no JVM API.
  *
  * <p><b>Usage</b></p>
  * <pre>
@@ -106,7 +106,7 @@ public final class MemoryUtil {
      * Set a reference field to null. Automatically handles GC card table update.
      */
     public void putNullField(String className, String fieldChain) {
-        // Send 8 zero bytes — DLL will use correct size (4 or 8) based on compressed oops
+        // Send 8 zero bytes -- DLL will use correct size (4 or 8) based on compressed oops
         sendPutFieldPath(className, fieldChain, new byte[8]);
     }
 

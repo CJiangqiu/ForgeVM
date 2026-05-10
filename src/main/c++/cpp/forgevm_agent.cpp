@@ -8,6 +8,8 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <unordered_map>
+#include <functional>
 #include <cstdio>
 #include <cstdarg>
 
@@ -64,16 +66,21 @@ typedef int(__cdecl* PutFieldFn)(unsigned long long, const char*, const char*, c
 typedef int(__cdecl* PutFieldBatchFn)(const unsigned long long*, unsigned long long, const char*, const char*, const unsigned char*, unsigned long long);
 typedef void(__cdecl* SetLogDirFn)(const char*);
 typedef int(__cdecl* TransformLoadFn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*);
+typedef int(__cdecl* TransformLoadV2Fn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*, int);
 typedef int(__cdecl* TransformUnloadFn)(const char*, const char*, const char*);
+typedef int(__cdecl* ForceDeoptNowFn)();
 typedef int(__cdecl* PurgeAgentFn)(const char*);
 typedef int(__cdecl* PutFieldPathFn)(const char*, const char*, const unsigned char*, unsigned long long);
 typedef int(__cdecl* ForgeSubclassLoadFn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*);
+typedef int(__cdecl* ForgeSubclassLoadV2Fn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*, int);
 typedef int(__cdecl* ForgeSubclassUnloadFn)(const char*, const char*, const char*);
 typedef int(__cdecl* PutObjectFieldPathFn)(const char*, const char*, const char*, const char*);
 typedef int(__cdecl* BanJavaAgentFn)(const char*);
 typedef int(__cdecl* UnbanJavaAgentFn)();
 typedef int(__cdecl* BanNativeLoadFn)(const char*);
 typedef int(__cdecl* UnbanNativeLoadFn)();
+typedef int(__cdecl* ForgeClassPlanFn)(const char*, const char*, int, int, char*, int);
+typedef int(__cdecl* ForgeClassUnloadFn)(const char*, int);
 
 namespace {
 struct NativeApi {
@@ -93,16 +100,21 @@ struct NativeApi {
     ProbeFn dumpCardStructs = NULL;
     SetLogDirFn setLogDir = NULL;
     TransformLoadFn transformLoad = NULL;
+    TransformLoadV2Fn transformLoadV2 = NULL;
     TransformUnloadFn transformUnload = NULL;
+    ForceDeoptNowFn forceDeoptNow = NULL;
     PurgeAgentFn purgeAgent = NULL;
     PutFieldPathFn putFieldPath = NULL;
     ForgeSubclassLoadFn forgeSubLoad = NULL;
+    ForgeSubclassLoadV2Fn forgeSubLoadV2 = NULL;
     ForgeSubclassUnloadFn forgeSubUnload = NULL;
     PutObjectFieldPathFn putObjectFieldPath = NULL;
     BanJavaAgentFn banJavaAgent = NULL;
     UnbanJavaAgentFn unbanJavaAgent = NULL;
     BanNativeLoadFn banNativeLoad = NULL;
     UnbanNativeLoadFn unbanNativeLoad = NULL;
+    ForgeClassPlanFn forgeClassPlan = NULL;
+    ForgeClassUnloadFn forgeClassUnload = NULL;
 };
 
 struct AgentLockState {
@@ -391,6 +403,86 @@ std::vector<unsigned long long> parseJsonUint64Array(const std::string& line, co
     return result;
 }
 
+// Returns the index of the matching '}' for the '{' at openIdx, or npos.
+// String/escape-aware so quoted braces don't confuse depth counting.
+size_t findMatchingBrace(const std::string& s, size_t openIdx) {
+    int depth = 0;
+    bool inString = false;
+    bool escaped = false;
+    for (size_t i = openIdx; i < s.size(); ++i) {
+        char c = s[i];
+        if (escaped) { escaped = false; continue; }
+        if (inString) {
+            if (c == '\\') escaped = true;
+            else if (c == '"') inString = false;
+            continue;
+        }
+        if (c == '"') inString = true;
+        else if (c == '{') depth++;
+        else if (c == '}') {
+            depth--;
+            if (depth == 0) return i;
+        }
+    }
+    return std::string::npos;
+}
+
+// Extract the contents of "key":[...] (between [ and ], exclusive). Returns
+// empty string if the array is absent or malformed. String/escape-aware.
+std::string extractArrayInner(const std::string& s, const std::string& key) {
+    std::string pat = "\"" + key + "\":[";
+    size_t i = s.find(pat);
+    if (i == std::string::npos) return std::string();
+    size_t start = i + pat.size();
+    int depth = 1;
+    bool inString = false;
+    bool escaped = false;
+    for (size_t j = start; j < s.size(); ++j) {
+        char c = s[j];
+        if (escaped) { escaped = false; continue; }
+        if (inString) {
+            if (c == '\\') escaped = true;
+            else if (c == '"') inString = false;
+            continue;
+        }
+        if (c == '"') inString = true;
+        else if (c == '[') depth++;
+        else if (c == ']') {
+            depth--;
+            if (depth == 0) return s.substr(start, j - start);
+        }
+    }
+    return std::string();
+}
+
+// Iterate top-level JSON objects in arrayInner, calling cb with each object's
+// substring (including the outer braces). Other characters between objects
+// (commas, whitespace) are skipped.
+template<typename F>
+void forEachJsonObject(const std::string& arrayInner, F cb) {
+    size_t i = 0;
+    while (i < arrayInner.size()) {
+        char c = arrayInner[i];
+        if (c == '{') {
+            size_t end = findMatchingBrace(arrayInner, i);
+            if (end == std::string::npos) return;
+            cb(arrayInner.substr(i, end - i + 1));
+            i = end + 1;
+        } else {
+            ++i;
+        }
+    }
+}
+
+// "true" / "false" lookup for "key":<bool>. Returns fallback if not found.
+bool getJsonBoolField(const std::string& s, const std::string& key, bool fallback) {
+    std::string truePat  = "\"" + key + "\":true";
+    std::string falsePat = "\"" + key + "\":false";
+    if (s.find(truePat)  != std::string::npos) return true;
+    if (s.find(falsePat) != std::string::npos) return false;
+    return fallback;
+}
+
 bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUtf8, NativeApi* api, std::string* reason) {
     if (wideDllPath.empty()) { *reason = "dll_path_empty"; return false; }
 
@@ -417,16 +509,21 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->setLogDir       = reinterpret_cast<SetLogDirFn>(GetProcAddress(module, "forgevm_set_log_dir"));
     api->dumpCardStructs = reinterpret_cast<ProbeFn>(GetProcAddress(module, "forgevm_dump_card_structs"));
     api->transformLoad   = reinterpret_cast<TransformLoadFn>(GetProcAddress(module, "forgevm_transform_load"));
+    api->transformLoadV2 = reinterpret_cast<TransformLoadV2Fn>(GetProcAddress(module, "forgevm_transform_load_v2"));
     api->transformUnload = reinterpret_cast<TransformUnloadFn>(GetProcAddress(module, "forgevm_transform_unload"));
+    api->forceDeoptNow   = reinterpret_cast<ForceDeoptNowFn>(GetProcAddress(module, "forgevm_force_deopt_now"));
     api->purgeAgent      = reinterpret_cast<PurgeAgentFn>(GetProcAddress(module, "forgevm_purge_agent"));
     api->putFieldPath    = reinterpret_cast<PutFieldPathFn>(GetProcAddress(module, "forgevm_put_field_path"));
     api->forgeSubLoad    = reinterpret_cast<ForgeSubclassLoadFn>(GetProcAddress(module, "forgevm_forge_load_subclasses"));
+    api->forgeSubLoadV2  = reinterpret_cast<ForgeSubclassLoadV2Fn>(GetProcAddress(module, "forgevm_forge_load_subclasses_v2"));
     api->forgeSubUnload  = reinterpret_cast<ForgeSubclassUnloadFn>(GetProcAddress(module, "forgevm_forge_unload_subclasses"));
     api->putObjectFieldPath = reinterpret_cast<PutObjectFieldPathFn>(GetProcAddress(module, "forgevm_put_object_field_path"));
     api->banJavaAgent    = reinterpret_cast<BanJavaAgentFn>(GetProcAddress(module, "forgevm_ban_java_agent"));
     api->unbanJavaAgent  = reinterpret_cast<UnbanJavaAgentFn>(GetProcAddress(module, "forgevm_unban_java_agent"));
     api->banNativeLoad   = reinterpret_cast<BanNativeLoadFn>(GetProcAddress(module, "forgevm_ban_native_load"));
     api->unbanNativeLoad = reinterpret_cast<UnbanNativeLoadFn>(GetProcAddress(module, "forgevm_unban_native_load"));
+    api->forgeClassPlan   = reinterpret_cast<ForgeClassPlanFn>(GetProcAddress(module, "forgevm_forge_class_plan"));
+    api->forgeClassUnload = reinterpret_cast<ForgeClassUnloadFn>(GetProcAddress(module, "forgevm_forge_class_unload"));
 
     if (api->probe == NULL || api->init == NULL) { *reason = "missing_export"; return false; }
     return true;
@@ -698,6 +795,7 @@ void handleForgeLoad(const NativeApi& api, const std::string& line, const std::s
     std::string hookMethod   = getJsonStringField(line, "hookMethod");
     std::string hookDesc     = getJsonStringField(line, "hookDesc");
     bool includeSubclasses   = line.find("\"includeSubclasses\":true") != std::string::npos;
+    bool deferDeopt          = line.find("\"deferDeopt\":true") != std::string::npos;
 
     // Combine injectAt + injectTarget into "TYPE:target" format for DLL
     std::string injectAtFull = injectAt;
@@ -705,10 +803,11 @@ void handleForgeLoad(const NativeApi& api, const std::string& line, const std::s
         injectAtFull += ":" + injectTarget;
     }
 
-    AGENT_LOG("forge_load: %s.%s(%s) @ %s -> %s.%s%s [subclasses=%s]",
+    AGENT_LOG("forge_load: %s.%s(%s) @ %s -> %s.%s%s [subclasses=%s defer=%s]",
               targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
               injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str(),
-              includeSubclasses ? "true" : "false");
+              includeSubclasses ? "true" : "false",
+              deferDeopt ? "true" : "false");
 
     if (targetClass.empty() || targetMethod.empty() || injectAt.empty() ||
         hookClass.empty() || hookMethod.empty() || hookDesc.empty()) {
@@ -718,11 +817,23 @@ void handleForgeLoad(const NativeApi& api, const std::string& line, const std::s
     }
 
     int result;
-    if (includeSubclasses && api.forgeSubLoad != NULL) {
+    if (includeSubclasses && api.forgeSubLoadV2 != NULL) {
+        result = api.forgeSubLoadV2(
+            targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
+            injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str(),
+            deferDeopt ? 1 : 0);
+    } else if (includeSubclasses && api.forgeSubLoad != NULL) {
+        // Fallback for older DLL without v2 export
         result = api.forgeSubLoad(
             targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
             injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str());
+    } else if (api.transformLoadV2 != NULL) {
+        result = api.transformLoadV2(
+            targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
+            injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str(),
+            deferDeopt ? 1 : 0);
     } else {
+        // Fallback for older DLL without v2 export
         result = api.transformLoad(
             targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
             injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str());
@@ -770,6 +881,308 @@ void handleForgeUnload(const NativeApi& api, const std::string& line, const std:
     } else {
         printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
     }
+}
+
+// ============================================================
+// forge_batch_plan: per-class plan-once-commit-once entry point
+//
+// Java side sends one batch IPC for the entire load() call; this handler
+// decomposes it into per-ingot transformLoad calls (Stage 2 wiring). The
+// real plan-once-commit-once implementation lives in the DLL (Stage 3) --
+// once that lands, this handler routes to a single new DLL export instead
+// of looping per-ingot.
+// ============================================================
+
+namespace {
+
+struct BatchCandidate {
+    std::string methodName;
+    std::string paramDesc;
+};
+
+struct BatchIngot {
+    std::string targetClass;
+    bool        includeSubclasses = false;
+    std::string injectAt;
+    std::string injectTarget;
+    std::string hookClass;
+    std::string hookMethod;
+    std::string hookDesc;
+    std::vector<BatchCandidate> candidates;
+};
+
+struct PerIngotResult {
+    bool        matched = false;
+    std::string methodName;
+    std::string paramDesc;
+    std::string reason;
+};
+
+PerIngotResult tryIngotCandidates(const NativeApi& api, const BatchIngot& ingot, int deferDeopt) {
+    PerIngotResult r;
+    r.reason = ingot.candidates.empty() ? "no_candidates" : "method_not_found";
+
+    std::string injectAtFull = ingot.injectAt;
+    if (!ingot.injectTarget.empty()) {
+        injectAtFull += ":" + ingot.injectTarget;
+    }
+
+    for (const auto& cand : ingot.candidates) {
+        int result;
+        if (ingot.includeSubclasses && api.forgeSubLoadV2 != NULL) {
+            result = api.forgeSubLoadV2(
+                ingot.targetClass.c_str(), cand.methodName.c_str(), cand.paramDesc.c_str(),
+                injectAtFull.c_str(), ingot.hookClass.c_str(), ingot.hookMethod.c_str(),
+                ingot.hookDesc.c_str(), deferDeopt);
+        } else if (ingot.includeSubclasses && api.forgeSubLoad != NULL) {
+            result = api.forgeSubLoad(
+                ingot.targetClass.c_str(), cand.methodName.c_str(), cand.paramDesc.c_str(),
+                injectAtFull.c_str(), ingot.hookClass.c_str(), ingot.hookMethod.c_str(),
+                ingot.hookDesc.c_str());
+        } else if (api.transformLoadV2 != NULL) {
+            result = api.transformLoadV2(
+                ingot.targetClass.c_str(), cand.methodName.c_str(), cand.paramDesc.c_str(),
+                injectAtFull.c_str(), ingot.hookClass.c_str(), ingot.hookMethod.c_str(),
+                ingot.hookDesc.c_str(), deferDeopt);
+        } else {
+            result = api.transformLoad(
+                ingot.targetClass.c_str(), cand.methodName.c_str(), cand.paramDesc.c_str(),
+                injectAtFull.c_str(), ingot.hookClass.c_str(), ingot.hookMethod.c_str(),
+                ingot.hookDesc.c_str());
+        }
+        if (result == 1) {
+            r.matched    = true;
+            r.methodName = cand.methodName;
+            r.paramDesc  = cand.paramDesc;
+            return r;
+        }
+        const char* le = api.lastError ? api.lastError() : NULL;
+        if (le != NULL && le[0] != '\0') {
+            r.reason = le;
+        }
+    }
+    return r;
+}
+
+} // namespace
+
+// Parse a forgevm_forge_class_plan results JSON ("[{matched:..,...}, ...]")
+// into a vector of PerIngotResult that parallels the input order.
+static std::vector<PerIngotResult> parseClassPlanResults(const std::string& json,
+                                                        size_t expected) {
+    std::vector<PerIngotResult> out;
+    out.reserve(expected);
+    forEachJsonObject(json, [&out](const std::string& obj) {
+        PerIngotResult r;
+        r.matched = getJsonBoolField(obj, "matched", false);
+        if (r.matched) {
+            r.methodName = getJsonStringField(obj, "methodName");
+            r.paramDesc  = getJsonStringField(obj, "paramDesc");
+        } else {
+            r.reason = getJsonStringField(obj, "reason");
+            if (r.reason.empty()) r.reason = "match_failed";
+        }
+        out.push_back(std::move(r));
+    });
+    return out;
+}
+
+void handleForgeBatchPlan(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    if (api.transformLoad == NULL && api.forgeClassPlan == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "forge_load_not_exported");
+        return;
+    }
+
+    std::vector<BatchIngot> ingots;
+    {
+        std::string ingotsArr = extractArrayInner(line, "ingots");
+        forEachJsonObject(ingotsArr, [&ingots](const std::string& obj) {
+            BatchIngot spec;
+            spec.targetClass        = getJsonStringField(obj, "targetClass");
+            spec.includeSubclasses  = getJsonBoolField(obj, "includeSubclasses", false);
+            spec.injectAt           = getJsonStringField(obj, "injectAt");
+            spec.injectTarget       = getJsonStringField(obj, "injectTarget");
+            spec.hookClass          = getJsonStringField(obj, "hookClass");
+            spec.hookMethod         = getJsonStringField(obj, "hookMethod");
+            spec.hookDesc           = getJsonStringField(obj, "hookDesc");
+
+            std::string candArr = extractArrayInner(obj, "candidates");
+            forEachJsonObject(candArr, [&spec](const std::string& cobj) {
+                BatchCandidate c;
+                c.methodName = getJsonStringField(cobj, "methodName");
+                c.paramDesc  = getJsonStringField(cobj, "paramDesc");
+                spec.candidates.push_back(std::move(c));
+            });
+            ingots.push_back(std::move(spec));
+        });
+    }
+
+    AGENT_LOG("forge_batch_plan: %zu ingot(s)", ingots.size());
+    if (ingots.empty()) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "empty_ingots");
+        return;
+    }
+
+    std::vector<PerIngotResult> results(ingots.size());
+
+    if (api.forgeClassPlan != NULL) {
+        // §17 Stage 3: group ingots by (targetClass, includeSubclasses) and
+        // commit each class as one plan-once-commit-once operation. All
+        // commits defer deopt; we run a single global deopt sweep at the end.
+        struct GroupKey {
+            std::string targetClass;
+            bool includeSubclasses;
+            bool operator==(const GroupKey& o) const {
+                return targetClass == o.targetClass && includeSubclasses == o.includeSubclasses;
+            }
+        };
+        struct GroupKeyHash {
+            size_t operator()(const GroupKey& g) const {
+                return std::hash<std::string>{}(g.targetClass) ^
+                       (g.includeSubclasses ? 0x9E3779B9ULL : 0ULL);
+            }
+        };
+        std::unordered_map<GroupKey, std::vector<size_t>, GroupKeyHash> groups;
+        std::vector<GroupKey> groupOrder;
+        for (size_t i = 0; i < ingots.size(); ++i) {
+            GroupKey k{ ingots[i].targetClass, ingots[i].includeSubclasses };
+            auto it = groups.find(k);
+            if (it == groups.end()) {
+                groups[k] = std::vector<size_t>{ i };
+                groupOrder.push_back(k);
+            } else {
+                it->second.push_back(i);
+            }
+        }
+        AGENT_LOG("forge_batch_plan: %zu group(s) (one DLL call per group)", groupOrder.size());
+
+        for (const GroupKey& gk : groupOrder) {
+            const auto& idxs = groups[gk];
+
+            // Build hooksJson for this class.
+            std::ostringstream js;
+            js << '[';
+            for (size_t j = 0; j < idxs.size(); ++j) {
+                if (j > 0) js << ',';
+                const BatchIngot& sp = ingots[idxs[j]];
+                js << '{';
+                js << "\"hookClass\":\""  << escapeJson(sp.hookClass)  << "\",";
+                js << "\"hookMethod\":\"" << escapeJson(sp.hookMethod) << "\",";
+                js << "\"hookDesc\":\""   << escapeJson(sp.hookDesc)   << "\",";
+                js << "\"injectAt\":\""   << escapeJson(sp.injectAt)   << "\"";
+                if (!sp.injectTarget.empty()) {
+                    js << ",\"injectTarget\":\"" << escapeJson(sp.injectTarget) << "\"";
+                }
+                js << ",\"candidates\":[";
+                for (size_t c = 0; c < sp.candidates.size(); ++c) {
+                    if (c > 0) js << ',';
+                    js << "{\"methodName\":\"" << escapeJson(sp.candidates[c].methodName) << "\","
+                       << "\"paramDesc\":\""   << escapeJson(sp.candidates[c].paramDesc)  << "\"}";
+                }
+                js << "]}";
+            }
+            js << ']';
+            std::string hooksJson = js.str();
+
+            // Generous result buffer: enough for a few hundred per-hook outcomes.
+            std::vector<char> resultBuf(64 * 1024, 0);
+            int rc = api.forgeClassPlan(gk.targetClass.c_str(),
+                                        hooksJson.c_str(),
+                                        gk.includeSubclasses ? 1 : 0,
+                                        /*deferDeopt=*/1,
+                                        resultBuf.data(),
+                                        (int)resultBuf.size());
+
+            if (rc != 1) {
+                std::string reason = api.lastError ? api.lastError() : "class_plan_failed";
+                AGENT_LOG("forge_batch_plan: class %s commit FAILED reason=%s",
+                          gk.targetClass.c_str(), reason.c_str());
+                for (size_t k : idxs) {
+                    PerIngotResult& r = results[k];
+                    r.matched = false;
+                    r.reason  = reason.empty() ? "class_plan_failed" : reason;
+                }
+                continue;
+            }
+
+            std::vector<PerIngotResult> groupResults =
+                parseClassPlanResults(std::string(resultBuf.data()), idxs.size());
+            for (size_t j = 0; j < idxs.size() && j < groupResults.size(); ++j) {
+                results[idxs[j]] = std::move(groupResults[j]);
+            }
+            // Defensive: if buffer parse came up short, fill the tail with a generic failure.
+            for (size_t j = groupResults.size(); j < idxs.size(); ++j) {
+                results[idxs[j]].matched = false;
+                results[idxs[j]].reason  = "result_buffer_truncated";
+            }
+        }
+
+        if (api.forceDeoptNow != NULL) {
+            api.forceDeoptNow();
+        }
+    } else {
+        // Legacy fallback: per-ingot transformLoad loop. Kept for the case where
+        // the loaded DLL pre-dates forgevm_forge_class_plan.
+        AGENT_LOG("forge_batch_plan: forgeClassPlan not exported, falling back to per-ingot");
+        for (size_t i = 0; i < ingots.size(); ++i) {
+            results[i] = tryIngotCandidates(api, ingots[i], /*deferDeopt=*/1);
+        }
+        if (api.forceDeoptNow != NULL) {
+            api.forceDeoptNow();
+        }
+    }
+
+    int matchedCount = 0;
+    std::ostringstream oss;
+    oss << "{\"status\":\"ok\""
+        << ",\"capability\":\"FULL\""
+        << ",\"dllPath\":\"" << escapeJson(dllPath) << "\""
+        << ",\"reason\":\"batch_plan_done\""
+        << ",\"results\":[";
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (i > 0) oss << ',';
+        const auto& r = results[i];
+        if (r.matched) ++matchedCount;
+        oss << '{';
+        oss << "\"matched\":" << (r.matched ? "true" : "false");
+        if (r.matched) {
+            oss << ",\"methodName\":\"" << escapeJson(r.methodName) << "\"";
+            oss << ",\"paramDesc\":\""  << escapeJson(r.paramDesc)  << "\"";
+        } else {
+            oss << ",\"reason\":\"" << escapeJson(r.reason) << "\"";
+        }
+        oss << '}';
+    }
+    oss << "]}";
+    std::cout << oss.str() << std::endl;
+    AGENT_LOG("forge_batch_plan: %d/%zu matched", matchedCount, (size_t)results.size());
+}
+
+void handleForgeClassUnload(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    if (api.forgeClassUnload == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "unknown_command");
+        return;
+    }
+    std::string targetClass = getJsonStringField(line, "targetClass");
+    bool includeSubclasses = getJsonBoolField(line, "includeSubclasses", false);
+    if (targetClass.empty()) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_target_class");
+        return;
+    }
+
+    AGENT_LOG("forge_class_unload: %s [subclasses=%d]",
+              targetClass.c_str(), (int)includeSubclasses);
+
+    int result = api.forgeClassUnload(targetClass.c_str(), includeSubclasses ? 1 : 0);
+    std::string reason = copyReason(api, result == 1 ? "ok" : "forge_class_unload_failed");
+    AGENT_LOG("forge_class_unload result=%d reason=%s", result, reason.c_str());
+
+    std::ostringstream oss;
+    oss << "{\"status\":\"" << (result == 1 ? "ok" : "fallback") << "\""
+        << ",\"capability\":\"" << (result == 1 ? "FULL" : "UNAVAILABLE") << "\""
+        << ",\"dllPath\":\"" << escapeJson(dllPath) << "\""
+        << ",\"reason\":\"" << escapeJson(reason) << "\"}";
+    std::cout << oss.str() << std::endl;
 }
 
 void handlePutFieldPath(const NativeApi& api, const std::string& line, const std::string& dllPath) {
@@ -1357,8 +1770,25 @@ int main(int argc, char** argv) {
             handlePutRefFieldBatch(api, line, dllPath);
         } else if (cmd == "forge_load") {
             handleForgeLoad(api, line, dllPath);
+        } else if (cmd == "forge_batch_plan") {
+            handleForgeBatchPlan(api, line, dllPath);
+        } else if (cmd == "force_deopt") {
+            if (api.forceDeoptNow != NULL) {
+                int r = api.forceDeoptNow();
+                std::string reason = copyReason(api, r == 1 ? "ok" : "force_deopt_failed");
+                AGENT_LOG("force_deopt result=%d reason=%s", r, reason.c_str());
+                if (r == 1) {
+                    printResult("ok", "FULL", dllPath, reason.c_str());
+                } else {
+                    printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
+                }
+            } else {
+                printResult("fallback", "UNAVAILABLE", dllPath, "force_deopt_not_exported");
+            }
         } else if (cmd == "forge_unload") {
             handleForgeUnload(api, line, dllPath);
+        } else if (cmd == "forge_class_unload") {
+            handleForgeClassUnload(api, line, dllPath);
         } else if (cmd == "purge_agent") {
             handlePurgeAgent(api, line, dllPath);
         } else if (cmd == "put_field_path") {

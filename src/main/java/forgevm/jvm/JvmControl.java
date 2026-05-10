@@ -18,7 +18,7 @@ public final class JvmControl {
         }
         try {
             sender.sendExitCommand(exitCode);
-            // If Agent succeeded, TerminateProcess kills us — we never reach here.
+            // If Agent succeeded, TerminateProcess kills us -- we never reach here.
             // If we're still alive, the kill failed.
             Thread.sleep(1000);
             return false;

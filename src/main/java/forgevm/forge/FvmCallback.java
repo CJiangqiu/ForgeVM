@@ -9,11 +9,11 @@ package forgevm.forge;
  *
  * <h2>Control flow</h2>
  * <ul>
- *   <li>{@link #setReturnValue(Object)} — skip the original method and return a
+ *   <li>{@link #setReturnValue(Object)} -- skip the original method and return a
  *       specific value. For primitive return types, pass the boxed equivalent
  *       (e.g. {@code 20.0f} for a {@code float} method).</li>
- *   <li>{@link #cancel()} — skip the original method for {@code void} methods.</li>
- *   <li><em>Neither called</em> — the original method executes normally after the
+ *   <li>{@link #cancel()} -- skip the original method for {@code void} methods.</li>
+ *   <li><em>Neither called</em> -- the original method executes normally after the
  *       hook returns.</li>
  * </ul>
  *
@@ -24,7 +24,7 @@ package forgevm.forge;
  *     if (target instanceof com.example.app.PremiumRetryPolicy) {
  *         callback.setReturnValue(100);  // override return value
  *     }
- *     // other instances → original method runs normally
+ *     // other instances -&gt; original method runs normally
  * }
  * }</pre>
  *
@@ -50,7 +50,7 @@ public final class FvmCallback {
 
     /**
      * Constructs a callback with argument access.
-     * Called by injected bytecode — not intended for direct use.
+     * Called by injected bytecode -- not intended for direct use.
      *
      * @param instance the target method's {@code this}, or {@code null} for static methods
      * @param args the target method's arguments (reference types only; primitives are boxed)
@@ -75,9 +75,9 @@ public final class FvmCallback {
      *
      * <p>For primitive return types, pass the boxed equivalent:
      * <ul>
-     *   <li>{@code float} method → {@code callback.setReturnValue(20.0f)}</li>
-     *   <li>{@code int} method → {@code callback.setReturnValue(42)}</li>
-     *   <li>{@code boolean} method → {@code callback.setReturnValue(true)}</li>
+     *   <li>{@code float} method -&gt; {@code callback.setReturnValue(20.0f)}</li>
+     *   <li>{@code int} method -&gt; {@code callback.setReturnValue(42)}</li>
+     *   <li>{@code boolean} method -&gt; {@code callback.setReturnValue(true)}</li>
      * </ul>
      *
      * @param value the value to return from the target method

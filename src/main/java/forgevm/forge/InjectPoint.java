@@ -5,16 +5,16 @@ package forgevm.forge;
  *
  * <p>Basic injection points:
  * <ul>
- *   <li>{@link #HEAD} — before the first instruction</li>
- *   <li>{@link #RETURN} — before every {@code return} instruction</li>
+ *   <li>{@link #HEAD} -- before the first instruction</li>
+ *   <li>{@link #RETURN} -- before every {@code return} instruction</li>
  * </ul>
  *
  * <p>Targeted injection points (specify a target within the method body):
  * <ul>
- *   <li>{@link #INVOKE(String)} — before a call to the specified method</li>
- *   <li>{@link #FIELD_GET(String)} — before a {@code getfield}/{@code getstatic} of the specified field</li>
- *   <li>{@link #FIELD_PUT(String)} — before a {@code putfield}/{@code putstatic} of the specified field</li>
- *   <li>{@link #NEW(String)} — before a {@code new} instruction for the specified class</li>
+ *   <li>{@link #INVOKE(String)} -- before a call to the specified method</li>
+ *   <li>{@link #FIELD_GET(String)} -- before a {@code getfield}/{@code getstatic} of the specified field</li>
+ *   <li>{@link #FIELD_PUT(String)} -- before a {@code putfield}/{@code putstatic} of the specified field</li>
+ *   <li>{@link #NEW(String)} -- before a {@code new} instruction for the specified class</li>
  * </ul>
  *
  * @see FvmIngot

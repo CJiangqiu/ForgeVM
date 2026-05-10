@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <cstdint>
 #include <cstdio>
@@ -208,20 +209,45 @@ void extractCompressionParams();
 // Transform: bytecode rewriting (out-of-process)
 // ============================================================
 
-struct TransformBackup {
-    std::string key;                    // "className#methodName#paramDesc"
-    uint64_t methodAddr;                // Method* address in target
-    uint64_t origConstMethodAddr;       // original ConstMethod* value
-    uint64_t origConstPoolAddr;         // original ConstantPool* value
-    uint64_t allocatedConstMethod;      // VirtualAllocEx'd new ConstMethod
-    uint64_t allocatedConstPool;        // VirtualAllocEx'd new ConstantPool
-    uint64_t allocatedCache;            // VirtualAllocEx'd new ConstantPoolCache
-    uint64_t allocatedResolvedKlasses;  // VirtualAllocEx'd new _resolved_klasses
-    size_t allocatedConstMethodSize;
-    size_t allocatedConstPoolSize;
+struct HookSpec {
+    std::string hookClass;
+    std::string hookMethod;
+    std::string hookDesc;
+    std::string injectAt;
 };
 
-extern std::unordered_map<std::string, TransformBackup> g_transformBackups;
+// Per-class transform plan (§17.4).
+// One plan per InstanceKlass; all patched methods in the class share one newCP/newCPCache/newRK.
+// The plan accumulates hooks as each applyTransform call adds to the same class.
+// On restore the entire class reverts atomically — all hooks for the class are removed.
+
+struct MethodCMBackup {
+    uint64_t methodAddr;
+    uint64_t origConstMethodAddr;  // CM* before any patch to this class
+    uint64_t origConstantsPtr;     // CM._constants before any patch (= oldCPAddr)
+};
+
+struct PatchedMethodInfo {
+    uint64_t methodAddr;
+    uint64_t newCMAddr;   // most-recent newCM allocated for this method
+    HookSpec hook;
+};
+
+struct ClassTransformPlan {
+    std::string className;
+    uint64_t klassAddr  = 0;
+    uint64_t oldCPAddr  = 0;   // true original CP — used for restore
+
+    std::vector<MethodCMBackup>   methodBackups;   // ALL class methods, captured before first patch
+    std::vector<PatchedMethodInfo> patchedMethods;  // methods that have been patched
+
+    // Most-recent active allocations (layered: each call appends to the previous newCP)
+    uint64_t newCPAddr      = 0;
+    uint64_t newCPCacheAddr = 0;
+    uint64_t newRKAddr      = 0;
+};
+
+extern std::unordered_map<uint64_t, ClassTransformPlan> g_plans;  // key = klassAddr
 
 // Find an InstanceKlass by internal name (e.g. "com/example/Foo")
 bool findInstanceKlassByName(const std::string& internalName, uint64_t* outKlassAddr);
@@ -239,20 +265,60 @@ bool readConstMethodBytecode(uint64_t constMethodAddr, std::vector<uint8_t>* byt
 bool readConstantPool(uint64_t constPoolAddr, std::vector<uint8_t>* poolBytesOut,
                       uint32_t* poolLengthOut, size_t* poolByteSizeOut);
 
-// Build new constant pool with appended MethodRef for hook
-bool buildExpandedConstPool(const std::vector<uint8_t>& origPoolBytes, uint32_t origLength,
-                            size_t origByteSize, const char* hookClass, const char* hookMethod,
-                            const char* hookDesc, std::vector<uint8_t>* newPoolBytesOut,
-                            uint16_t* newMethodRefIndex);
-
-// Build new bytecode with injected invokestatic at given point
-bool buildInjectedBytecode(const std::vector<uint8_t>& origBytecode, const char* injectAt,
-                           uint16_t hookMethodRefIndex, std::vector<uint8_t>* newBytecodeOut);
-
 // Apply transform: allocate in target, write new constpool + bytecode, swap pointers
 int applyTransform(const char* className, const char* methodName, const char* paramDesc,
                    const char* injectAt, const char* hookClass, const char* hookMethod,
-                   const char* hookDesc);
+                   const char* hookDesc, bool deferDeopt);
 
 // Restore original method
 int restoreTransform(const char* className, const char* methodName, const char* paramDesc);
+
+// ============================================================
+// Per-class plan-once-commit-once API (§17.5 / §17.7)
+//
+// commitClassPlan is the proper per-class transform: one merged ConstantPool
+// per class, all patched methods share it, atomic class-level swap. Replaces
+// the layered-append behavior of repeated applyTransform calls.
+//
+// unloadClassPlan reverts the entire InstanceKlass plan to its original CP.
+// ============================================================
+
+struct HookCandidate {
+    std::string methodName;
+    std::string paramDesc;
+};
+
+struct HookSpecExtended {
+    std::string hookClass;
+    std::string hookMethod;
+    std::string hookDesc;
+    std::string injectAt;       // "HEAD", "RETURN", "INVOKE:foo", "FIELD_GET:bar", etc.
+    std::vector<HookCandidate> candidates;
+};
+
+struct HookOutcome {
+    bool matched = false;
+    std::string methodName;     // matched candidate (on success)
+    std::string paramDesc;
+    std::string reason;         // failure reason (on failure)
+    uint64_t methodAddr = 0;    // resolved Method* (on success)
+};
+
+// Plan-once-commit-once (§17.5 Phase A→D). targetClassName is dot- or slash-
+// separated. additionalHooks are merged with the plan's existing hooks (if any);
+// the entire merged set is re-committed atomically with one merged newCP.
+//
+// outResults parallels additionalHooks (same size, same order) and reports
+// per-hook match/failure. Returns 1 on commit success, 0 on commit failure.
+int commitClassPlan(const char* targetClassName,
+                    const std::vector<HookSpecExtended>& additionalHooks,
+                    bool includeSubclasses,
+                    bool deferDeopt,
+                    std::vector<HookOutcome>* outResults);
+
+// Class-level rollback (§17.7). Restores InstanceKlass._constants to the
+// original CP and reverts all patched-method ConstMethod pointers from the
+// plan's backups. Does not VirtualFreeEx — in-flight frames may still
+// reference the new allocations. Returns 1 on success, 0 if no plan exists
+// for the given class.
+int unloadClassPlan(const char* targetClassName, bool includeSubclasses);

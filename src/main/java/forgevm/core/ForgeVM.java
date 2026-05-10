@@ -517,7 +517,7 @@ public final class ForgeVM {
             try {
                 Files.copy(input, target, StandardCopyOption.REPLACE_EXISTING);
             } catch (java.nio.file.AccessDeniedException ignored) {
-                // File is locked by a running agent process — reuse it as-is
+                // File is locked by a running agent process -- reuse it as-is
                 if (Files.exists(target)) return target;
                 return null;
             }
@@ -607,7 +607,7 @@ public final class ForgeVM {
         FULL,
         /** Agent is active with restricted privileges. */
         RESTRICTED,
-        /** Agent is unavailable — all operations will fail. */
+        /** Agent is unavailable -- all operations will fail. */
         UNAVAILABLE
     }
 
