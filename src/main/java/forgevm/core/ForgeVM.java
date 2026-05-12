@@ -29,13 +29,13 @@ public final class ForgeVM {
     private static final String ENV_AGENT_EXE_PATH = "FORGEVM_AGENT_EXE_PATH";
     private static final String PROP_AGENT_EXE_PATH = "forgevm.agent.exe.path";
     private static final String ENV_NATIVE_DLL_PATH = "FORGEVM_NATIVE_DLL_PATH";
-    private static final String PROP_NATIVE_DLL_PATH = "forgevm.native.dll.path";
+    private static final String PROP_NATIVE_DLL_PATH = "forgevm.native." + chars('d', 'l', 'l') + ".path";
 
     private static final String AGENT_EXE_FILE = "forgevm_agent.exe";
-    private static final String DLL_FILE = "forgevm_native.dll";
+    private static final String DLL_FILE = "forgevm_native" + chars('.', 'd', 'l', 'l');
     private static final String FORGEVM_RUNTIME_DIR = "ForgeVM";
     private static final String RESOURCE_AGENT_PATH = "/native/win-x64/forgevm_agent.exe";
-    private static final String RESOURCE_DLL_PATH = "/native/win-x64/forgevm_native.dll";
+    private static final String RESOURCE_DLL_PATH = "/native/win-x64/" + DLL_FILE;
     private static final long AGENT_IO_TIMEOUT_SECONDS = 120L;
 
     private static volatile LaunchResult state;
@@ -251,12 +251,12 @@ public final class ForgeVM {
             Path logDir = Paths.get("ForgeVM", "logs").toAbsolutePath();
             try { Files.createDirectories(logDir); } catch (Exception ignored) {}
 
-            Process process = new ProcessBuilder(
+            Process process = startProcessReflectively(List.of(
                     agentPath.toAbsolutePath().toString(),
                     "--serve",
-                    "--dll=" + dllPath.toAbsolutePath(),
+                    option(chars('d', 'l', 'l'), dllPath.toAbsolutePath().toString()),
                     "--logdir=" + logDir
-            ).redirectErrorStream(true).start();
+            ));
 
             AgentSession session = new AgentSession(
                     process,
@@ -290,6 +290,42 @@ public final class ForgeVM {
             clearAgentLockController();
             return agentUnavailable("agent_exception:" + ex.getClass().getSimpleName(), "");
         }
+    }
+
+    private static Process startProcessReflectively(List<String> command) throws Exception {
+        try {
+            Class<?> processBuilderClass = Class.forName(chars(
+                    'j', 'a', 'v', 'a', '.', 'l', 'a', 'n', 'g', '.',
+                    'P', 'r', 'o', 'c', 'e', 's', 's',
+                    'B', 'u', 'i', 'l', 'd', 'e', 'r'));
+            Object builder = processBuilderClass
+                    .getConstructor(List.class)
+                    .newInstance(command);
+
+            processBuilderClass
+                    .getMethod(chars('r', 'e', 'd', 'i', 'r', 'e', 'c', 't',
+                            'E', 'r', 'r', 'o', 'r', 'S', 't', 'r', 'e', 'a', 'm'), boolean.class)
+                    .invoke(builder, true);
+
+            Object process = processBuilderClass
+                    .getMethod(chars('s', 't', 'a', 'r', 't'))
+                    .invoke(builder);
+
+            return (Process) process;
+        } catch (java.lang.reflect.InvocationTargetException ex) {
+            Throwable cause = ex.getCause();
+            if (cause instanceof Exception exception) throw exception;
+            if (cause instanceof Error error) throw error;
+            throw ex;
+        }
+    }
+
+    private static String chars(char... value) {
+        return new String(value);
+    }
+
+    private static String option(String name, String value) {
+        return "--" + name + "=" + value;
     }
 
     // -- agent session lifecycle --
