@@ -216,10 +216,8 @@ struct HookSpec {
     std::string injectAt;
 };
 
-// Per-class transform plan (§17.4).
-// One plan per InstanceKlass; all patched methods in the class share one newCP/newCPCache/newRK.
-// The plan accumulates hooks as each applyTransform call adds to the same class.
-// On restore the entire class reverts atomically — all hooks for the class are removed.
+// Per-class transform plan. One plan per InstanceKlass; all patched methods share one newCP.
+// On unload the entire class reverts atomically — all hooks for the class are removed.
 
 struct MethodCMBackup {
     uint64_t methodAddr;
@@ -265,22 +263,13 @@ bool readConstMethodBytecode(uint64_t constMethodAddr, std::vector<uint8_t>* byt
 bool readConstantPool(uint64_t constPoolAddr, std::vector<uint8_t>* poolBytesOut,
                       uint32_t* poolLengthOut, size_t* poolByteSizeOut);
 
-// Apply transform: allocate in target, write new constpool + bytecode, swap pointers
-int applyTransform(const char* className, const char* methodName, const char* paramDesc,
-                   const char* injectAt, const char* hookClass, const char* hookMethod,
-                   const char* hookDesc, bool deferDeopt);
-
-// Restore original method
-int restoreTransform(const char* className, const char* methodName, const char* paramDesc);
-
 // ============================================================
-// Per-class plan-once-commit-once API (§17.5 / §17.7)
+// Per-class plan-once-commit-once API
 //
-// commitClassPlan is the proper per-class transform: one merged ConstantPool
-// per class, all patched methods share it, atomic class-level swap. Replaces
-// the layered-append behavior of repeated applyTransform calls.
+// commitClassPlan: one new ConstantPool per class, all patched methods share it,
+// atomic class-level swap (§17.5 Phase A→D).
 //
-// unloadClassPlan reverts the entire InstanceKlass plan to its original CP.
+// unloadClassPlan: reverts the entire InstanceKlass plan to its original CP (§17.7).
 // ============================================================
 
 struct HookCandidate {

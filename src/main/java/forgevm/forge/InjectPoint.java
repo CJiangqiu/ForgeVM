@@ -30,11 +30,18 @@ public final class InjectPoint {
     /**
      * Before a call to the specified method within the target method's body.
      *
+     * <p>Target string forms (most to least specific):
+     * <ul>
+     *   <li>{@code "setHealth"} — match by method name only; all overloads injected</li>
+     *   <li>{@code "setHealth(F)"} — match by name + parameter descriptor</li>
+     *   <li>{@code "setHealth(F)V"} — match by name + parameters + return type</li>
+     * </ul>
+     *
      * <pre>{@code
-     * super("com.example.Entity", "hurt", InjectPoint.INVOKE("setHealth"));
+     * super("com.example.Entity", "tick", InjectPoint.INVOKE("setHealth(F)"));
      * }</pre>
      *
-     * @param methodName the name of the method call to intercept
+     * @param methodName the method to intercept, optionally with descriptor
      */
     public static InjectPoint INVOKE(String methodName) {
         if (methodName == null || methodName.isBlank()) {
@@ -46,11 +53,17 @@ public final class InjectPoint {
     /**
      * Before a {@code getfield}/{@code getstatic} instruction for the specified field.
      *
+     * <p>Target string forms:
+     * <ul>
+     *   <li>{@code "health"} — match by field name only</li>
+     *   <li>{@code "health:F"} — match by name + descriptor</li>
+     * </ul>
+     *
      * <pre>{@code
-     * super("com.example.Entity", "tick", InjectPoint.FIELD_GET("health"));
+     * super("com.example.Entity", "tick", InjectPoint.FIELD_GET("health:F"));
      * }</pre>
      *
-     * @param fieldName the name of the field access to intercept
+     * @param fieldName the field to intercept, optionally with descriptor (name:desc)
      */
     public static InjectPoint FIELD_GET(String fieldName) {
         if (fieldName == null || fieldName.isBlank()) {
@@ -62,11 +75,17 @@ public final class InjectPoint {
     /**
      * Before a {@code putfield}/{@code putstatic} instruction for the specified field.
      *
+     * <p>Target string forms:
+     * <ul>
+     *   <li>{@code "health"} — match by field name only</li>
+     *   <li>{@code "health:F"} — match by name + descriptor</li>
+     * </ul>
+     *
      * <pre>{@code
-     * super("com.example.Entity", "tick", InjectPoint.FIELD_PUT("health"));
+     * super("com.example.Entity", "tick", InjectPoint.FIELD_PUT("health:F"));
      * }</pre>
      *
-     * @param fieldName the name of the field write to intercept
+     * @param fieldName the field to intercept, optionally with descriptor (name:desc)
      */
     public static InjectPoint FIELD_PUT(String fieldName) {
         if (fieldName == null || fieldName.isBlank()) {

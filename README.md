@@ -49,12 +49,7 @@ if (!result.nativeDllActive()) {
 // Agent is active, all APIs are now usable
 ```
 
-Two launch policies:
-
-```java
-ForgeVM.launch();              // SILENT — no elevation prompt
-ForgeVM.launch(ForgeVM.PROMPT); // PROMPT — shows a UAC dialog to request higher privileges
-```
+`launch()` is the single entry point — no overloads, no policies. Result is binary: `FULL` on success, `UNAVAILABLE` on failure (reason written to log).
 
 ### 3. Use the API
 
@@ -67,10 +62,9 @@ ForgeVM.memory().putIntField("com.example.Server", "INSTANCE.config.maxHealth", 
 ForgeVM.forge().load(new MyIngot());
 
 // JVM Control
-ForgeVM.exit();                                         // TerminateProcess, no Java API
-ForgeVM.banJavaAgent();                                 // block agent attachment
+ForgeVM.exitJvm();                                         // TerminateProcess, no Java API
+ForgeVM.banJavaAgent();                                 // purge all loaded agents + block all future attaches
 ForgeVM.banNativeLoad();                                // block native library loading
-ForgeVM.purgeAgent("com.example.agent.EvilAgent");      // disable a loaded agent
 ```
 
 ## Requirements
@@ -78,7 +72,7 @@ ForgeVM.purgeAgent("com.example.agent.EvilAgent");      // disable a loaded agen
 - **OS**: Windows x64
 - **JDK**: 17+
 - **Target JVM**: HotSpot (OpenJDK / Oracle JDK)
-- **Privileges**: `SeDebugPrivilege` or administrator rights
+- **Privileges**: Same-user JVM access requires no elevated privileges. `SeDebugPrivilege` is attempted opportunistically at startup — if unavailable, ForgeVM continues normally.
 
 ## How It Works
 
@@ -89,11 +83,12 @@ Java Application
     ▼
 ForgeVM Java Library (in-process)
     │  Extracts & starts the native Agent executable
-    │  Communicates via stdin/stdout JSON protocol
+    │  Communicates via process stdin/stdout (initial spawn)
+    │  or named pipe \\.\pipe\forgevm_cmd_<pid> (post-relaunch handoff)
     │  Sends only string descriptors — zero JVM native API
     ▼
 ForgeVM Agent (forgevm_agent.exe, separate process)
-    │  Communicates via stdin/stdout JSON protocol
+    │  Receives JSON commands line-by-line, replies on stdout
     │  Loads forgevm_native.dll
     │  Opens target JVM process handle
     │  Reads HotSpot VMStructs to build internal layout map
@@ -152,41 +147,66 @@ Supported types: `boolean`, `byte`, `char`, `short`, `int`, `float`, `long`, `do
 
 ```java
 // Terminate JVM (Agent calls TerminateProcess directly)
-ForgeVM.exit();
-ForgeVM.exit(1);
+ForgeVM.exitJvm();
+ForgeVM.exitJvm(1);
 
 // Lock Agent — prevents other processes from commanding it
 ForgeVM.lockAgent(60);  // TTL in seconds
 ForgeVM.unlockAgent();
 
-// Block Java Agent attachment
-ForgeVM.banJavaAgent();                                        // block all
-ForgeVM.banJavaAgent(AgentFilter.Blacklist("com.evil."));      // block by package prefix
-ForgeVM.banJavaAgent(AgentFilter.Whitelist("com.trusted."));   // only allow matching packages
-ForgeVM.banJavaAgent(AgentFilter.JarBlacklist("*evil*"));      // block by JAR path
-ForgeVM.banJavaAgent(AgentFilter.JarWhitelist("*trusted*"));   // only allow matching JARs
-ForgeVM.unbanJavaAgent();                                      // allow again
+// Block Java Agent attachment — single API covers both already-loaded and future attaches.
+// The filter is jar-path glob (case-insensitive, '\\' == '/').
+ForgeVM.banJavaAgent();                                        // purge ALL loaded + block all future
+ForgeVM.banJavaAgent(AgentFilter.Blacklist("*evil*.jar"));     // purge + ban only jars matching pattern
+ForgeVM.banJavaAgent(AgentFilter.Whitelist("*trusted*.jar"));  // purge + ban all jars NOT in whitelist
 
-// Block native library loading (System.load / System.loadLibrary)
+ForgeVM.unbanJavaAgent();                                      // un-patch future-attach filter (purge is irreversible)
+
+// Block native library loading
 ForgeVM.banNativeLoad();                                       // block all
 ForgeVM.banNativeLoad(NativeFilter.Blacklist("*cheat*"));      // block by name/path glob
 ForgeVM.banNativeLoad(NativeFilter.Whitelist("lwjgl*"));       // only allow matching
 ForgeVM.unbanNativeLoad();                                     // allow again
 
-// Purge a loaded Java agent entirely
-ForgeVM.purgeAgent("com.example.agent.MyAgent");
-
 // Rebind Agent to current JVM (for Shadow JVM switching)
 ForgeVM.rebindAgentToCurrentJvm();
+
+// Relaunch — kill the JVM and restart it with a filtered command line
+// Throws RelaunchException on failure. On success, never returns (JVM is killed).
+// Automatically refuses to run if the current JVM was already relaunched by ForgeVM,
+// preventing infinite restart loops without any extra guard from the caller.
+try {
+    ForgeVM.relaunch();                                      // restart, keep all args
+    ForgeVM.relaunch(AgentFilter.Blacklist("evil.jar"));     // strip matching -javaagent: args
+    ForgeVM.relaunch(NativeFilter.Blacklist("*cheat*"));     // strip matching -agentpath: args
+    ForgeVM.relaunch(agentFilter, nativeFilter);             // both filters at once
+} catch (RelaunchException e) {
+    // e.getMessage(): "already_relaunched" | "agent_not_active" | "open_process_failed" | ...
+}
 ```
 
-**`purgeAgent`** disables an already-loaded agent via native memory operations:
-1. Nullifies `TransformerManager` inside `InstrumentationImpl`
-2. Nullifies the agent's static `Instrumentation` reference
+**`banJavaAgent` purges already-loaded agents** that match the filter via native memory operations:
+1. Enumerates `ClassLoaderDataGraph` to find every InstanceKlass holding a static `Instrumentation` / `InstrumentationImpl` reference (= agent main class)
+2. Resolves each agent's source jar via `Klass._java_mirror → Class.protection_domain → CodeSource.location → URL.path` — the same jar identity the future-attach trampoline observes, so one filter covers both arms
+3. For matching agents: nullifies `TransformerManager` inside `InstrumentationImpl`, nullifies the agent's static `Instrumentation` reference
 3. Overwrites `agentmain`/`premain` bytecode with bare `return`
 4. Forces JIT deoptimization
 
-**`banNativeLoad`** hooks `Runtime.load0()` and `Runtime.loadLibrary0()` — the internal entry points for all Java-side native library loading (`System.load`, `System.loadLibrary`, `Runtime.load`, `Runtime.loadLibrary` all flow through these). ForgeVM's own DLL is not affected — it loads via the external Agent process, not through Java's `System.load`.
+The purge arm is irreversible (unlike the future-attach filter, which `unbanJavaAgent()` can lift). Agents whose jar identity cannot be resolved (boot loader, dynamically-generated classes) are skipped when a filter is supplied — call `banJavaAgent()` with no filter for unconditional purge.
+
+**`banNativeLoad`** hooks `ntdll!LdrLoadDll` — the kernel-level entry point for every DLL load in the process, including JNI loads, smuggled agent DLLs, and injected threads. All of `System.load`, `System.loadLibrary`, `Runtime.load`, `Runtime.loadLibrary`, and any other path that maps a DLL are covered. Blocked loads return `STATUS_DLL_NOT_FOUND`. ForgeVM's own DLL is not affected — it loads through the external Agent process before any hook is installed.
+
+**`relaunch`** is the only API in ForgeVM that protects the new JVM's *entire lifecycle*, starting from its very first instruction. The flow:
+
+1. Query the current JVM's full command line via WMI; apply filters to strip `-javaagent:` / `-agentpath:` tokens. Inject `-Dforgevm.relaunched=true` (loop-breaker) and `-Dforgevm.agent.pid=<agent_pid>` (handoff token).
+2. `CreateProcessW` the new JVM with `CREATE_SUSPENDED` — the new process exists but its main thread hasn't executed a single instruction yet.
+3. Open the new JVM's handle, switch the DLL's target to it (`forgevm_attach_target_minimal`), and patch `ntdll!LdrLoadDll` directly into the new JVM's memory. From this moment, every DLL load in the new JVM — including the JVM launcher's load of `jvm.dll` itself, JNI loads, and any injected DLL — is filtered against `nativeFilter`.
+4. `ResumeThread` the new JVM. It now runs with the ntdll hook live from its first instruction.
+5. `TerminateProcess` the old JVM. The agent does **not** exit — it persists.
+6. A watcher thread in the persistent agent polls the new JVM's module list every 50 ms; the moment `jvm.dll` is mapped, it runs full `bootstrap_target` and installs the `JVM_EnqueueOperation` hook (banJavaAgent). This happens long before `main()` runs, so dynamic agent attach is blocked for the new JVM's entire lifetime.
+7. When the new JVM eventually calls `ForgeVM.launch()`, it detects the handoff token and connects to the persistent agent via the named pipe `\\.\pipe\forgevm_cmd_<agent_pid>` instead of spawning a fresh agent. The same agent that pre-patched the new JVM continues to serve all subsequent commands.
+
+Result: the supplied filters behave like real JVM startup arguments — they are in effect from instruction zero of the new JVM, with no observable window in which an attacker could attach or load. Old already-loaded agents/DLLs are gone (their JVM was terminated and the OS reclaimed the address space).
 
 ### Forge Module
 
@@ -220,11 +240,15 @@ super("com.example.Foo", "bar(Ljava/lang/String;)"); // with parameter descripto
 **Injection points:**
 
 ```java
-super("Foo", "bar", HEAD);                      // before first instruction (default)
+super("Foo", "bar", HEAD);                       // before first instruction (default)
 super("Foo", "bar", RETURN);                     // before every return
-super("Foo", "bar", INVOKE("targetMethod"));     // before a method call
-super("Foo", "bar", FIELD_GET("fieldName"));     // before a field read
-super("Foo", "bar", FIELD_PUT("fieldName"));     // before a field write
+super("Foo", "bar", INVOKE("setHealth"));        // before any call to setHealth (all overloads)
+super("Foo", "bar", INVOKE("setHealth(F)"));     // before calls matching name + param descriptor
+super("Foo", "bar", INVOKE("setHealth(F)V"));    // before calls matching full descriptor
+super("Foo", "bar", FIELD_GET("health"));        // before any getfield/getstatic named health
+super("Foo", "bar", FIELD_GET("health:F"));      // before getfield/getstatic matching name + type
+super("Foo", "bar", FIELD_PUT("health"));        // before any putfield/putstatic named health
+super("Foo", "bar", FIELD_PUT("health:F"));      // before putfield/putstatic matching name + type
 super("Foo", "bar", NEW("java.util.ArrayList")); // before object creation
 ```
 
@@ -300,12 +324,7 @@ if (!result.nativeDllActive()) {
 // Agent 已就绪，所有 API 可用
 ```
 
-两种启动策略：
-
-```java
-ForgeVM.launch();              // SILENT — 不弹出提权提示
-ForgeVM.launch(ForgeVM.PROMPT); // PROMPT — 弹出 UAC 对话框请求更高权限
-```
+`launch()` 是唯一入口，无重载，无策略参数。结果二值：成功为 `FULL`，失败为 `UNAVAILABLE`（原因写入日志）。
 
 ### 3. 使用 API
 
@@ -318,10 +337,9 @@ ForgeVM.memory().putIntField("com.example.Server", "INSTANCE.config.maxHealth", 
 ForgeVM.forge().load(new MyIngot());
 
 // JVM 控制
-ForgeVM.exit();                                         // TerminateProcess，不涉及 Java API
-ForgeVM.banJavaAgent();                                 // 拦截 Agent 附着
+ForgeVM.exitJvm();                                         // TerminateProcess，不涉及 Java API
+ForgeVM.banJavaAgent();                                 // 清除所有已加载 agent + 阻断所有未来 attach
 ForgeVM.banNativeLoad();                                // 拦截原生库加载
-ForgeVM.purgeAgent("com.example.agent.EvilAgent");      // 禁用已加载的 Agent
 ```
 
 ## 环境要求
@@ -329,7 +347,7 @@ ForgeVM.purgeAgent("com.example.agent.EvilAgent");      // 禁用已加载的 Ag
 - **操作系统**：Windows x64
 - **JDK**：17+
 - **目标 JVM**：HotSpot（OpenJDK / Oracle JDK）
-- **权限**：`SeDebugPrivilege` 或管理员权限
+- **权限**：同用户 JVM 访问无需提权。`SeDebugPrivilege` 在启动时机会主义地尝试获取 — 拿不到不影响正常运行。
 
 ## 工作原理
 
@@ -340,11 +358,12 @@ Java 应用程序
     ▼
 ForgeVM Java 库（进程内）
     │  解压并启动原生 Agent 可执行文件
-    │  通过 stdin/stdout JSON 协议通信
+    │  通过进程 stdin/stdout 通信（初始启动）
+    │  或命名管道 \\.\pipe\forgevm_cmd_<pid>（重启后 handoff）
     │  仅发送字符串描述符 — 零 JVM 原生 API
     ▼
 ForgeVM Agent（forgevm_agent.exe，独立进程）
-    │  通过 stdin/stdout JSON 协议接收命令
+    │  按行接收 JSON 命令，通过 stdout 回应
     │  加载 forgevm_native.dll
     │  打开目标 JVM 进程句柄
     │  读取 HotSpot VMStructs 构建内部布局映射
@@ -403,41 +422,63 @@ ForgeVM.memory().putObjectField("com.example.Server", "INSTANCE.config", newConf
 
 ```java
 // 终止 JVM（Agent 直接调用 TerminateProcess）
-ForgeVM.exit();
-ForgeVM.exit(1);
+ForgeVM.exitJvm();
+ForgeVM.exitJvm(1);
 
 // 锁定 Agent — 阻止其他进程对其发送命令
 ForgeVM.lockAgent(60);  // TTL 秒数
 ForgeVM.unlockAgent();
 
-// 拦截 Java Agent 附着
-ForgeVM.banJavaAgent();                                        // 全部拦截
-ForgeVM.banJavaAgent(AgentFilter.Blacklist("com.evil."));      // 按包名前缀拦截
-ForgeVM.banJavaAgent(AgentFilter.Whitelist("com.trusted."));   // 仅放行匹配的包
-ForgeVM.banJavaAgent(AgentFilter.JarBlacklist("*evil*"));      // 按 JAR 路径拦截
-ForgeVM.banJavaAgent(AgentFilter.JarWhitelist("*trusted*"));   // 仅放行匹配的 JAR
-ForgeVM.unbanJavaAgent();                                      // 解除拦截
+// 拦截 Java Agent —— 单一 API 同时处理"已加载"和"未来 attach"两个时态。
+// filter 按 jar 路径 glob 匹配（大小写不敏感，'\\' 等价于 '/'）。
+ForgeVM.banJavaAgent();                                        // 清除所有已加载 + 阻断所有未来 attach
+ForgeVM.banJavaAgent(AgentFilter.Blacklist("*evil*.jar"));     // 清除并拦截匹配 pattern 的 jar
+ForgeVM.banJavaAgent(AgentFilter.Whitelist("*trusted*.jar")); // 清除并拦截 不在白名单内的 jar
 
-// 拦截原生库加载（System.load / System.loadLibrary）
+ForgeVM.unbanJavaAgent();                                      // 卸除未来 attach 过滤（已 purge 的不可逆）
+
+// 拦截原生库加载
 ForgeVM.banNativeLoad();                                       // 全部拦截
-ForgeVM.banNativeLoad(NativeFilter.Blacklist("*cheat*"));      // 按名称/路径模式拦截
+ForgeVM.banNativeLoad(NativeFilter.Blacklist("*cheat*"));      // 按名称/路径模式
 ForgeVM.banNativeLoad(NativeFilter.Whitelist("lwjgl*"));       // 仅放行匹配的
 ForgeVM.unbanNativeLoad();                                     // 解除拦截
 
-// 清除已加载的 Java Agent
-ForgeVM.purgeAgent("com.example.agent.MyAgent");
-
 // 将 Agent 重新绑定到当前 JVM（用于 Shadow JVM 切换）
 ForgeVM.rebindAgentToCurrentJvm();
+
+// 重启 — 杀死当前 JVM 并以过滤后的命令行重新启动
+// 失败时抛出 RelaunchException。成功时永不返回（JVM 已被杀死）。
+// 若当前 JVM 已经是 ForgeVM 重启后的进程，自动拒绝执行，无需调用方手动防死循环。
+try {
+    ForgeVM.relaunch();                                      // 保留所有参数重启
+    ForgeVM.relaunch(AgentFilter.Blacklist("evil.jar"));     // 过滤掉匹配的 -javaagent: 参数
+    ForgeVM.relaunch(NativeFilter.Blacklist("*cheat*"));     // 过滤掉匹配的 -agentpath: 参数
+    ForgeVM.relaunch(agentFilter, nativeFilter);             // 同时应用两种过滤
+} catch (RelaunchException e) {
+    // e.getMessage(): "already_relaunched" | "agent_not_active" | "open_process_failed" | ...
+}
 ```
 
-**`purgeAgent`** 通过原生内存操作彻底禁用已加载的 Agent：
-1. 清空 `InstrumentationImpl` 内部的 `TransformerManager`
-2. 将 Agent 的静态 `Instrumentation` 引用置为 null
-3. 用空 `return` 覆写 `agentmain`/`premain` 方法字节码
-4. 强制 JIT 反优化
+**`banJavaAgent` 自动清除匹配 filter 的已加载 Agent**，通过原生内存操作：
+1. 遍历 `ClassLoaderDataGraph` 找出所有持有静态 `Instrumentation` / `InstrumentationImpl` 引用的 InstanceKlass（= agent 主类）
+2. 沿 `Klass._java_mirror → Class.protection_domain → CodeSource.location → URL.path` 反查每个 agent 的来源 jar 路径——和未来 attach trampoline 看到的是同一个 jar 身份，所以同一份 filter 同时覆盖两个时态
+3. 对命中 filter 的 agent：清空 `InstrumentationImpl` 内部的 `TransformerManager`、把 agent 的静态 `Instrumentation` 引用置为 null、用空 `return` 覆写 `agentmain`/`premain` 字节码、强制 JIT 反优化
 
-**`banNativeLoad`** 通过 hook `Runtime.load0()` 和 `Runtime.loadLibrary0()` 实现 — 这是所有 Java 侧原生库加载的内部入口（`System.load`、`System.loadLibrary`、`Runtime.load`、`Runtime.loadLibrary` 全部经过这里）。ForgeVM 自身的 DLL 不受影响 — 它通过外部 Agent 进程加载，不走 Java 的 `System.load`。
+purge 不可逆（不像未来 attach 过滤可以用 `unbanJavaAgent()` 撤销）。jar 身份无法识别的 agent（boot loader / 动态生成类）在 filter 模式下会被跳过——若希望连这类一起清掉，调用无参的 `banJavaAgent()`。
+
+**`banNativeLoad`** hook `ntdll!LdrLoadDll` — 进程内所有 DLL 加载的内核级入口，覆盖 JNI 加载、注入线程、被偷渡的 Agent DLL 等全部路径。`System.load`、`System.loadLibrary`、`Runtime.load`、`Runtime.loadLibrary` 以及任何映射 DLL 的手段均受控制，被拦截的加载返回 `STATUS_DLL_NOT_FOUND`。ForgeVM 自身的 DLL 不受影响——它在 hook 安装前通过外部 Agent 进程加载。
+
+**`relaunch`** 是 ForgeVM 中唯一能保护新 JVM **整个生命周期**（从第一条指令开始）的 API。流程：
+
+1. 通过 WMI 查询当前 JVM 完整命令行，对 `-javaagent:` / `-agentpath:` token 应用过滤剥离。注入 `-Dforgevm.relaunched=true`（断路器）和 `-Dforgevm.agent.pid=<agent_pid>`（handoff token）。
+2. `CreateProcessW` 以 `CREATE_SUSPENDED` 创建新 JVM —— 进程已存在但主线程尚未执行任何一条指令。
+3. 打开新 JVM 句柄，把 DLL 的目标切换到它（`forgevm_attach_target_minimal`），把 `ntdll!LdrLoadDll` patch 直接写入新 JVM 内存。**从此刻起**，新 JVM 中所有 DLL 加载——包括 JVM 启动器加载 `jvm.dll` 本身、JNI 加载、被注入的 DLL——全部经过 `nativeFilter` 过滤。
+4. `ResumeThread` 唤醒新 JVM。它从第一条指令开始就带着 ntdll hook 跑。
+5. `TerminateProcess` 杀掉旧 JVM。Agent **不退出**，继续保留。
+6. 持久化 agent 的 watcher 线程每 50 ms 轮询新 JVM 的模块列表；一旦看到 `jvm.dll` 被映射，立即跑完整 `bootstrap_target` 并装上 `JVM_EnqueueOperation` hook（banJavaAgent）。这早在 `main()` 运行之前完成，新 JVM 整个生命周期内动态 agent attach 都被阻断。
+7. 新 JVM 后续调用 `ForgeVM.launch()` 时，检测到 handoff token，通过命名管道 `\\.\pipe\forgevm_cmd_<agent_pid>` 连接到现有 agent，而不是 spawn 新 agent。**同一个** agent 既预先 patch 了新 JVM，又继续服务所有后续命令。
+
+结果：传入的 filter 行为等价于真正的 JVM 启动参数——从新 JVM 的第 0 条指令就生效，攻击者没有任何可乘的窗口期进行 attach 或加载。旧的已加载 agent/DLL 全部消失（旧 JVM 被终止，OS 回收了地址空间）。
 
 ### Forge 模块
 
@@ -471,11 +512,15 @@ super("com.example.Foo", "bar(Ljava/lang/String;)"); // 带参数描述符
 **注入点：**
 
 ```java
-super("Foo", "bar", HEAD);                      // 方法入口（默认）
+super("Foo", "bar", HEAD);                       // 方法入口（默认）
 super("Foo", "bar", RETURN);                     // 每个 return 前
-super("Foo", "bar", INVOKE("targetMethod"));     // 方法调用前
-super("Foo", "bar", FIELD_GET("fieldName"));     // 字段读取前
-super("Foo", "bar", FIELD_PUT("fieldName"));     // 字段写入前
+super("Foo", "bar", INVOKE("setHealth"));        // 所有 setHealth 调用前（全重载）
+super("Foo", "bar", INVOKE("setHealth(F)"));     // 名称 + 参数描述符匹配
+super("Foo", "bar", INVOKE("setHealth(F)V"));    // 完整描述符匹配
+super("Foo", "bar", FIELD_GET("health"));        // 所有名为 health 的 getfield/getstatic 前
+super("Foo", "bar", FIELD_GET("health:F"));      // 名称 + 类型描述符匹配
+super("Foo", "bar", FIELD_PUT("health"));        // 所有名为 health 的 putfield/putstatic 前
+super("Foo", "bar", FIELD_PUT("health:F"));      // 名称 + 类型描述符匹配
 super("Foo", "bar", NEW("java.util.ArrayList")); // 对象创建前
 ```
 

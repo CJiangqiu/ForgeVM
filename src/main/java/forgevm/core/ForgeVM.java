@@ -3,6 +3,7 @@ package forgevm.core;
 import forgevm.jvm.AgentFilter;
 import forgevm.jvm.JvmControl;
 import forgevm.jvm.NativeFilter;
+import forgevm.jvm.RelaunchException;
 import forgevm.memory.MemoryUtil;
 import forgevm.forge.ForgeManager;
 import forgevm.util.FvmLog;
@@ -14,6 +15,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.io.RandomAccessFile;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -28,6 +33,11 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class ForgeVM {
     private static final String ENV_AGENT_EXE_PATH = "FORGEVM_AGENT_EXE_PATH";
     private static final String PROP_AGENT_EXE_PATH = "forgevm.agent.exe.path";
+    /** Set by the persistent agent on the new JVM's command line after relaunch.
+     *  Value is the agent's own PID — used to construct the handoff named pipe
+     *  path. When this property is present, launch() reuses the existing agent
+     *  instead of spawning a new one. */
+    private static final String PROP_AGENT_HANDOFF_PID = "forgevm.agent.pid";
     private static final String ENV_NATIVE_DLL_PATH = "FORGEVM_NATIVE_DLL_PATH";
     private static final String PROP_NATIVE_DLL_PATH = "forgevm.native." + chars('d', 'l', 'l') + ".path";
 
@@ -72,7 +82,7 @@ public final class ForgeVM {
 
     public static synchronized LaunchResult launch() {
         AgentSession currentSession = agentSession;
-        if (currentSession != null && !currentSession.process().isAlive()) {
+        if (currentSession != null && !currentSession.isAlive()) {
             clearAgentExitSender();
             clearAgentLockController();
             closeAgentSession(currentSession);
@@ -80,7 +90,7 @@ public final class ForgeVM {
         }
 
         if (state != null && state.nativeDllActive()
-                && agentSession != null && agentSession.process().isAlive()) {
+                && agentSession != null && agentSession.isAlive()) {
             return state;
         }
 
@@ -94,7 +104,7 @@ public final class ForgeVM {
 
     public static boolean isAgentActive() {
         AgentSession session = agentSession;
-        return session != null && session.process().isAlive();
+        return session != null && session.isAlive();
     }
 
     // -- memory API --
@@ -121,11 +131,13 @@ public final class ForgeVM {
 
     // -- jvm control --
 
-    public static boolean exit() {
+    /** Kill the target JVM via out-of-process {@code TerminateProcess}. Not a wrapper for {@code System.exit}. */
+    public static boolean exitJvm() {
         return JvmControl.exitJvm();
     }
 
-    public static boolean exit(int exitCode) {
+    /** Kill the target JVM with the given exit code via out-of-process {@code TerminateProcess}. */
+    public static boolean exitJvm(int exitCode) {
         return JvmControl.exitJvm(exitCode);
     }
 
@@ -143,20 +155,38 @@ public final class ForgeVM {
 
     // -- java agent guard (native-level, patches JVM_EnqueueOperation in jvm.dll) --
 
-    /** Block all Java agent attach attempts. */
+    /**
+     * Comprehensive Java agent ban: purges every already-loaded agent and blocks
+     * every future attach attempt. Irreversible for the purge arm.
+     */
     public static boolean banJavaAgent() {
-        return sendFilterCommand("ban_java_agent", null, null);
+        return banJavaAgentInternal(null);
     }
 
-    /** Block Java agent attach attempts matching the filter. */
+    /**
+     * Filtered Java agent ban: purges already-loaded agents whose source jar
+     * matches {@code filter}, and blocks future attach attempts whose jar path
+     * matches the same filter. Agents whose jar identity cannot be resolved
+     * (boot loader, dynamically-generated classes) are NOT purged — call
+     * {@link #banJavaAgent()} with no filter for unconditional purge.
+     *
+     * <p>The purge arm is irreversible; the future-attach block is reversible
+     * via {@link #unbanJavaAgent()}.
+     */
     public static boolean banJavaAgent(AgentFilter filter) {
-        return sendFilterCommand("ban_java_agent",
-                filter == null ? null : filter.mode().name(),
-                filter == null ? null : filter.patterns());
+        return banJavaAgentInternal(filter);
     }
 
     public static boolean unbanJavaAgent() {
         return sendFilterCommand("unban_java_agent", null, null);
+    }
+
+    private static boolean banJavaAgentInternal(AgentFilter filter) {
+        String mode = filter == null ? null : filter.mode().name();
+        List<String> patterns = filter == null ? null : filter.patterns();
+        boolean ok = sendFilterCommand("purge_matching_agents", mode, patterns);
+        ok &= sendFilterCommand("ban_java_agent", mode, patterns);
+        return ok;
     }
 
     // -- native load guard (loader-level, patches ntdll!LdrLoadDll) --
@@ -177,9 +207,94 @@ public final class ForgeVM {
         return sendFilterCommand("unban_native_load", null, null);
     }
 
+    // -- relaunch (kill + restart JVM with filtered command line) --
+
+    /** Relaunch the JVM, keeping all existing -javaagent/-agentpath args. Never returns on success. */
+    public static void relaunch() throws RelaunchException {
+        relaunchInternal(null, null);
+    }
+
+    /** Relaunch the JVM, applying agentFilter to -javaagent: args on the new command line. Never returns on success. */
+    public static void relaunch(AgentFilter agentFilter) throws RelaunchException {
+        relaunchInternal(agentFilter, null);
+    }
+
+    /** Relaunch the JVM, applying nativeFilter to -agentpath: args on the new command line. Never returns on success. */
+    public static void relaunch(NativeFilter nativeFilter) throws RelaunchException {
+        relaunchInternal(null, nativeFilter);
+    }
+
+    /** Relaunch the JVM, applying both filters to the new command line. Never returns on success. */
+    public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter) throws RelaunchException {
+        relaunchInternal(agentFilter, nativeFilter);
+    }
+
+    private static void relaunchInternal(AgentFilter agentFilter, NativeFilter nativeFilter) throws RelaunchException {
+        if (System.getProperty("forgevm.relaunched") != null) {
+            throw new RelaunchException("already_relaunched");
+        }
+        AgentSession session = agentSession;
+        if (session == null || !session.isAlive()) {
+            throw new RelaunchException("agent_not_active");
+        }
+        try {
+            String command = buildRelaunchCommand(agentFilter, nativeFilter);
+            String response = sendCommand(session, command);
+            if (!isOkResponse(response)) {
+                String reason = "relaunch_rejected";
+                if (response != null && !response.isBlank()) {
+                    Map<String, String> fields = JsonUtils.parseFlatJsonObject(response);
+                    reason = fields.getOrDefault("reason", reason);
+                }
+                throw new RelaunchException(reason);
+            }
+            /* Agent acknowledged: JVM termination is imminent. Block here until killed. */
+            try {
+                Thread.sleep(Long.MAX_VALUE);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            throw new RelaunchException("jvm_not_killed");
+        } catch (RelaunchException e) {
+            throw e;
+        } catch (Throwable e) {
+            throw new RelaunchException("relaunch_send_failed");
+        }
+    }
+
+    private static String buildRelaunchCommand(AgentFilter agentFilter, NativeFilter nativeFilter) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"cmd\":\"relaunch\"");
+        sb.append(",\"pid\":").append(ProcessHandle.current().pid());
+        sb.append(",\"hasAgentFilter\":").append(agentFilter != null);
+        if (agentFilter != null) {
+            sb.append(",\"agentMode\":\"").append(escapeJson(agentFilter.mode().name().toLowerCase())).append("\"");
+            sb.append(",\"agentPatterns\":[");
+            List<String> ap = agentFilter.patterns();
+            for (int i = 0; i < ap.size(); i++) {
+                if (i > 0) sb.append(',');
+                sb.append('"').append(escapeJson(ap.get(i))).append('"');
+            }
+            sb.append(']');
+        }
+        sb.append(",\"hasNativeFilter\":").append(nativeFilter != null);
+        if (nativeFilter != null) {
+            sb.append(",\"nativeMode\":\"").append(escapeJson(nativeFilter.mode().name().toLowerCase())).append("\"");
+            sb.append(",\"nativePatterns\":[");
+            List<String> np = nativeFilter.patterns();
+            for (int i = 0; i < np.size(); i++) {
+                if (i > 0) sb.append(',');
+                sb.append('"').append(escapeJson(np.get(i))).append('"');
+            }
+            sb.append(']');
+        }
+        sb.append('}');
+        return sb.toString();
+    }
+
     private static boolean sendFilterCommand(String cmd, String mode, List<String> patterns) {
         AgentSession session = agentSession;
-        if (session == null || !session.process().isAlive()) {
+        if (session == null || !session.isAlive()) {
             return false;
         }
         try {
@@ -209,23 +324,6 @@ public final class ForgeVM {
         return sb.toString();
     }
 
-    public static boolean purgeAgent(String agentClassName) {
-        if (agentClassName == null || agentClassName.isBlank()) {
-            return false;
-        }
-        AgentSession session = agentSession;
-        if (session == null || !session.process().isAlive()) {
-            return false;
-        }
-        try {
-            String command = buildCommand("purge_agent", Map.of("agentClass", agentClassName));
-            String response = sendCommand(session, command);
-            return isOkResponse(response);
-        } catch (Throwable ignored) {
-            return false;
-        }
-    }
-
     public static boolean rebindAgentToCurrentJvm() {
         return JvmControl.rebindAgentToCurrentJvm();
     }
@@ -233,6 +331,19 @@ public final class ForgeVM {
     // -- launch internals --
 
     private static LaunchResult launchInternal() {
+        /* Handoff: a persistent agent that survived a relaunch put its PID on
+         * our command line. Connect to its named pipe instead of spawning a
+         * fresh agent — this is what makes the new JVM's lifecycle fully
+         * protected (the same agent that pre-patched ntdll!LdrLoadDll into
+         * this JVM while it was still SUSPENDED). */
+        String handoffPid = System.getProperty(PROP_AGENT_HANDOFF_PID);
+        if (handoffPid != null && !handoffPid.isBlank()) {
+            LaunchResult r = launchViaHandoff(handoffPid.trim());
+            if (r != null) return r;
+            /* Handoff failed — fall through to normal spawn as a degraded path.
+             * Logged inside launchViaHandoff. */
+        }
+
         Path dllPath = resolveNativeDllPath();
         if (dllPath == null || !Files.exists(dllPath)) {
             clearAgentExitSender();
@@ -292,6 +403,58 @@ public final class ForgeVM {
         }
     }
 
+    /** Connect to a pre-existing agent via the handoff named pipe.
+     *  The pipe is created by the persistent agent at startup with name
+     *  {@code \\.\pipe\forgevm_cmd_<agent_pid>}. Returns a {@code LaunchResult}
+     *  on success (with {@code agentSession} populated), or null to signal
+     *  that the caller should fall back to spawning a fresh agent. */
+    private static LaunchResult launchViaHandoff(String agentPid) {
+        String pipePath = "\\\\.\\pipe\\forgevm_cmd_" + agentPid;
+        try {
+            /* On Windows, named pipes can be opened with regular file I/O —
+             * the kernel handles the pipe protocol transparently. We use
+             * RandomAccessFile because it supports full-duplex on a single
+             * handle (FileInputStream + FileOutputStream would open two
+             * separate handles, exceeding the agent's maxInstances=1). */
+            RandomAccessFile raf = new RandomAccessFile(pipePath, "rw");
+            FileChannel ch = raf.getChannel();
+            BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(Channels.newInputStream(ch), StandardCharsets.UTF_8));
+            BufferedWriter writer = new BufferedWriter(
+                    new OutputStreamWriter(Channels.newOutputStream(ch), StandardCharsets.UTF_8));
+
+            /* process=null marks this as a handoff session — isAlive() returns
+             * true until an IPC error, and closeAgentSession skips waitFor. */
+            AgentSession session = new AgentSession(null, reader, writer);
+
+            String responseLine = sendCommand(session,
+                    "{\"cmd\":\"bootstrap\",\"pid\":" + ProcessHandle.current().pid() + "}");
+            if (responseLine == null || responseLine.isBlank()) {
+                closeAgentSession(session);
+                return agentUnavailable("handoff_empty_response", pipePath);
+            }
+
+            /* The agent was already bound to this JVM (the watcher thread
+             * re-bootstrapped on jvm.dll load), so the bootstrap reply tells
+             * us the current status. */
+            Path dllPathPlaceholder = Paths.get(pipePath);
+            LaunchResult result = parseAgentResponse(responseLine, dllPathPlaceholder);
+            if (result.agentStatus() == AgentStatus.UNAVAILABLE) {
+                closeAgentSession(session);
+                return result;
+            }
+            agentSession = session;
+            registerAgentExitSender(session);
+            registerAgentLockController(session);
+            FvmLog.info("ForgeVM connected to persistent agent via " + pipePath);
+            return result;
+        } catch (Throwable ex) {
+            FvmLog.warn("handoff failed (" + ex.getClass().getSimpleName() + "): " + ex.getMessage()
+                    + " — falling back to fresh agent spawn");
+            return null;
+        }
+    }
+
     private static Process startProcessReflectively(List<String> command) throws Exception {
         try {
             Class<?> processBuilderClass = Class.forName(chars(
@@ -336,7 +499,7 @@ public final class ForgeVM {
         JvmControl.ExitCommandSender sender = new JvmControl.ExitCommandSender() {
             @Override
             public boolean isAvailable() {
-                return session.process().isAlive();
+                return session.isAlive();
             }
 
             @Override
@@ -366,7 +529,7 @@ public final class ForgeVM {
         JvmControl.AgentLockController controller = new JvmControl.AgentLockController() {
             @Override
             public boolean isAvailable() {
-                return session.process().isAlive();
+                return session.isAlive();
             }
 
             @Override
@@ -405,7 +568,7 @@ public final class ForgeVM {
 
     public static String agentSend(String commandJson) {
         AgentSession session = agentSession;
-        if (session == null || !session.process().isAlive()) {
+        if (session == null || !session.isAlive()) {
             throw new IllegalStateException("agent_not_active");
         }
         try {
@@ -450,7 +613,10 @@ public final class ForgeVM {
         session.ioLock().lock();
         try {
             session.writer().write(commandJson);
-            session.writer().newLine();
+            /* Use explicit '\n' rather than BufferedWriter.newLine() (which is
+             * \r\n on Windows). After handoff the agent's stdin is in binary
+             * mode and an embedded \r would corrupt the trailing JSON field. */
+            session.writer().write('\n');
             session.writer().flush();
 
             CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
@@ -613,20 +779,25 @@ public final class ForgeVM {
                 session.ioLock().lock();
                 try {
                     session.writer().write("{\"cmd\":\"shutdown\"}");
-                    session.writer().newLine();
+                    session.writer().write('\n');
                     session.writer().flush();
                 } finally {
                     session.ioLock().unlock();
                 }
             } catch (Throwable ignored) {
             }
-            try { session.process().waitFor(1500, TimeUnit.MILLISECONDS); } catch (Throwable ignored) {}
+            if (session.process() != null) {
+                try { session.process().waitFor(1500, TimeUnit.MILLISECONDS); } catch (Throwable ignored) {}
+            }
             try { session.writer().close(); } catch (Throwable ignored) {}
             try { session.reader().close(); } catch (Throwable ignored) {}
         } catch (Throwable ignored) {
         }
     }
 
+    /** Agent IPC session. {@code process} is non-null when we spawned the agent
+     *  ourselves (initial launch) and null when we connected to a pre-existing
+     *  agent via the handoff named pipe (post-relaunch). */
     private record AgentSession(
             Process process,
             BufferedReader reader,
@@ -635,6 +806,13 @@ public final class ForgeVM {
     ) {
         private AgentSession(Process process, BufferedReader reader, BufferedWriter writer) {
             this(process, reader, writer, new ReentrantLock());
+        }
+
+        /** Conservative liveness check: when we own the agent process, ask the OS.
+         *  In handoff mode we don't own the process, so we trust the IPC until a
+         *  read/write fails. */
+        boolean isAlive() {
+            return process == null || process.isAlive();
         }
     }
 

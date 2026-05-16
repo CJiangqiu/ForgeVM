@@ -1,6 +1,11 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <aclapi.h>
+/* WMI for relaunch: link ole32.lib oleaut32.lib wbemuuid.lib */
+#include <comdef.h>
+#include <wbemidl.h>
+/* EnumProcessModulesEx / GetModuleBaseNameW for relaunch post-resume watcher. Link Psapi.lib. */
+#include <psapi.h>
 
 #include <iostream>
 #include <sstream>
@@ -12,6 +17,10 @@
 #include <functional>
 #include <cstdio>
 #include <cstdarg>
+#include <cwctype>
+/* For redirecting stdin/stdout to the handoff command pipe after old JVM dies. */
+#include <io.h>
+#include <fcntl.h>
 
 // ============================================================
 // Agent-level file logging — unified with DLL into one file
@@ -61,19 +70,14 @@ typedef int(__cdecl* InitFn)();
 typedef const char* (__cdecl* LastErrorFn)();
 typedef int(__cdecl* ExitByPidFn)(unsigned long long, int);
 typedef int(__cdecl* BootstrapTargetFn)(unsigned long long);
+typedef int(__cdecl* AttachTargetMinimalFn)(unsigned long long);
 typedef unsigned long long(__cdecl* StructMapCountFn)();
 typedef int(__cdecl* PutFieldFn)(unsigned long long, const char*, const char*, const unsigned char*, unsigned long long);
 typedef int(__cdecl* PutFieldBatchFn)(const unsigned long long*, unsigned long long, const char*, const char*, const unsigned char*, unsigned long long);
 typedef void(__cdecl* SetLogDirFn)(const char*);
-typedef int(__cdecl* TransformLoadFn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*);
-typedef int(__cdecl* TransformLoadV2Fn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*, int);
-typedef int(__cdecl* TransformUnloadFn)(const char*, const char*, const char*);
 typedef int(__cdecl* ForceDeoptNowFn)();
-typedef int(__cdecl* PurgeAgentFn)(const char*);
+typedef int(__cdecl* PurgeAgentsMatchingFn)(int, const char* const*, int);
 typedef int(__cdecl* PutFieldPathFn)(const char*, const char*, const unsigned char*, unsigned long long);
-typedef int(__cdecl* ForgeSubclassLoadFn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*);
-typedef int(__cdecl* ForgeSubclassLoadV2Fn)(const char*, const char*, const char*, const char*, const char*, const char*, const char*, int);
-typedef int(__cdecl* ForgeSubclassUnloadFn)(const char*, const char*, const char*);
 typedef int(__cdecl* PutObjectFieldPathFn)(const char*, const char*, const char*, const char*);
 typedef int(__cdecl* BanJavaAgentFn)(const char*);
 typedef int(__cdecl* UnbanJavaAgentFn)();
@@ -90,6 +94,7 @@ struct NativeApi {
     LastErrorFn lastError = NULL;
     ExitByPidFn exitByPid = NULL;
     BootstrapTargetFn bootstrapTarget = NULL;
+    AttachTargetMinimalFn attachTargetMinimal = NULL;
     StructMapCountFn structMapCount = NULL;
     StructMapCountFn typeMapCount = NULL;
     LastErrorFn compressionInfo = NULL;
@@ -99,15 +104,9 @@ struct NativeApi {
     PutFieldBatchFn putRefFieldBatch = NULL;
     ProbeFn dumpCardStructs = NULL;
     SetLogDirFn setLogDir = NULL;
-    TransformLoadFn transformLoad = NULL;
-    TransformLoadV2Fn transformLoadV2 = NULL;
-    TransformUnloadFn transformUnload = NULL;
     ForceDeoptNowFn forceDeoptNow = NULL;
-    PurgeAgentFn purgeAgent = NULL;
+    PurgeAgentsMatchingFn purgeAgentsMatching = NULL;
     PutFieldPathFn putFieldPath = NULL;
-    ForgeSubclassLoadFn forgeSubLoad = NULL;
-    ForgeSubclassLoadV2Fn forgeSubLoadV2 = NULL;
-    ForgeSubclassUnloadFn forgeSubUnload = NULL;
     PutObjectFieldPathFn putObjectFieldPath = NULL;
     BanJavaAgentFn banJavaAgent = NULL;
     UnbanJavaAgentFn unbanJavaAgent = NULL;
@@ -177,26 +176,72 @@ static bool hardenSelfProcessDACL() {
 // Parent process watchdog: exits agent when parent JVM dies
 static std::atomic<DWORD> g_parentPid{0};
 
+/* Set true by handleRelaunch after a successful CREATE_SUSPENDED + suspended-time
+ * hook install. Tells main() to NOT exit when stdin EOFs (old JVM is dead) — the
+ * agent must persist to keep serving the filter pipe so the ntdll hook in the new
+ * JVM continues to receive allow/block decisions. */
+static std::atomic<bool> g_persistAfterEOF{false};
+
 DWORD WINAPI parentWatchdogThread(LPVOID) {
+    /* Short-timeout polling instead of INFINITE wait. The agent's parent pid
+     * changes mid-life during relaunch (`g_parentPid.store(0)` to disable,
+     * then `.store(new_jvm_pid)` once the new JVM is created). A blocking
+     * INFINITE wait on the old handle would never observe these transitions
+     * and would force-exit the moment the old JVM is terminated — killing
+     * the persistent agent before it can serve the new JVM.
+     *
+     * The 200ms loop:
+     *   - tracks the current g_parentPid value
+     *   - re-opens the handle when pid changes
+     *   - on parent death, only exits if g_parentPid still points to the
+     *     same (now-dead) pid AND g_persistAfterEOF is not set (i.e. we
+     *     aren't in the middle of a relaunch handoff). */
+    DWORD lastPid = 0;
+    HANDLE hParent = NULL;
     while (true) {
         DWORD pid = g_parentPid.load();
-        if (pid == 0) {
-            Sleep(500);
+
+        if (pid != lastPid) {
+            if (hParent) { CloseHandle(hParent); hParent = NULL; }
+            lastPid = pid;
+            if (pid != 0) {
+                hParent = OpenProcess(SYNCHRONIZE, FALSE, pid);
+                if (hParent == NULL) {
+                    /* Can't open — could be transient (e.g. process just spawned
+                     * and ACLs not stable yet). Retry next tick instead of
+                     * exiting; only ExitProcess once we previously had a valid
+                     * handle and saw a WAIT_OBJECT_0 signal. */
+                    lastPid = 0;
+                }
+            }
+        }
+
+        if (hParent == NULL) {
+            Sleep(200);
             continue;
         }
-        HANDLE hParent = OpenProcess(SYNCHRONIZE, FALSE, pid);
-        if (hParent == NULL) {
-            // Parent already dead — force exit
-            ExitProcess(0);
-            return 0;
-        }
-        DWORD waitResult = WaitForSingleObject(hParent, INFINITE);
+
+        DWORD r = WaitForSingleObject(hParent, 200);
+        if (r != WAIT_OBJECT_0) continue; /* still alive, loop */
+
+        /* Parent process is gone. Decide whether to exit. */
         CloseHandle(hParent);
-        if (waitResult == WAIT_OBJECT_0) {
-            // Parent exited — force exit
-            ExitProcess(0);
+        hParent = NULL;
+
+        DWORD nowPid = g_parentPid.load();
+        if (nowPid != lastPid) {
+            /* Pid was switched (relaunch in progress). Loop will re-open. */
+            lastPid = 0;
+            continue;
         }
-        return 0;
+        if (g_persistAfterEOF.load()) {
+            /* Relaunch armed persistence — old JVM died as expected, new pid
+             * not yet stored. Wait for g_parentPid to be updated. */
+            lastPid = 0;
+            continue;
+        }
+        /* Truly orphaned — exit. */
+        ExitProcess(0);
     }
     return 0;
 }
@@ -498,7 +543,8 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->init            = reinterpret_cast<InitFn>(GetProcAddress(module, "forgevm_init"));
     api->lastError       = reinterpret_cast<LastErrorFn>(GetProcAddress(module, "forgevm_last_error"));
     api->exitByPid       = reinterpret_cast<ExitByPidFn>(GetProcAddress(module, "forgevm_exit_process"));
-    api->bootstrapTarget = reinterpret_cast<BootstrapTargetFn>(GetProcAddress(module, "forgevm_bootstrap_target"));
+    api->bootstrapTarget     = reinterpret_cast<BootstrapTargetFn>(GetProcAddress(module, "forgevm_bootstrap_target"));
+    api->attachTargetMinimal = reinterpret_cast<AttachTargetMinimalFn>(GetProcAddress(module, "forgevm_attach_target_minimal"));
     api->structMapCount  = reinterpret_cast<StructMapCountFn>(GetProcAddress(module, "forgevm_structmap_count"));
     api->typeMapCount    = reinterpret_cast<StructMapCountFn>(GetProcAddress(module, "forgevm_typemap_count"));
     api->compressionInfo = reinterpret_cast<LastErrorFn>(GetProcAddress(module, "forgevm_compression_info"));
@@ -508,15 +554,9 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->putRefFieldBatch = reinterpret_cast<PutFieldBatchFn>(GetProcAddress(module, "forgevm_put_ref_field_batch"));
     api->setLogDir       = reinterpret_cast<SetLogDirFn>(GetProcAddress(module, "forgevm_set_log_dir"));
     api->dumpCardStructs = reinterpret_cast<ProbeFn>(GetProcAddress(module, "forgevm_dump_card_structs"));
-    api->transformLoad   = reinterpret_cast<TransformLoadFn>(GetProcAddress(module, "forgevm_transform_load"));
-    api->transformLoadV2 = reinterpret_cast<TransformLoadV2Fn>(GetProcAddress(module, "forgevm_transform_load_v2"));
-    api->transformUnload = reinterpret_cast<TransformUnloadFn>(GetProcAddress(module, "forgevm_transform_unload"));
     api->forceDeoptNow   = reinterpret_cast<ForceDeoptNowFn>(GetProcAddress(module, "forgevm_force_deopt_now"));
-    api->purgeAgent      = reinterpret_cast<PurgeAgentFn>(GetProcAddress(module, "forgevm_purge_agent"));
+    api->purgeAgentsMatching = reinterpret_cast<PurgeAgentsMatchingFn>(GetProcAddress(module, "forgevm_purge_agents_matching"));
     api->putFieldPath    = reinterpret_cast<PutFieldPathFn>(GetProcAddress(module, "forgevm_put_field_path"));
-    api->forgeSubLoad    = reinterpret_cast<ForgeSubclassLoadFn>(GetProcAddress(module, "forgevm_forge_load_subclasses"));
-    api->forgeSubLoadV2  = reinterpret_cast<ForgeSubclassLoadV2Fn>(GetProcAddress(module, "forgevm_forge_load_subclasses_v2"));
-    api->forgeSubUnload  = reinterpret_cast<ForgeSubclassUnloadFn>(GetProcAddress(module, "forgevm_forge_unload_subclasses"));
     api->putObjectFieldPath = reinterpret_cast<PutObjectFieldPathFn>(GetProcAddress(module, "forgevm_put_object_field_path"));
     api->banJavaAgent    = reinterpret_cast<BanJavaAgentFn>(GetProcAddress(module, "forgevm_ban_java_agent"));
     api->unbanJavaAgent  = reinterpret_cast<UnbanJavaAgentFn>(GetProcAddress(module, "forgevm_unban_java_agent"));
@@ -781,116 +821,8 @@ void handlePutRefFieldBatch(const NativeApi& api, const std::string& line, const
     }
 }
 
-void handleForgeLoad(const NativeApi& api, const std::string& line, const std::string& dllPath) {
-    if (api.transformLoad == NULL) {
-        printResult("fallback", "UNAVAILABLE", dllPath, "forge_load_not_exported");
-        return;
-    }
-    std::string targetClass  = getJsonStringField(line, "targetClass");
-    std::string targetMethod = getJsonStringField(line, "targetMethod");
-    std::string targetParamDesc = getJsonStringField(line, "targetParamDesc");
-    std::string injectAt     = getJsonStringField(line, "injectAt");
-    std::string injectTarget = getJsonStringField(line, "injectTarget");
-    std::string hookClass    = getJsonStringField(line, "hookClass");
-    std::string hookMethod   = getJsonStringField(line, "hookMethod");
-    std::string hookDesc     = getJsonStringField(line, "hookDesc");
-    bool includeSubclasses   = line.find("\"includeSubclasses\":true") != std::string::npos;
-    bool deferDeopt          = line.find("\"deferDeopt\":true") != std::string::npos;
-
-    // Combine injectAt + injectTarget into "TYPE:target" format for DLL
-    std::string injectAtFull = injectAt;
-    if (!injectTarget.empty()) {
-        injectAtFull += ":" + injectTarget;
-    }
-
-    AGENT_LOG("forge_load: %s.%s(%s) @ %s -> %s.%s%s [subclasses=%s defer=%s]",
-              targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
-              injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str(),
-              includeSubclasses ? "true" : "false",
-              deferDeopt ? "true" : "false");
-
-    if (targetClass.empty() || targetMethod.empty() || injectAt.empty() ||
-        hookClass.empty() || hookMethod.empty() || hookDesc.empty()) {
-        AGENT_LOG("forge_load: missing params");
-        printResult("fallback", "UNAVAILABLE", dllPath, "missing_forge_load_params");
-        return;
-    }
-
-    int result;
-    if (includeSubclasses && api.forgeSubLoadV2 != NULL) {
-        result = api.forgeSubLoadV2(
-            targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
-            injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str(),
-            deferDeopt ? 1 : 0);
-    } else if (includeSubclasses && api.forgeSubLoad != NULL) {
-        // Fallback for older DLL without v2 export
-        result = api.forgeSubLoad(
-            targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
-            injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str());
-    } else if (api.transformLoadV2 != NULL) {
-        result = api.transformLoadV2(
-            targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
-            injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str(),
-            deferDeopt ? 1 : 0);
-    } else {
-        // Fallback for older DLL without v2 export
-        result = api.transformLoad(
-            targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
-            injectAtFull.c_str(), hookClass.c_str(), hookMethod.c_str(), hookDesc.c_str());
-    }
-
-    std::string reason = copyReason(api, result == 1 ? "ok" : "forge_load_failed");
-    AGENT_LOG("forge_load result=%d reason=%s", result, reason.c_str());
-    if (result == 1) {
-        printResult("ok", "FULL", dllPath, reason.c_str());
-    } else {
-        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
-    }
-}
-
-void handleForgeUnload(const NativeApi& api, const std::string& line, const std::string& dllPath) {
-    if (api.transformUnload == NULL) {
-        printResult("fallback", "UNAVAILABLE", dllPath, "forge_unload_not_exported");
-        return;
-    }
-    std::string targetClass  = getJsonStringField(line, "targetClass");
-    std::string targetMethod = getJsonStringField(line, "targetMethod");
-    std::string targetParamDesc = getJsonStringField(line, "targetParamDesc");
-    bool includeSubclasses   = line.find("\"includeSubclasses\":true") != std::string::npos;
-
-    AGENT_LOG("forge_unload: %s.%s(%s) [subclasses=%s]",
-              targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str(),
-              includeSubclasses ? "true" : "false");
-
-    if (targetClass.empty() || targetMethod.empty()) {
-        printResult("fallback", "UNAVAILABLE", dllPath, "missing_forge_unload_params");
-        return;
-    }
-
-    int result;
-    if (includeSubclasses && api.forgeSubUnload != NULL) {
-        result = api.forgeSubUnload(targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str());
-    } else {
-        result = api.transformUnload(targetClass.c_str(), targetMethod.c_str(), targetParamDesc.c_str());
-    }
-
-    std::string reason = copyReason(api, result == 1 ? "ok" : "forge_unload_failed");
-    AGENT_LOG("forge_unload result=%d reason=%s", result, reason.c_str());
-    if (result == 1) {
-        printResult("ok", "FULL", dllPath, reason.c_str());
-    } else {
-        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
-    }
-}
-
 // ============================================================
 // forge_batch_plan: per-class plan-once-commit-once entry point
-//
-// Java side sends one batch IPC for the entire load() call; this handler
-// decomposes it into per-ingot transformLoad calls (Stage 2 wiring). The
-// real plan-once-commit-once implementation lives in the DLL (Stage 3) --
-// once that lands, this handler routes to a single new DLL export instead
-// of looping per-ingot.
 // ============================================================
 
 namespace {
@@ -918,52 +850,6 @@ struct PerIngotResult {
     std::string reason;
 };
 
-PerIngotResult tryIngotCandidates(const NativeApi& api, const BatchIngot& ingot, int deferDeopt) {
-    PerIngotResult r;
-    r.reason = ingot.candidates.empty() ? "no_candidates" : "method_not_found";
-
-    std::string injectAtFull = ingot.injectAt;
-    if (!ingot.injectTarget.empty()) {
-        injectAtFull += ":" + ingot.injectTarget;
-    }
-
-    for (const auto& cand : ingot.candidates) {
-        int result;
-        if (ingot.includeSubclasses && api.forgeSubLoadV2 != NULL) {
-            result = api.forgeSubLoadV2(
-                ingot.targetClass.c_str(), cand.methodName.c_str(), cand.paramDesc.c_str(),
-                injectAtFull.c_str(), ingot.hookClass.c_str(), ingot.hookMethod.c_str(),
-                ingot.hookDesc.c_str(), deferDeopt);
-        } else if (ingot.includeSubclasses && api.forgeSubLoad != NULL) {
-            result = api.forgeSubLoad(
-                ingot.targetClass.c_str(), cand.methodName.c_str(), cand.paramDesc.c_str(),
-                injectAtFull.c_str(), ingot.hookClass.c_str(), ingot.hookMethod.c_str(),
-                ingot.hookDesc.c_str());
-        } else if (api.transformLoadV2 != NULL) {
-            result = api.transformLoadV2(
-                ingot.targetClass.c_str(), cand.methodName.c_str(), cand.paramDesc.c_str(),
-                injectAtFull.c_str(), ingot.hookClass.c_str(), ingot.hookMethod.c_str(),
-                ingot.hookDesc.c_str(), deferDeopt);
-        } else {
-            result = api.transformLoad(
-                ingot.targetClass.c_str(), cand.methodName.c_str(), cand.paramDesc.c_str(),
-                injectAtFull.c_str(), ingot.hookClass.c_str(), ingot.hookMethod.c_str(),
-                ingot.hookDesc.c_str());
-        }
-        if (result == 1) {
-            r.matched    = true;
-            r.methodName = cand.methodName;
-            r.paramDesc  = cand.paramDesc;
-            return r;
-        }
-        const char* le = api.lastError ? api.lastError() : NULL;
-        if (le != NULL && le[0] != '\0') {
-            r.reason = le;
-        }
-    }
-    return r;
-}
-
 } // namespace
 
 // Parse a forgevm_forge_class_plan results JSON ("[{matched:..,...}, ...]")
@@ -988,8 +874,8 @@ static std::vector<PerIngotResult> parseClassPlanResults(const std::string& json
 }
 
 void handleForgeBatchPlan(const NativeApi& api, const std::string& line, const std::string& dllPath) {
-    if (api.transformLoad == NULL && api.forgeClassPlan == NULL) {
-        printResult("fallback", "UNAVAILABLE", dllPath, "forge_load_not_exported");
+    if (api.forgeClassPlan == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "forge_class_plan_not_exported");
         return;
     }
 
@@ -1120,16 +1006,6 @@ void handleForgeBatchPlan(const NativeApi& api, const std::string& line, const s
         if (api.forceDeoptNow != NULL) {
             api.forceDeoptNow();
         }
-    } else {
-        // Legacy fallback: per-ingot transformLoad loop. Kept for the case where
-        // the loaded DLL pre-dates forgevm_forge_class_plan.
-        AGENT_LOG("forge_batch_plan: forgeClassPlan not exported, falling back to per-ingot");
-        for (size_t i = 0; i < ingots.size(); ++i) {
-            results[i] = tryIngotCandidates(api, ingots[i], /*deferDeopt=*/1);
-        }
-        if (api.forceDeoptNow != NULL) {
-            api.forceDeoptNow();
-        }
     }
 
     int matchedCount = 0;
@@ -1217,27 +1093,41 @@ void handlePutFieldPath(const NativeApi& api, const std::string& line, const std
     }
 }
 
-void handlePurgeAgent(const NativeApi& api, const std::string& line, const std::string& dllPath) {
-    if (api.purgeAgent == NULL) {
-        printResult("fallback", "UNAVAILABLE", dllPath, "purge_agent_not_exported");
-        return;
-    }
-    std::string agentClass = getJsonStringField(line, "agentClass");
-    if (agentClass.empty()) {
-        printResult("fallback", "UNAVAILABLE", dllPath, "missing_agent_class");
+std::vector<std::string> parseJsonStringArray(const std::string& line, const std::string& key);
+
+void handlePurgeMatchingAgents(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    if (api.purgeAgentsMatching == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "purge_agents_matching_not_exported");
         return;
     }
 
-    AGENT_LOG("purge_agent: %s", agentClass.c_str());
+    /* Parse {mode, patterns} from JSON, same shape as ban_java_agent.
+     * Missing/blank mode => filterMode 0 (NONE) = purge ALL loaded agents. */
+    std::string mode = getJsonStringField(line, "mode");
+    std::vector<std::string> patterns = parseJsonStringArray(line, "patterns");
 
-    int result = api.purgeAgent(agentClass.c_str());
-    std::string reason = copyReason(api, result == 1 ? "ok" : "purge_agent_failed");
-    AGENT_LOG("purge_agent result=%d reason=%s", result, reason.c_str());
-    if (result == 1) {
-        printResult("ok", "FULL", dllPath, reason.c_str());
-    } else {
-        printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
-    }
+    std::string modeLower = mode;
+    for (char& c : modeLower) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+
+    int filterMode = 0;
+    if (modeLower == "blacklist" && !patterns.empty()) filterMode = 1;
+    else if (modeLower == "whitelist" && !patterns.empty()) filterMode = 2;
+
+    std::vector<const char*> rawPatterns;
+    rawPatterns.reserve(patterns.size());
+    for (const auto& p : patterns) rawPatterns.push_back(p.c_str());
+
+    AGENT_LOG("purge_matching_agents: mode=%s filterMode=%d patterns=%zu",
+              modeLower.c_str(), filterMode, patterns.size());
+
+    int result = api.purgeAgentsMatching(filterMode,
+                                          rawPatterns.empty() ? nullptr : rawPatterns.data(),
+                                          (int)rawPatterns.size());
+    std::string reason = copyReason(api, "ok");
+    AGENT_LOG("purge_matching_agents: purged=%d reason=%s", result, reason.c_str());
+    /* result is the count of agents purged (may be 0 if filter matched none —
+     * not an error condition). */
+    printResult("ok", "FULL", dllPath, reason.c_str());
 }
 
 void handlePutObjectFieldPath(const NativeApi& api, const std::string& line, const std::string& dllPath) {
@@ -1530,6 +1420,96 @@ DWORD WINAPI filterPipeAcceptLoopThread(LPVOID param) {
 
 std::string g_filterPipeName;
 
+/* Handoff command pipe — \\.\pipe\forgevm_cmd_<agent_pid>. Created at agent
+ * startup. After old JVM dies (stdin EOF), main() waits on this pipe for the
+ * new JVM's ForgeVM.launch() to connect, then redirects stdin/stdout to the
+ * pipe and re-enters the command loop. */
+static HANDLE g_commandPipeServer = INVALID_HANDLE_VALUE;
+static std::string g_commandPipeName;
+
+static std::string buildCommandPipeName() {
+    char buf[64];
+    sprintf_s(buf, sizeof(buf), "\\\\.\\pipe\\forgevm_cmd_%lu",
+              (unsigned long)GetCurrentProcessId());
+    return std::string(buf);
+}
+
+/* Idempotent: creates the first instance of the command pipe and stashes it
+ * in g_commandPipeServer. Returns true on success. Subsequent calls re-use
+ * the existing server pipe handle. */
+static bool ensureCommandPipeCreated() {
+    if (g_commandPipeServer != INVALID_HANDLE_VALUE) return true;
+    g_commandPipeName = buildCommandPipeName();
+    HANDLE pipe = CreateNamedPipeA(
+        g_commandPipeName.c_str(),
+        PIPE_ACCESS_DUPLEX,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        /*maxInstances*/ 1,
+        /*outBuf*/ 4096, /*inBuf*/ 4096,
+        /*defaultTimeout*/ 0,
+        /*sa*/ NULL);
+    if (pipe == INVALID_HANDLE_VALUE) {
+        AGENT_LOG("ensureCommandPipeCreated: CreateNamedPipe failed: %lu", GetLastError());
+        return false;
+    }
+    g_commandPipeServer = pipe;
+    AGENT_LOG("command pipe ready: %s", g_commandPipeName.c_str());
+    return true;
+}
+
+/* Block until a client connects to the command pipe. Returns the connected
+ * pipe handle (caller takes ownership; the server pipe instance is consumed
+ * for this client and must be recreated for further clients). */
+static HANDLE acceptCommandPipeClient() {
+    if (!ensureCommandPipeCreated()) return NULL;
+    HANDLE pipe = g_commandPipeServer;
+    BOOL connected = ConnectNamedPipe(pipe, NULL)
+                         ? TRUE
+                         : (GetLastError() == ERROR_PIPE_CONNECTED);
+    if (!connected) {
+        AGENT_LOG("acceptCommandPipeClient: ConnectNamedPipe failed: %lu", GetLastError());
+        CloseHandle(pipe);
+        g_commandPipeServer = INVALID_HANDLE_VALUE;
+        return NULL;
+    }
+    /* Server handle is now bound to this client. Future clients require a
+     * fresh CreateNamedPipe call. */
+    g_commandPipeServer = INVALID_HANDLE_VALUE;
+    return pipe;
+}
+
+/* Replace the process's stdin/stdout file descriptors with the given pipe
+ * handle so that std::cin / std::cout / printResult all transparently use
+ * the pipe. Clears EOF/error state on the C++ streams. */
+static bool redirectStdioToPipe(HANDLE pipe) {
+    int pipeFd = _open_osfhandle(reinterpret_cast<intptr_t>(pipe), _O_BINARY);
+    if (pipeFd == -1) {
+        AGENT_LOG("redirectStdioToPipe: _open_osfhandle failed");
+        return false;
+    }
+    if (_dup2(pipeFd, _fileno(stdin)) != 0) {
+        AGENT_LOG("redirectStdioToPipe: _dup2(stdin) failed");
+        _close(pipeFd);
+        return false;
+    }
+    if (_dup2(pipeFd, _fileno(stdout)) != 0) {
+        AGENT_LOG("redirectStdioToPipe: _dup2(stdout) failed");
+        _close(pipeFd);
+        return false;
+    }
+    /* pipeFd is no longer needed — fd 0 and fd 1 hold their own refs to the
+     * underlying handle now. Closing pipeFd does not invalidate them. */
+    _close(pipeFd);
+    /* Disable C buffering so each response line is flushed immediately. */
+    setvbuf(stdin, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    /* Clear stream error/EOF state — the old underlying fd hit EOF when the
+     * old JVM died; reset so getline / cout resume working on the new fd. */
+    std::cin.clear();
+    std::cout.clear();
+    return true;
+}
+
 // Start the filter pipe server (idempotent). Synchronously creates the
 // first pipe instance before spawning the accept thread so that the
 // trampoline's CreateFileA can never race the server's first listen.
@@ -1687,6 +1667,382 @@ void handleUnbanNativeLoad(const NativeApi& api, const std::string& dllPath) {
                 api.lastError ? api.lastError() : "unknown");
 }
 
+// ============================================================
+// relaunch: WMI cmdline query → filter → TerminateProcess + CreateProcessW
+// ============================================================
+
+static std::wstring queryProcessCommandLine(DWORD pid) {
+    std::wstring result;
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    bool needUninit = (hr == S_OK || hr == S_FALSE);
+
+    do {
+        IWbemLocator* pLoc = NULL;
+        hr = CoCreateInstance(CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER,
+                              IID_IWbemLocator, reinterpret_cast<LPVOID*>(&pLoc));
+        if (FAILED(hr)) break;
+
+        IWbemServices* pSvc = NULL;
+        BSTR ns = SysAllocString(L"ROOT\\CIMV2");
+        hr = pLoc->ConnectServer(ns, NULL, NULL, 0, 0, NULL, NULL, &pSvc);
+        SysFreeString(ns);
+        pLoc->Release();
+        if (FAILED(hr)) break;
+
+        hr = CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
+                               RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+                               NULL, EOAC_NONE);
+        if (FAILED(hr)) { pSvc->Release(); break; }
+
+        wchar_t queryBuf[128];
+        swprintf_s(queryBuf, ARRAYSIZE(queryBuf),
+                   L"SELECT CommandLine FROM Win32_Process WHERE ProcessId = %u",
+                   static_cast<unsigned>(pid));
+
+        BSTR lang  = SysAllocString(L"WQL");
+        BSTR query = SysAllocString(queryBuf);
+        IEnumWbemClassObject* pEnum = NULL;
+        hr = pSvc->ExecQuery(lang, query,
+                             WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                             NULL, &pEnum);
+        SysFreeString(lang);
+        SysFreeString(query);
+        pSvc->Release();
+        if (FAILED(hr) || pEnum == NULL) break;
+
+        IWbemClassObject* pObj = NULL;
+        ULONG got = 0;
+        hr = pEnum->Next(WBEM_INFINITE, 1, &pObj, &got);
+        pEnum->Release();
+        if (FAILED(hr) || got == 0 || pObj == NULL) break;
+
+        VARIANT var;
+        VariantInit(&var);
+        if (SUCCEEDED(pObj->Get(L"CommandLine", 0, &var, NULL, NULL))
+                && var.vt == VT_BSTR && var.bstrVal != NULL) {
+            result = std::wstring(var.bstrVal);
+        }
+        VariantClear(&var);
+        pObj->Release();
+    } while (false);
+
+    if (needUninit) CoUninitialize();
+    return result;
+}
+
+static std::vector<std::wstring> tokenizeCmdLine(const std::wstring& cmdline) {
+    std::vector<std::wstring> tokens;
+    size_t i = 0, n = cmdline.size();
+    while (i < n) {
+        while (i < n && cmdline[i] == L' ') i++;
+        if (i >= n) break;
+        std::wstring tok;
+        bool inQuote = false;
+        while (i < n) {
+            wchar_t c = cmdline[i];
+            if (c == L'"') { inQuote = !inQuote; i++; continue; }
+            if (!inQuote && c == L' ') break;
+            tok += c;
+            i++;
+        }
+        if (!tok.empty()) tokens.push_back(tok);
+    }
+    return tokens;
+}
+
+static std::wstring quoteIfNeeded(const std::wstring& token) {
+    if (token.find(L' ') == std::wstring::npos) return token;
+    return L"\"" + token + L"\"";
+}
+
+static bool relaunchShouldKeepToken(const std::wstring& token,
+                                     bool hasAgentFilter, const LoadFilter& agentFlt,
+                                     bool hasNativeFilter, const LoadFilter& nativeFlt) {
+    static const wchar_t kAgentPfx[]  = L"-javaagent:";
+    static const wchar_t kNativePfx[] = L"-agentpath:";
+    static const size_t  kPfxLen = 11; // both prefixes are 11 chars
+
+    auto extractPath = [](const std::wstring& tok, size_t prefixLen) -> std::string {
+        std::wstring pathW = tok.substr(prefixLen);
+        size_t eq = pathW.find(L'=');
+        if (eq != std::wstring::npos) pathW = pathW.substr(0, eq);
+        return wideToUtf8(pathW);
+    };
+
+    if (token.size() > kPfxLen && token.compare(0, kPfxLen, kAgentPfx, kPfxLen) == 0) {
+        if (!hasAgentFilter) return true;
+        return filterAllows(agentFlt, extractPath(token, kPfxLen));
+    }
+    if (token.size() > kPfxLen && token.compare(0, kPfxLen, kNativePfx, kPfxLen) == 0) {
+        if (!hasNativeFilter) return true;
+        return filterAllows(nativeFlt, extractPath(token, kPfxLen));
+    }
+    return true;
+}
+
+void handleRelaunch(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    unsigned long long pid = getJsonUnsignedField(line, "pid", 0ULL);
+    if (pid == 0ULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_pid");
+        return;
+    }
+
+    bool hasAgentFilter  = getJsonBoolField(line, "hasAgentFilter",  false);
+    bool hasNativeFilter = getJsonBoolField(line, "hasNativeFilter", false);
+
+    LoadFilter agentFlt, nativeFlt;
+
+    auto buildFilter = [&](LoadFilter& f, const char* modeKey, const char* patsKey) {
+        std::string mode = getJsonStringField(line, modeKey);
+        std::vector<std::string> pats = parseJsonStringArray(line, patsKey);
+        for (char& c : mode) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (mode == "blacklist") {
+            f.mode = FilterMode::Blacklist;
+            f.patterns = std::move(pats);
+        } else if (mode == "whitelist") {
+            f.mode = FilterMode::Whitelist;
+            f.patterns = std::move(pats);
+        } else {
+            f.mode = FilterMode::None;
+        }
+        f.active = true;
+    };
+
+    if (hasAgentFilter)  buildFilter(agentFlt,  "agentMode",  "agentPatterns");
+    if (hasNativeFilter) buildFilter(nativeFlt, "nativeMode", "nativePatterns");
+
+    /* Snapshot pre-relaunch ban state. Trampolines in the old JVM die with it,
+     * so the new JVM needs fresh installs whenever a ban was active OR the
+     * caller passed a new filter. Without this, relaunch() with no filter
+     * args silently drops banJavaAgent/banNativeLoad protection that was
+     * active before the call — the trampolines die with the old JVM and
+     * nothing reinstalls them on the new one. */
+    bool wasAgentBanActive, wasNativeBanActive;
+    {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        wasAgentBanActive  = g_javaAgentFilter.active;
+        wasNativeBanActive = g_nativeLoadFilter.active;
+    }
+    bool installNativeBan = hasNativeFilter || wasNativeBanActive;
+    bool installAgentBan  = hasAgentFilter  || wasAgentBanActive;
+
+    AGENT_LOG("relaunch: pid=%llu hasAgentFilter=%d hasNativeFilter=%d wasAgentActive=%d wasNativeActive=%d",
+              pid, (int)hasAgentFilter, (int)hasNativeFilter,
+              (int)wasAgentBanActive, (int)wasNativeBanActive);
+
+    std::wstring cmdLine = queryProcessCommandLine(static_cast<DWORD>(pid));
+    if (cmdLine.empty()) {
+        AGENT_LOG("relaunch: WMI cmdline empty");
+        printResult("fallback", "UNAVAILABLE", dllPath, "wmi_cmdline_empty");
+        return;
+    }
+    AGENT_LOG("relaunch: cmdline len=%zu", cmdLine.size());
+
+    std::vector<std::wstring> tokens = tokenizeCmdLine(cmdLine);
+    if (tokens.empty()) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "cmdline_parse_failed");
+        return;
+    }
+
+    std::vector<std::wstring> newTokens;
+    newTokens.push_back(tokens[0]);
+    newTokens.push_back(L"-Dforgevm.relaunched=true");
+    {
+        /* Inject handoff token so the new JVM's ForgeVM.launch() connects to
+         * the persistent agent via named pipe instead of spawning a new agent. */
+        wchar_t buf[64];
+        swprintf_s(buf, ARRAYSIZE(buf), L"-Dforgevm.agent.pid=%lu",
+                   (unsigned long)GetCurrentProcessId());
+        newTokens.push_back(buf);
+    }
+    for (size_t i = 1; i < tokens.size(); i++) {
+        if (relaunchShouldKeepToken(tokens[i], hasAgentFilter, agentFlt, hasNativeFilter, nativeFlt)) {
+            newTokens.push_back(tokens[i]);
+        } else {
+            AGENT_LOG("relaunch: stripped: %s", wideToUtf8(tokens[i]).c_str());
+        }
+    }
+
+    std::wstring newCmdLine;
+    for (size_t i = 0; i < newTokens.size(); i++) {
+        if (i > 0) newCmdLine += L' ';
+        newCmdLine += quoteIfNeeded(newTokens[i]);
+    }
+
+    HANDLE hJvm = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    if (hJvm == NULL) {
+        AGENT_LOG("relaunch: OpenProcess failed: %lu", GetLastError());
+        printResult("fallback", "UNAVAILABLE", dllPath, "open_process_failed");
+        return;
+    }
+
+    /* Disable the parent watchdog so it doesn't ExitProcess on us when we kill the
+     * old JVM. We re-arm it on the new JVM after CREATE_SUSPENDED succeeds. */
+    g_parentPid.store(0);
+
+    /* Create new JVM SUSPENDED so we can patch ntdll!LdrLoadDll into its memory
+     * before any user-mode instruction runs. This gives banNativeLoad protection
+     * from the very first instruction of the new JVM's lifetime. banJavaAgent
+     * cannot be installed yet (jvm.dll isn't mapped); a watcher thread below
+     * polls for jvm.dll and installs it the moment the load completes. */
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    std::vector<wchar_t> cmdLineBuf(newCmdLine.begin(), newCmdLine.end());
+    cmdLineBuf.push_back(L'\0');
+
+    BOOL created = CreateProcessW(NULL, cmdLineBuf.data(), NULL, NULL,
+                                  FALSE,
+                                  CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                                  NULL, NULL, &si, &pi);
+    if (!created) {
+        AGENT_LOG("relaunch: CreateProcessW failed: %lu", GetLastError());
+        CloseHandle(hJvm);
+        g_parentPid.store(static_cast<DWORD>(pid));
+        printResult("fallback", "UNAVAILABLE", dllPath, "create_process_failed");
+        return;
+    }
+    AGENT_LOG("relaunch: new process created suspended pid=%lu", pi.dwProcessId);
+
+    /* Bump parent pid so the filter pipe name (derived from g_parentPid)
+     * corresponds to the new JVM identity. */
+    g_parentPid.store(pi.dwProcessId);
+
+    /* Switch DLL's g_target to the new (suspended) JVM. attach_target_minimal
+     * opens a handle and sets g_target.{handle,pid} without requiring jvm.dll. */
+    bool nativeHookInstalled = false;
+    if (api.attachTargetMinimal != NULL) {
+        if (api.attachTargetMinimal(static_cast<unsigned long long>(pi.dwProcessId)) == 1) {
+            std::string filterPipeName = ensureFilterPipeStarted();
+            if (!filterPipeName.empty() && installNativeBan && api.banNativeLoad != NULL) {
+                if (hasNativeFilter) {
+                    std::lock_guard<std::mutex> g(g_filterMutex);
+                    g_nativeLoadFilter = nativeFlt;
+                }
+                if (api.banNativeLoad(filterPipeName.c_str()) == 1) {
+                    nativeHookInstalled = true;
+                    AGENT_LOG("relaunch: ntdll!LdrLoadDll hook installed on suspended new JVM (filter_source=%s)",
+                              hasNativeFilter ? "new" : "carried_over");
+                } else {
+                    AGENT_LOG("relaunch: banNativeLoad on suspended new JVM failed: %s",
+                              api.lastError ? api.lastError() : "unknown");
+                }
+            } else if (installNativeBan) {
+                AGENT_LOG("relaunch: filter pipe unavailable, native hook skipped");
+            }
+        } else {
+            AGENT_LOG("relaunch: attachTargetMinimal failed: %s",
+                      api.lastError ? api.lastError() : "unknown");
+        }
+    } else {
+        AGENT_LOG("relaunch: attachTargetMinimal export not loaded — DLL out of date?");
+    }
+
+    /* Stash the agent filter for the post-resume watcher to install once jvm.dll
+     * is mapped. Only overwrite when the caller passed a new filter — otherwise
+     * keep the pre-relaunch g_javaAgentFilter so a carried-over ban retains its
+     * patterns. */
+    if (hasAgentFilter) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_javaAgentFilter = agentFlt;
+    }
+
+    /* Resume new JVM. From this instant the ntdll hook (if installed) is live. */
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    AGENT_LOG("relaunch: new JVM resumed pid=%lu (ntdll_hooked=%d)",
+              pi.dwProcessId, (int)nativeHookInstalled);
+
+    /* Spawn watcher thread: polls EnumProcessModules until jvm.dll appears in
+     * the new JVM, then full-bootstraps and installs banJavaAgent. */
+    struct RelaunchPostResumeCtx {
+        HANDLE hNewJvm;
+        DWORD newPid;
+        bool installAgentBan;
+        const NativeApi* api;
+        std::string dllPath;
+    };
+    auto* ctx = new RelaunchPostResumeCtx{
+        pi.hProcess, pi.dwProcessId, installAgentBan, &api, dllPath
+    };
+    HANDLE watcher = CreateThread(NULL, 0, [](LPVOID p) -> DWORD {
+        auto* c = static_cast<RelaunchPostResumeCtx*>(p);
+        HANDLE h = c->hNewJvm;
+        DWORD newPid = c->newPid;
+        bool installAgentBan = c->installAgentBan;
+        const NativeApi* api = c->api;
+        delete c;
+
+        /* Poll for jvm.dll. Cap at 30s — JVM startup completes well within. */
+        const int kMaxAttempts = 600;
+        bool found = false;
+        for (int i = 0; i < kMaxAttempts; i++) {
+            HMODULE mods[256];
+            DWORD needed = 0;
+            if (EnumProcessModulesEx(h, mods, sizeof(mods), &needed, LIST_MODULES_ALL)) {
+                size_t count = needed / sizeof(HMODULE);
+                if (count > 256) count = 256;
+                for (size_t m = 0; m < count; m++) {
+                    wchar_t name[MAX_PATH];
+                    if (GetModuleBaseNameW(h, mods[m], name, MAX_PATH) > 0) {
+                        std::wstring nameLower(name);
+                        for (auto& ch : nameLower) ch = (wchar_t)towlower(ch);
+                        if (nameLower == L"jvm.dll") { found = true; break; }
+                    }
+                }
+            }
+            if (found) break;
+            Sleep(50);
+        }
+
+        if (!found) {
+            AGENT_LOG("post-relaunch watcher: jvm.dll never appeared in new JVM pid=%lu", newPid);
+            CloseHandle(h);
+            return 0;
+        }
+        AGENT_LOG("post-relaunch watcher: jvm.dll detected in new JVM pid=%lu", newPid);
+
+        if (api->bootstrapTarget != NULL) {
+            if (api->bootstrapTarget(static_cast<unsigned long long>(newPid)) == 1) {
+                AGENT_LOG("post-relaunch watcher: bootstrap_target(%lu) ok", newPid);
+                if (installAgentBan && api->banJavaAgent != NULL) {
+                    std::string filterPipeName = ensureFilterPipeStarted();
+                    if (!filterPipeName.empty()) {
+                        int r = api->banJavaAgent(filterPipeName.c_str());
+                        AGENT_LOG("post-relaunch watcher: banJavaAgent r=%d", r);
+                    }
+                }
+            } else {
+                AGENT_LOG("post-relaunch watcher: bootstrap_target(%lu) failed: %s",
+                          newPid, api->lastError ? api->lastError() : "unknown");
+            }
+        }
+        CloseHandle(h);
+        return 0;
+    }, ctx, 0, NULL);
+    if (watcher != NULL) CloseHandle(watcher);
+
+    /* Mark agent for post-EOF persistence — once we kill old JVM, our stdin
+     * (inherited from old JVM) will EOF and the main read loop will fall out;
+     * the persistence flag tells main() to block instead of exiting. */
+    g_persistAfterEOF.store(true);
+
+    /* Acknowledge to caller BEFORE killing old JVM. Old JVM's Java thread is
+     * blocked on Thread.sleep(Long.MAX_VALUE) after receiving this ok. */
+    printResult("ok", "FULL", dllPath, "relaunch_pending");
+    std::cout.flush();
+    Sleep(50);
+
+    /* Kill old JVM. Agent does NOT exit — it continues serving the filter pipe
+     * so the ntdll hook in the new JVM has a live decision endpoint. The new
+     * JVM's ForgeVM.launch() will reconnect via a handoff command pipe — Java
+     * side support for that arrives in a follow-up change. */
+    TerminateProcess(hJvm, 0);
+    CloseHandle(hJvm);
+    AGENT_LOG("relaunch: old JVM pid=%llu terminated; agent persisting for new JVM pid=%lu",
+              pid, pi.dwProcessId);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1749,8 +2105,14 @@ int main(int argc, char** argv) {
     CreateThread(NULL, 0, parentWatchdogThread, NULL, 0, NULL);
     AGENT_LOG("serve mode: entering command loop");
 
+    /* Create handoff command pipe up-front. After relaunch, the new JVM's
+     * ForgeVM.launch() reads -Dforgevm.agent.pid and connects to this pipe;
+     * having it ready before relaunch removes any startup race. */
+    ensureCommandPipeCreated();
+
     AgentLockState lockState;
     std::string line;
+re_enter_command_loop:
     while (std::getline(std::cin, line)) {
         refreshLockIfExpired(&lockState);
         std::string cmd = getJsonStringField(line, "cmd");
@@ -1768,8 +2130,6 @@ int main(int argc, char** argv) {
             handlePutRefField(api, line, dllPath);
         } else if (cmd == "put_ref_field_batch") {
             handlePutRefFieldBatch(api, line, dllPath);
-        } else if (cmd == "forge_load") {
-            handleForgeLoad(api, line, dllPath);
         } else if (cmd == "forge_batch_plan") {
             handleForgeBatchPlan(api, line, dllPath);
         } else if (cmd == "force_deopt") {
@@ -1785,12 +2145,10 @@ int main(int argc, char** argv) {
             } else {
                 printResult("fallback", "UNAVAILABLE", dllPath, "force_deopt_not_exported");
             }
-        } else if (cmd == "forge_unload") {
-            handleForgeUnload(api, line, dllPath);
         } else if (cmd == "forge_class_unload") {
             handleForgeClassUnload(api, line, dllPath);
-        } else if (cmd == "purge_agent") {
-            handlePurgeAgent(api, line, dllPath);
+        } else if (cmd == "purge_matching_agents") {
+            handlePurgeMatchingAgents(api, line, dllPath);
         } else if (cmd == "put_field_path") {
             handlePutFieldPath(api, line, dllPath);
         } else if (cmd == "put_object_field_path") {
@@ -1818,6 +2176,8 @@ int main(int argc, char** argv) {
             handleBanNativeLoad(api, line, dllPath);
         } else if (cmd == "unban_native_load") {
             handleUnbanNativeLoad(api, dllPath);
+        } else if (cmd == "relaunch") {
+            handleRelaunch(api, line, dllPath);
         } else if (cmd == "shutdown") {
             printResult("ok", "RESTRICTED", dllPath, "bye");
             break;
@@ -1828,6 +2188,32 @@ int main(int argc, char** argv) {
 
     while (lockState.locked && !lockExpired(lockState)) {
         Sleep(100);
+    }
+
+    /* If a relaunch armed the persistence flag, our stdin (inherited from
+     * old JVM) just EOF'd. Don't exit — wait for the new JVM's ForgeVM.launch()
+     * to connect to the handoff command pipe, then redirect stdin/stdout to
+     * the pipe and re-enter the command loop. The filter pipe (serving the
+     * new JVM's ntdll trampoline) stays alive throughout this transition
+     * because it's owned by the filter pipe accept thread which is independent
+     * of stdio. */
+    if (g_persistAfterEOF.load()) {
+        AGENT_LOG("main: stdin EOF after relaunch — awaiting handoff on %s",
+                  g_commandPipeName.c_str());
+        HANDLE pipe = acceptCommandPipeClient();
+        if (pipe != NULL && pipe != INVALID_HANDLE_VALUE) {
+            AGENT_LOG("main: handoff client connected, redirecting stdio");
+            if (redirectStdioToPipe(pipe)) {
+                /* The persistence flag is one-shot: subsequent stdin EOFs
+                 * (e.g., new JVM disconnects) should terminate the agent
+                 * normally, since at that point no JVM is left to serve. */
+                g_persistAfterEOF.store(false);
+                goto re_enter_command_loop;
+            }
+            CloseHandle(pipe);
+        } else {
+            AGENT_LOG("main: handoff accept failed — exiting");
+        }
     }
 
     if (api.module != NULL) FreeLibrary(api.module);

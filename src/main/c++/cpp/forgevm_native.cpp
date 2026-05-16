@@ -628,11 +628,87 @@ extern "C" __declspec(dllexport) int forgevm_init() {
     return 1;
 }
 
-extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long targetPid) {
-    FVM_LOG("forgevm_bootstrap_target(pid=%llu)", targetPid);
+/* Patch trampoline state — declared up front because the bootstrap/attach
+ * paths below clear these when the target PID changes. Definitions live in
+ * the anonymous namespace further down for module-internal linkage. */
+namespace {
+    struct PatchState {
+        uint64_t targetAddr = 0;
+        uint8_t  original[16] = {};
+        size_t   patchSize = 0;
+        bool     patched = false;
+        uint64_t trampolineAddr = 0;
+        size_t   trampolineSize = 0;
+        bool     trampolineInstalled = false;
+    };
+    extern PatchState g_javaAgentPatch;
+    extern PatchState g_nativeLoadPatch;
+}
+
+/* Minimal attach: opens process handle and sets g_target.{handle,pid}.
+ * Does NOT find jvm.dll or read VMStructs — those require jvm.dll to be loaded
+ * in the target. Used during relaunch to install ntdll!LdrLoadDll hooks on a
+ * CREATE_SUSPENDED new JVM before jvm.dll has been mapped. After the new JVM
+ * resumes and loads jvm.dll, callers must call forgevm_bootstrap_target() for
+ * the full VMStructs setup. */
+extern "C" __declspec(dllexport) int forgevm_attach_target_minimal(unsigned long long targetPid) {
+    FVM_LOG("forgevm_attach_target_minimal(pid=%llu)", targetPid);
+    DWORD oldPid = g_target.pid;
+    DWORD newPid = static_cast<DWORD>(targetPid);
     if (g_target.handle != NULL) {
         CloseHandle(g_target.handle);
         g_target = TargetProcess{};
+    }
+    /* When the target PID changes, any patch state from the previous target
+     * is stale — its trampolines live in the old process's address space,
+     * which is gone (or about to be). Reset so future install calls don't
+     * bail with "already_patched". */
+    if (oldPid != newPid) {
+        g_javaAgentPatch  = PatchState{};
+        g_nativeLoadPatch = PatchState{};
+        FVM_LOG("attach_target_minimal: target pid changed %lu -> %lu, patch state cleared",
+                (unsigned long)oldPid, (unsigned long)newPid);
+    }
+    g_structMap.clear();
+    g_typeMap.clear();
+    g_intConstants.clear();
+    g_longConstants.clear();
+    g_fieldInfoCache.clear();
+
+    if (targetPid == 0ULL) {
+        setError("target_pid_zero");
+        return 0;
+    }
+
+    HANDLE proc = OpenProcess(
+        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
+        FALSE, static_cast<DWORD>(targetPid));
+    if (proc == NULL) {
+        setError("open_target_process_failed");
+        return 0;
+    }
+    g_target.handle = proc;
+    g_target.pid = static_cast<DWORD>(targetPid);
+    /* jvmDllBase / structMapReady deliberately left zero/false — caller must
+     * follow up with forgevm_bootstrap_target() once jvm.dll has loaded. */
+    setError("ok");
+    return 1;
+}
+
+extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long targetPid) {
+    FVM_LOG("forgevm_bootstrap_target(pid=%llu)", targetPid);
+    DWORD oldPid = g_target.pid;
+    DWORD newPid = static_cast<DWORD>(targetPid);
+    if (g_target.handle != NULL) {
+        CloseHandle(g_target.handle);
+        g_target = TargetProcess{};
+    }
+    /* See attach_target_minimal for rationale — patch state is per-target. */
+    if (oldPid != newPid) {
+        g_javaAgentPatch  = PatchState{};
+        g_nativeLoadPatch = PatchState{};
+        FVM_LOG("bootstrap_target: target pid changed %lu -> %lu, patch state cleared",
+                (unsigned long)oldPid, (unsigned long)newPid);
     }
     g_structMap.clear();
     g_typeMap.clear();
@@ -789,15 +865,7 @@ extern "C" __declspec(dllexport) const char* forgevm_compression_info() {
 // ============================================================
 
 namespace {
-    struct PatchState {
-        uint64_t targetAddr = 0;
-        uint8_t  original[16] = {};
-        size_t   patchSize = 0;
-        bool     patched = false;
-        uint64_t trampolineAddr = 0;
-        size_t   trampolineSize = 0;
-        bool     trampolineInstalled = false;
-    };
+    /* Definitions for the forward-declared globals above. */
     PatchState g_javaAgentPatch;
     PatchState g_nativeLoadPatch;
 }
@@ -1065,12 +1133,19 @@ static std::vector<uint8_t> buildFilterTrampoline(const uint8_t* savedPrologue,
     // 0x181: jmp qword [rip+0x199]  -> abs_orig_plus_5 at 0x320
     emitBytes(code, {0xFF, 0x25, 0x99, 0x01, 0x00, 0x00});
 
-    // _block at 0x187
-    // 0x187: add rsp, 0x478
+    // _block
+    /* Return -1 (not 0). HotSpot attach protocol: JVM_EnqueueOperation returns
+     * 0 = "operation enqueued, wait for response on pipe". The attacher then
+     * calls connectPipe() and blocks until the AttachListener thread writes the
+     * response — but we short-circuited, so no one ever writes, and attacher
+     * deadlocks forever. Returning non-zero makes the JDK-side native `enqueue`
+     * throw IOException immediately (before reaching connectPipe), which the
+     * caller's catch handles cleanly. */
+    // add rsp, 0x478
     emitBytes(code, {0x48, 0x81, 0xC4, 0x78, 0x04, 0x00, 0x00});
-    // 0x18E: xor eax, eax
-    emitBytes(code, {0x33, 0xC0});
-    // 0x190: ret
+    // mov eax, 0xFFFFFFFF  (return -1)
+    emitBytes(code, {0xB8, 0xFF, 0xFF, 0xFF, 0xFF});
+    // ret
     emitBytes(code, {0xC3});
 
     // Sanity: the code section must fit below the data region at 0x300
@@ -1142,6 +1217,29 @@ static int installFilterTrampoline(PatchState& state,
     }
     FVM_LOG("%s: original prologue: %02X %02X %02X %02X %02X", logTag,
             saved5[0], saved5[1], saved5[2], saved5[3], saved5[4]);
+
+    /* MSVC incremental-linking emits each exported function as a 5-byte
+     * `JMP rel32` thunk that jumps to the real function body. Modern JDK 17+
+     * jvm.dll ships this way, so `JVM_EnqueueOperation`'s prologue is
+     * `E9 xx xx xx xx`. Patching the thunk itself would corrupt other code
+     * (the byte after E9+4 may be the next thunk's first byte), but we can
+     * just follow the jump and hook the real body instead. */
+    for (int hop = 0; hop < 2 && saved5[0] == 0xE9; hop++) {
+        int32_t rel = (int32_t)saved5[1]
+                    | ((int32_t)saved5[2] << 8)
+                    | ((int32_t)saved5[3] << 16)
+                    | ((int32_t)saved5[4] << 24);
+        uint64_t realAddr = addr + 5 + (int64_t)rel;
+        FVM_LOG("%s: prologue is JMP thunk, following 0x%llX -> 0x%llX",
+                logTag, (unsigned long long)addr, (unsigned long long)realAddr);
+        if (!readRemoteMem(proc, realAddr, saved5, 5)) {
+            setError("read_real_prologue_failed");
+            return 0;
+        }
+        FVM_LOG("%s: real prologue: %02X %02X %02X %02X %02X", logTag,
+                saved5[0], saved5[1], saved5[2], saved5[3], saved5[4]);
+        addr = realAddr;
+    }
 
     // Refuse dangerous starters (rel jumps/calls we can't safely relocate).
     uint8_t b0 = saved5[0];
@@ -1240,8 +1338,9 @@ static int installFilterTrampoline(PatchState& state,
 }
 
 static int uninstallFilterTrampoline(PatchState& state, const char* logTag) {
-    if (!g_target.structMapReady) {
-        setError("not_bootstrapped");
+    /* Only requires a valid handle — see installLdrLoadDllFilter rationale. */
+    if (g_target.handle == NULL) {
+        setError("no_target_handle");
         return 0;
     }
     if (!state.patched || state.targetAddr == 0) {
@@ -1571,8 +1670,12 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
 }
 
 static int installLdrLoadDllFilter(PatchState& state, const char* pipeName) {
-    if (!g_target.structMapReady) {
-        setError("not_bootstrapped");
+    /* ntdll!LdrLoadDll patching only needs a valid process handle — ntdll is
+     * mapped into every Win32 process from creation. structMapReady (which
+     * requires jvm.dll) is not required, so this can run on a CREATE_SUSPENDED
+     * new JVM during relaunch. */
+    if (g_target.handle == NULL) {
+        setError("no_target_handle");
         return 0;
     }
     if (state.patched) {

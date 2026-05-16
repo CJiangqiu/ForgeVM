@@ -38,7 +38,7 @@ static std::unordered_map<std::string, uint64_t> g_methodCache;
 // for different methods by N ingots in batch.
 static std::unordered_set<uint64_t> g_klassMethodsScanned;
 
-// Hit-rate counters (logged opportunistically in applyTransform).
+// Hit-rate counters (logged in forgevm_force_deopt_now).
 static uint64_t g_klassCacheHits = 0;
 static uint64_t g_klassCacheMisses = 0;
 static uint64_t g_methodCacheHits = 0;
@@ -814,2253 +814,555 @@ static void clearMethodProfilingState(uint64_t methodAddr, bool setDontInline,
 }
 
 // ============================================================
-// Apply transform
-// ============================================================
-
-int applyTransform(const char* className, const char* methodName, const char* paramDesc,
-                   const char* injectAt, const char* hookClass, const char* hookMethod,
-                   const char* hookDesc, bool deferDeopt) {
-    HANDLE proc = g_target.handle;
-    std::string key = makeTransformKey(className, methodName, paramDesc);
-
-    FVM_LOG("=== TRANSFORM BEGIN ===");
-    FVM_LOG("target: %s.%s(%s) @ %s%s", className, methodName, paramDesc, injectAt,
-            deferDeopt ? " [defer-deopt]" : "");
-    FVM_LOG("hook:   %s.%s%s", hookClass, hookMethod, hookDesc);
-
-    // Per-class plan: hasPlan/klassAddr/truOldCPAddr are resolved after step 5.
-
-    // 1. Find the target Method*
-    uint64_t methodAddr = 0;
-    if (!findJavaMethod(className, methodName, paramDesc, &methodAddr)) {
-        FVM_LOG("TRANSFORM FAILED: method not found");
-        return 0;
-    }
-    FVM_LOG("Method* = 0x%llX", (unsigned long long)methodAddr);
-
-    // 2. Read Method -> ConstMethod*
-    int64_t constMethodOff = structOffset("Method", "_constMethod");
-    if (constMethodOff < 0) constMethodOff = 8;
-
-    uint64_t origConstMethodAddr = 0;
-    if (!readRemotePointer(proc, methodAddr + (uint64_t)constMethodOff, &origConstMethodAddr) || origConstMethodAddr == 0) {
-        setError("cannot_read_constmethod_ptr");
-        return 0;
-    }
-    FVM_LOG("ConstMethod* = 0x%llX (offset %lld from Method)", (unsigned long long)origConstMethodAddr, (long long)constMethodOff);
-
-    // 3. Read ConstMethod -> ConstantPool*
-    int64_t cmConstsOff = structOffset("ConstMethod", "_constants");
-    if (cmConstsOff < 0) cmConstsOff = 8;
-
-    uint64_t origConstPoolAddr = 0;
-    if (!readRemotePointer(proc, origConstMethodAddr + (uint64_t)cmConstsOff, &origConstPoolAddr) || origConstPoolAddr == 0) {
-        setError("cannot_read_constpool_ptr");
-        return 0;
-    }
-    FVM_LOG("ConstantPool* = 0x%llX", (unsigned long long)origConstPoolAddr);
-
-    // 4. Read original bytecode
-    std::vector<uint8_t> origBytecode;
-    uint64_t bcStartAddr = 0;
-    uint32_t codeSize = 0;
-    if (!readConstMethodBytecode(origConstMethodAddr, &origBytecode, &bcStartAddr, &codeSize)) {
-        FVM_LOG("TRANSFORM FAILED: cannot read bytecode");
-        return 0;
-    }
-    FVM_LOG("original bytecode: %u bytes at 0x%llX", codeSize, (unsigned long long)bcStartAddr);
-
-    // 5. Read original constant pool
-    std::vector<uint8_t> origPoolBytes;
-    uint32_t poolLength = 0;
-    size_t poolByteSize = 0;
-    if (!readConstantPool(origConstPoolAddr, &origPoolBytes, &poolLength, &poolByteSize)) {
-        FVM_LOG("TRANSFORM FAILED: cannot read constpool");
-        return 0;
-    }
-    FVM_LOG("original constpool: length=%u, byteSize=%zu", poolLength, poolByteSize);
-
-    // Resolve klassAddr from pool's _pool_holder field (needed for per-class plan).
-    uint64_t klassAddr = 0;
-    {
-        int64_t phOff = structOffset("ConstantPool", "_pool_holder");
-        if (phOff >= 0 && (size_t)(phOff + 8) <= origPoolBytes.size()) {
-            memcpy(&klassAddr, origPoolBytes.data() + phOff, 8);
-        }
-        if (klassAddr == 0) {
-            std::string clsInternal = std::string(className);
-            for (char& c : clsInternal) { if (c == '.') c = '/'; }
-            findInstanceKlassByName(clsInternal, &klassAddr);
-        }
-    }
-    bool hasPlan = (klassAddr != 0 && g_plans.count(klassAddr) > 0);
-    uint64_t truOldCPAddr = hasPlan ? g_plans[klassAddr].oldCPAddr : origConstPoolAddr;
-    FVM_LOG("klassAddr=0x%llX hasPlan=%d truOldCPAddr=0x%llX",
-            (unsigned long long)klassAddr, (int)hasPlan, (unsigned long long)truOldCPAddr);
-
-    // 6. Find the hook class's InstanceKlass to verify it exists
-    std::string hookClassInternal = toInternalName(hookClass);
-    uint64_t hookKlassAddr = 0;
-    if (!findInstanceKlassByName(hookClassInternal, &hookKlassAddr)) {
-        setError("hook_class_not_loaded:" + hookClassInternal);
-        return 0;
-    }
-    FVM_LOG("hookKlass (%s) = 0x%llX", hookClassInternal.c_str(), (unsigned long long)hookKlassAddr);
-
-    // Verify hook method exists
-    uint64_t hookMethodAddr = 0;
-    if (!findMethodInKlass(hookKlassAddr, hookMethod, hookDesc, &hookMethodAddr)) {
-        setError("hook_method_not_found:" + std::string(hookMethod));
-        return 0;
-    }
-    FVM_LOG("hookMethod (%s%s) = 0x%llX", hookMethod, hookDesc, (unsigned long long)hookMethodAddr);
-
-    // 7. Read target method's signature and access flags
-    std::string targetReturnDesc = "V"; // default void
-    std::string targetFullSig;          // full signature e.g. "(Ljava/lang/String;Ljava/lang/String;)V"
-    bool targetIsStatic = false;
-    {
-        // Read access flags from Method to detect static
-        int64_t accessFlagsOff = structOffset("Method", "_access_flags");
-        if (accessFlagsOff >= 0) {
-            int32_t flags = 0;
-            readRemoteI32(proc, methodAddr + (uint64_t)accessFlagsOff, &flags);
-            targetIsStatic = (flags & 0x0008) != 0; // ACC_STATIC
-            FVM_LOG("target access_flags=0x%X, isStatic=%d", flags, (int)targetIsStatic);
-        } else {
-            FVM_LOG("WARN: cannot read Method::_access_flags, assuming instance method");
-        }
-
-        int64_t sigIdxOff = structOffset("ConstMethod", "_signature_index");
-        if (sigIdxOff >= 0) {
-            uint16_t sigIndex = 0;
-            if (readRemoteU16(proc, origConstMethodAddr + (uint64_t)sigIdxOff, &sigIndex) && sigIndex > 0) {
-                int64_t cpHdrSize0 = typeSize("ConstantPool");
-                if (cpHdrSize0 < 0) cpHdrSize0 = 0x138;
-                uint64_t sigEntryAddr = origConstPoolAddr + (uint64_t)cpHdrSize0 + (uint64_t)sigIndex * 8;
-                uint64_t sigSymbol = 0;
-                if (readRemotePointer(proc, sigEntryAddr, &sigSymbol) && sigSymbol != 0) {
-                    std::string fullSig;
-                    if (readSymbolBody(proc, sigSymbol, &fullSig)) {
-                        targetFullSig = fullSig;
-                        size_t closeParen = fullSig.find(')');
-                        if (closeParen != std::string::npos && closeParen + 1 < fullSig.size()) {
-                            targetReturnDesc = fullSig.substr(closeParen + 1);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Parse target method's parameters for argument capture
-    std::vector<ParamSlotInfo> targetParams = parseParamSlots(targetFullSig, targetIsStatic);
-    FVM_LOG("target params: %zu (sig=%s, static=%d)", targetParams.size(),
-            targetFullSig.c_str(), (int)targetIsStatic);
-
-    // Determine return type category and unboxing info
-    struct UnboxInfo {
-        bool needsUnbox;
-        std::string wrapperClass;
-        std::string unboxMethod;
-        std::string unboxDesc;
-        uint8_t returnOp;
-    };
-    UnboxInfo unbox = { false, "", "", "", 0xB0 };
-
-    if (targetReturnDesc == "V") {
-        unbox.returnOp = 0xB1;
-    } else if (targetReturnDesc == "Z") {
-        unbox = { true, "java/lang/Boolean",   "booleanValue", "()Z", 0xAC };
-    } else if (targetReturnDesc == "B") {
-        unbox = { true, "java/lang/Byte",      "byteValue",    "()B", 0xAC };
-    } else if (targetReturnDesc == "C") {
-        unbox = { true, "java/lang/Character", "charValue",    "()C", 0xAC };
-    } else if (targetReturnDesc == "S") {
-        unbox = { true, "java/lang/Short",     "shortValue",   "()S", 0xAC };
-    } else if (targetReturnDesc == "I") {
-        unbox = { true, "java/lang/Integer",   "intValue",     "()I", 0xAC };
-    } else if (targetReturnDesc == "F") {
-        unbox = { true, "java/lang/Float",     "floatValue",   "()F", 0xAE };
-    } else if (targetReturnDesc == "J") {
-        unbox = { true, "java/lang/Long",      "longValue",    "()J", 0xAD };
-    } else if (targetReturnDesc == "D") {
-        unbox = { true, "java/lang/Double",    "doubleValue",  "()D", 0xAF };
-    } else {
-        unbox.returnOp = 0xB0; // areturn for Object/array
-    }
-
-    // Find unbox class + method if needed
-    uint64_t unboxKlassAddr = 0;
-    uint64_t unboxMethodAddr = 0;
-    if (unbox.needsUnbox) {
-        if (!findInstanceKlassByName(unbox.wrapperClass, &unboxKlassAddr)) {
-            setError("unbox_class_not_loaded:" + unbox.wrapperClass); return 0;
-        }
-        if (!findMethodInKlass(unboxKlassAddr, unbox.unboxMethod.c_str(),
-                               unbox.unboxDesc.c_str(), &unboxMethodAddr)) {
-            setError("unbox_method_not_found:" + unbox.unboxMethod); return 0;
-        }
-    }
-
-    FVM_LOG("targetReturnDesc=%s, needsUnbox=%d, returnOp=0x%02X",
-            targetReturnDesc.c_str(), (int)unbox.needsUnbox, unbox.returnOp);
-
-    // Find FvmCallback class and methods
-    uint64_t cbKlassAddr = 0;
-    if (!findInstanceKlassByName("forgevm/forge/FvmCallback", &cbKlassAddr)) {
-        setError("FvmCallback_class_not_loaded"); return 0;
-    }
-    uint64_t cbInitMethodAddr = 0;
-    if (!findMethodInKlass(cbKlassAddr, "<init>", "(Ljava/lang/Object;[Ljava/lang/Object;)V", &cbInitMethodAddr)) {
-        setError("FvmCallback_init_not_found"); return 0;
-    }
-    uint64_t cbIsCancelledAddr = 0;
-    if (!findMethodInKlass(cbKlassAddr, "isCancelled", "()Z", &cbIsCancelledAddr)) {
-        setError("FvmCallback_isCancelled_not_found"); return 0;
-    }
-    uint64_t cbGetReturnAddr = 0;
-    if (!findMethodInKlass(cbKlassAddr, "getReturnValue", "()Ljava/lang/Object;", &cbGetReturnAddr)) {
-        setError("FvmCallback_getReturnValue_not_found"); return 0;
-    }
-
-    // Find java/lang/Object klass (needed for anewarray to build Object[] args)
-    uint64_t objectKlassAddr = 0;
-    bool hasArgCapture = !targetParams.empty();
-    if (hasArgCapture) {
-        if (!findInstanceKlassByName("java/lang/Object", &objectKlassAddr)) {
-            FVM_LOG("WARN: java/lang/Object klass not found, disabling arg capture");
-            hasArgCapture = false;
-        }
-    }
-
-    // 8. Read EXISTING interned Symbol* pointers from target JVM metadata
-    //
-    // CRITICAL: HotSpot resolves methods by comparing Symbol* POINTERS, not string content.
-    // We must use the same interned Symbol* that the JVM already has, NOT freshly allocated copies.
-    // Read them from the Klass/Method objects we already located.
-
-    // Hook class/method/descriptor symbols
-    uint64_t symHookClass = readKlassNameSymbol(hookKlassAddr);
-    uint64_t symHookMethod = 0, symHookDesc = 0;
-    if (!readMethodSymbols(hookMethodAddr, &symHookMethod, &symHookDesc)) {
-        setError("cannot_read_hook_method_symbols"); return 0;
-    }
-
-    // FvmCallback class name symbol
-    uint64_t symCbClass = readKlassNameSymbol(cbKlassAddr);
-
-    // FvmCallback.<init> name and descriptor symbols
-    uint64_t symInit = 0, symInitDesc = 0;
-    if (!readMethodSymbols(cbInitMethodAddr, &symInit, &symInitDesc)) {
-        setError("cannot_read_cbInit_symbols"); return 0;
-    }
-
-    // FvmCallback.isCancelled name and descriptor symbols
-    uint64_t symIsCancelled = 0, symIsCancelledD = 0;
-    if (!readMethodSymbols(cbIsCancelledAddr, &symIsCancelled, &symIsCancelledD)) {
-        setError("cannot_read_cbIsCancelled_symbols"); return 0;
-    }
-
-    // FvmCallback.getReturnValue name and descriptor symbols
-    uint64_t symGetRetVal = 0, symGetRetValD = 0;
-    if (!readMethodSymbols(cbGetReturnAddr, &symGetRetVal, &symGetRetValD)) {
-        setError("cannot_read_cbGetReturnValue_symbols"); return 0;
-    }
-
-    FVM_LOG("interned symbols: hookClass=0x%llX hookMethod=0x%llX hookDesc=0x%llX",
-            (unsigned long long)symHookClass, (unsigned long long)symHookMethod, (unsigned long long)symHookDesc);
-    FVM_LOG("  cbClass=0x%llX init=0x%llX initDesc=0x%llX",
-            (unsigned long long)symCbClass, (unsigned long long)symInit, (unsigned long long)symInitDesc);
-    FVM_LOG("  isCancelled=0x%llX isCancelledD=0x%llX getRetVal=0x%llX getRetValD=0x%llX",
-            (unsigned long long)symIsCancelled, (unsigned long long)symIsCancelledD,
-            (unsigned long long)symGetRetVal, (unsigned long long)symGetRetValD);
-
-    if (symHookClass == 0 || symHookMethod == 0 || symHookDesc == 0 ||
-        symCbClass == 0 || symInit == 0 || symInitDesc == 0 ||
-        symIsCancelled == 0 || symIsCancelledD == 0 ||
-        symGetRetVal == 0 || symGetRetValD == 0) {
-        setError("failed_to_read_interned_symbols"); return 0;
-    }
-
-    // java/lang/Object class name symbol (for anewarray Object[])
-    uint64_t symObjectClass = 0;
-    if (hasArgCapture) {
-        symObjectClass = readKlassNameSymbol(objectKlassAddr);
-        if (symObjectClass == 0) {
-            FVM_LOG("WARN: cannot read java/lang/Object name symbol, disabling arg capture");
-            hasArgCapture = false;
-        }
-    }
-
-    uint64_t symUnboxClass = 0, symUnboxMethod = 0, symUnboxDesc = 0;
-    if (unbox.needsUnbox) {
-        symUnboxClass = readKlassNameSymbol(unboxKlassAddr);
-        if (!readMethodSymbols(unboxMethodAddr, &symUnboxMethod, &symUnboxDesc)) {
-            setError("cannot_read_unbox_method_symbols"); return 0;
-        }
-        if (symUnboxClass == 0 || symUnboxMethod == 0 || symUnboxDesc == 0) {
-            setError("failed_to_read_unbox_symbols"); return 0;
-        }
-        FVM_LOG("unbox symbols: class=0x%llX method=0x%llX desc=0x%llX",
-                (unsigned long long)symUnboxClass, (unsigned long long)symUnboxMethod, (unsigned long long)symUnboxDesc);
-    }
-
-    // 9. Expand _resolved_klasses (needed for 'new' and 'checkcast' to find Klass*)
-    int64_t resolvedKlassesOff = structOffset("ConstantPool", "_resolved_klasses");
-    int numNewClasses = 2 + (hasArgCapture ? 1 : 0) + (unbox.needsUnbox ? 1 : 0);
-    int hookClassRKIdx = 0, cbClassRKIdx = 0, objectClassRKIdx = 0, unboxClassRKIdx = 0;
-    uint64_t newRKAddr = 0;
-
-    if (resolvedKlassesOff >= 0) {
-        uint64_t origRK = 0;
-        memcpy(&origRK, origPoolBytes.data() + resolvedKlassesOff, 8);
-
-        if (origRK != 0) {
-            int64_t rkLenOff = 0, rkDataOff = 8;
-            { int64_t v = structOffset("Array<Klass*>", "_length"); if (v >= 0) rkLenOff = v; }
-            { int64_t v = structOffset("Array<Klass*>", "_data");   if (v >= 0) rkDataOff = v; }
-
-            int32_t origRKLen = 0;
-            readRemoteI32(proc, origRK + (uint64_t)rkLenOff, &origRKLen);
-
-            hookClassRKIdx = origRKLen;
-            cbClassRKIdx   = origRKLen + 1;
-            int nextRKIdx  = origRKLen + 2;
-            if (hasArgCapture) objectClassRKIdx = nextRKIdx++;
-            if (unbox.needsUnbox) unboxClassRKIdx = nextRKIdx++;
-
-            int32_t newRKLen = origRKLen + numNewClasses;
-            size_t origRKSize = (size_t)rkDataOff + origRKLen * 8;
-            size_t newRKSize  = (size_t)rkDataOff + newRKLen * 8;
-            newRKSize = (newRKSize + 7) & ~7;
-
-            std::vector<uint8_t> origRKBytes(origRKSize);
-            readRemoteMem(proc, origRK, origRKBytes.data(), origRKSize);
-
-            std::vector<uint8_t> newRKBytes(newRKSize, 0);
-            memcpy(newRKBytes.data(), origRKBytes.data(), origRKSize);
-            memcpy(newRKBytes.data() + rkLenOff, &newRKLen, 4);
-
-            uint64_t* rkData = (uint64_t*)(newRKBytes.data() + rkDataOff);
-            rkData[hookClassRKIdx] = hookKlassAddr;
-            rkData[cbClassRKIdx]   = cbKlassAddr;
-            if (hasArgCapture) rkData[objectClassRKIdx] = objectKlassAddr;
-            if (unbox.needsUnbox) rkData[unboxClassRKIdx] = unboxKlassAddr;
-
-            newRKAddr = (uint64_t)VirtualAllocEx(proc, NULL, newRKSize,
-                                                  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (newRKAddr == 0) { setError("VirtualAllocEx_resolved_klasses_failed"); return 0; }
-            writeRemoteMem(proc, newRKAddr, newRKBytes.data(), newRKSize);
-            FVM_LOG("resolved_klasses: origLen=%d, newLen=%d, newAddr=0x%llX",
-                    origRKLen, newRKLen, (unsigned long long)newRKAddr);
-            FVM_LOG("  hookClassRKIdx=%d (Klass=0x%llX), cbClassRKIdx=%d (Klass=0x%llX)",
-                    hookClassRKIdx, (unsigned long long)hookKlassAddr,
-                    cbClassRKIdx, (unsigned long long)cbKlassAddr);
-        }
-    }
-
-    // 10. Build expanded constant pool (proper symbolic format for JDK 17+)
-    //
-    // CP layout (P = poolLength):
-    //   P+0..P+9:   Utf8 entries (tag=1, slot=Symbol*)
-    //   P+10,P+11:  Class entries (tag=7, slot=(name_idx<<16)|resolved_klass_idx)
-    //   P+12..P+15: NameAndType entries (tag=12, slot=(desc_idx<<16)|name_idx)
-    //   P+16..P+19: Methodref entries (tag=10, slot=(nat_idx<<16)|class_idx)
-    //   [If argCapture]: +1 Utf8 (Object name), +1 Class (Object)
-    //   [If unbox]:      +3 Utf8, +1 Class, +1 NameAndType, +1 Methodref
-    //
-    // HotSpot extract helpers:
-    //   extract_low_short(val)  = val & 0xFFFF        (low 16 bits)
-    //   extract_high_short(val) = (val >> 16) & 0xFFFF (high 16 bits)
-
-    uint32_t argCaptureEntries = hasArgCapture ? 2 : 0;  // 1 Utf8 + 1 Class
-    uint32_t unboxEntries = unbox.needsUnbox ? 6 : 0;
-    uint32_t totalNewEntries = 20 + argCaptureEntries + unboxEntries;
-    uint32_t newPoolLength = poolLength + totalNewEntries;
-    size_t newPoolByteSize = poolByteSize + totalNewEntries * 8;
-
-    std::vector<uint8_t> newPoolBytes(newPoolByteSize, 0);
-    memcpy(newPoolBytes.data(), origPoolBytes.data(), poolByteSize);
-
-    int64_t lengthOff = structOffset("ConstantPool", "_length");
-    if (lengthOff >= 0) {
-        int32_t newLen32 = (int32_t)newPoolLength;
-        memcpy(newPoolBytes.data() + lengthOff, &newLen32, 4);
-    }
-
-    // Update _resolved_klasses pointer in pool
-    if (resolvedKlassesOff >= 0 && newRKAddr != 0) {
-        memcpy(newPoolBytes.data() + resolvedKlassesOff, &newRKAddr, 8);
-    }
-
-    int64_t cpHeaderSize = typeSize("ConstantPool");
-    if (cpHeaderSize < 0) cpHeaderSize = 0x138;
-
-    uint64_t* newSlots = (uint64_t*)(newPoolBytes.data() + cpHeaderSize);
-    uint32_t P = poolLength;
-
-    // Utf8 entries (tag=1, slot=Symbol*)
-    newSlots[P+0]  = symHookClass;
-    newSlots[P+1]  = symHookMethod;
-    newSlots[P+2]  = symHookDesc;
-    newSlots[P+3]  = symCbClass;
-    newSlots[P+4]  = symInit;
-    newSlots[P+5]  = symInitDesc;
-    newSlots[P+6]  = symIsCancelled;
-    newSlots[P+7]  = symIsCancelledD;
-    newSlots[P+8]  = symGetRetVal;
-    newSlots[P+9]  = symGetRetValD;
-
-    // Class entries (tag=7): slot = (name_utf8_idx << 16) | resolved_klass_idx
-    newSlots[P+10] = (uint64_t)(((uint32_t)(P+0) << 16) | (uint32_t)hookClassRKIdx);
-    newSlots[P+11] = (uint64_t)(((uint32_t)(P+3) << 16) | (uint32_t)cbClassRKIdx);
-
-    // NameAndType entries (tag=12): slot = (desc_idx << 16) | name_idx
-    newSlots[P+12] = (uint64_t)(((uint32_t)(P+2) << 16) | (uint32_t)(P+1));   // hookDesc<<16 | hookMethod
-    newSlots[P+13] = (uint64_t)(((uint32_t)(P+5) << 16) | (uint32_t)(P+4));   // initDesc<<16 | <init>
-    newSlots[P+14] = (uint64_t)(((uint32_t)(P+7) << 16) | (uint32_t)(P+6));   // ()Z<<16 | isCancelled
-    newSlots[P+15] = (uint64_t)(((uint32_t)(P+9) << 16) | (uint32_t)(P+8));   // ()Object<<16 | getReturnValue
-
-    // Methodref entries (tag=10): slot = (nat_idx << 16) | class_idx
-    newSlots[P+16] = (uint64_t)(((uint32_t)(P+12) << 16) | (uint32_t)(P+10)); // hook invokestatic
-    newSlots[P+17] = (uint64_t)(((uint32_t)(P+13) << 16) | (uint32_t)(P+11)); // FvmCallback.<init>
-    newSlots[P+18] = (uint64_t)(((uint32_t)(P+14) << 16) | (uint32_t)(P+11)); // FvmCallback.isCancelled
-    newSlots[P+19] = (uint64_t)(((uint32_t)(P+15) << 16) | (uint32_t)(P+11)); // FvmCallback.getReturnValue
-
-    // Dynamic extension point — optional entries use running index E
-    uint32_t E = 20;
-
-    // [arg capture] Object class for anewarray
-    uint32_t objClassCpIdx = 0; // CP index of java/lang/Object Class entry (for anewarray bytecode)
-    if (hasArgCapture) {
-        newSlots[P+E]   = symObjectClass;  // Utf8: "java/lang/Object"
-        newSlots[P+E+1] = (uint64_t)(((uint32_t)(P+E) << 16) | (uint32_t)objectClassRKIdx); // Class
-        objClassCpIdx = P + E + 1;
-        FVM_LOG("  argCapture: Object Utf8=P+%u, Class=P+%u (cpIdx=%u)", E, E+1, objClassCpIdx);
-        E += 2;
-    }
-
-    // [unbox] wrapper class + valueOf method
-    uint32_t unboxMethodrefCpOff = 0; // relative offset from P for unbox Methodref
-    if (unbox.needsUnbox) {
-        newSlots[P+E]   = symUnboxClass;
-        newSlots[P+E+1] = symUnboxMethod;
-        newSlots[P+E+2] = symUnboxDesc;
-        // Class: (name_idx << 16) | resolved_klass_idx
-        newSlots[P+E+3] = (uint64_t)(((uint32_t)(P+E) << 16) | (uint32_t)unboxClassRKIdx);
-        // NameAndType: (desc_idx << 16) | name_idx
-        newSlots[P+E+4] = (uint64_t)(((uint32_t)(P+E+2) << 16) | (uint32_t)(P+E+1));
-        // Methodref: (nat_idx << 16) | class_idx
-        newSlots[P+E+5] = (uint64_t)(((uint32_t)(P+E+4) << 16) | (uint32_t)(P+E+3));
-        unboxMethodrefCpOff = E + 5;
-        E += 6;
-    }
-
-    FVM_LOG("new CP entries (P=%u, newPoolLength=%u, totalNew=%u):", P, newPoolLength, totalNewEntries);
-
-    // Update tags array
-    int64_t tagsOff = structOffset("ConstantPool", "_tags");
-    if (tagsOff >= 0) {
-        uint64_t tagsArrayAddr = 0;
-        memcpy(&tagsArrayAddr, newPoolBytes.data() + tagsOff, 8);
-
-        if (tagsArrayAddr != 0) {
-            int64_t tagArrayLenOff = structOffset("Array<u1>", "_length");
-            if (tagArrayLenOff < 0) tagArrayLenOff = 0;
-            int64_t tagArrayDataOff = structOffset("Array<u1>", "_data");
-            if (tagArrayDataOff < 0) tagArrayDataOff = 4;
-
-            int32_t tagLen = 0;
-            readRemoteI32(proc, tagsArrayAddr + (uint64_t)tagArrayLenOff, &tagLen);
-
-            size_t newTagSize = (size_t)tagArrayDataOff + newPoolLength;
-            newTagSize = (newTagSize + 7) & ~7;
-
-            uint64_t newTagsAddr = (uint64_t)VirtualAllocEx(proc, NULL, newTagSize,
-                                                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (newTagsAddr != 0) {
-                std::vector<uint8_t> oldTags((size_t)tagArrayDataOff + tagLen);
-                readRemoteMem(proc, tagsArrayAddr, oldTags.data(), oldTags.size());
-
-                std::vector<uint8_t> newTags(newTagSize, 0);
-                memcpy(newTags.data(), oldTags.data(), oldTags.size());
-
-                int32_t newTagLen = (int32_t)newPoolLength;
-                memcpy(newTags.data() + tagArrayLenOff, &newTagLen, 4);
-
-                uint8_t* td = newTags.data() + tagArrayDataOff;
-                // Base 20 entries: 10 Utf8, 2 Class, 4 NameAndType, 4 Methodref
-                for (int i = 0; i < 10; i++) td[P+i] = 1;   // Utf8
-                td[P+10] = 7;  td[P+11] = 7;                 // Class
-                td[P+12] = 12; td[P+13] = 12; td[P+14] = 12; td[P+15] = 12; // NameAndType
-                td[P+16] = 10; td[P+17] = 10; td[P+18] = 10; td[P+19] = 10; // Methodref
-
-                // Tag optional entries using the same running offset logic
-                uint32_t tagE = 20;
-                if (hasArgCapture) {
-                    td[P+tagE] = 1;     // Utf8 (Object name)
-                    td[P+tagE+1] = 7;   // Class (Object)
-                    tagE += 2;
-                }
-                if (unbox.needsUnbox) {
-                    td[P+tagE] = 1;  td[P+tagE+1] = 1;  td[P+tagE+2] = 1;  // Utf8
-                    td[P+tagE+3] = 7;  // Class
-                    td[P+tagE+4] = 12; // NameAndType
-                    td[P+tagE+5] = 10; // Methodref
-                    tagE += 6;
-                }
-
-                writeRemoteMem(proc, newTagsAddr, newTags.data(), newTagSize);
-                memcpy(newPoolBytes.data() + tagsOff, &newTagsAddr, 8);
-            }
-        }
-    }
-
-    // 11. Expand ConstantPoolCache
-    //
-    // In JDK 17+, invoke bytecodes use CP cache indices (not CP indices).
-    // We must add cache entries for our new Methodref entries.
-    // Unresolved entries: _indices = cp_index, _f1 = 0, _f2 = 0, _flags = 0.
-    // The JVM will resolve them on first use from our symbolic CP entries.
-
-    int64_t cacheOff = structOffset("ConstantPool", "_cache");
-    int32_t origCacheLen = 0;
-    int numNewCacheEntries = unbox.needsUnbox ? 5 : 4;
-    int hookCacheIdx = 0, initCacheIdx = 0, cancelCacheIdx = 0, retValCacheIdx = 0, unboxCacheIdx = 0;
-    uint64_t newCacheAddr = 0;
-    int64_t cacheCpOff = -1;
-    std::vector<uint8_t> newCacheBytes;
-
-    // Hoisted: post-suspend snapshot needs these. See "snapshot CPCache (post-suspend)"
-    // section near suspendTargetThreads.
-    uint64_t origCacheAddr = 0;
-    int64_t cacheHdrSize = 16;
-    int64_t cacheEntrySize = 32;
-    int64_t cacheLenOff = 0;
-    int32_t newCacheLen = 0;
-    size_t origCacheSize = 0;
-
-    if (cacheOff >= 0) {
-        memcpy(&origCacheAddr, origPoolBytes.data() + cacheOff, 8);
-
-        if (origCacheAddr != 0) {
-            cacheHdrSize = typeSize("ConstantPoolCache");
-            if (cacheHdrSize < 0) cacheHdrSize = 16;
-            cacheLenOff = structOffset("ConstantPoolCache", "_length");
-            if (cacheLenOff < 0) cacheLenOff = 0;
-            cacheEntrySize = typeSize("ConstantPoolCacheEntry");
-            if (cacheEntrySize < 0) cacheEntrySize = 32;
-            cacheCpOff = structOffset("ConstantPoolCache", "_constant_pool");
-            if (cacheCpOff < 0) cacheCpOff = 8;
-
-            readRemoteI32(proc, origCacheAddr + (uint64_t)cacheLenOff, &origCacheLen);
-
-            hookCacheIdx   = origCacheLen;
-            initCacheIdx   = origCacheLen + 1;
-            cancelCacheIdx = origCacheLen + 2;
-            retValCacheIdx = origCacheLen + 3;
-            if (unbox.needsUnbox) unboxCacheIdx = origCacheLen + 4;
-
-            newCacheLen = origCacheLen + numNewCacheEntries;
-            origCacheSize = (size_t)cacheHdrSize + origCacheLen * cacheEntrySize;
-            size_t newCacheSize  = (size_t)cacheHdrSize + newCacheLen * cacheEntrySize;
-
-            /*
-             * Defer the [0, origCacheSize) prefix snapshot to post-suspend: target
-             * threads may be mid lazy-resolve and a pre-suspend read would tear.
-             * Allocate full size now (zero-init) so the tail entries
-             * [origCacheSize, newCacheSize) can be pre-resolved here; the later
-             * prefix memcpy only touches [0, origCacheSize) and leaves the tail.
-             */
-            newCacheBytes.resize(newCacheSize, 0);
-
-            /*
-             * Pre-resolve the new cache entries. HotSpot's LinkResolver fast path
-             * recovers the Methodref's CP index from ConstantPoolCacheEntry::_indices
-             * (low 16 bits); leaving the entry all-zero makes it resolve cp[0]
-             * (reserved/unused) and dereference a NULL Symbol*. Pre-filling _f1 with
-             * the resolved Method* additionally lets the interpreter dispatch
-             * directly, bypassing class-loader-constraint checks that fail when the
-             * target class is loaded by a child loader that cannot see the hook /
-             * callback classes.
-             */
-            {
-                int64_t indicesFieldOff = structOffset("ConstantPoolCacheEntry", "_indices");
-                if (indicesFieldOff < 0) indicesFieldOff = 0;
-                int64_t f1FieldOff      = structOffset("ConstantPoolCacheEntry", "_f1");
-                if (f1FieldOff      < 0) f1FieldOff      = 8;
-                int64_t f2FieldOff      = structOffset("ConstantPoolCacheEntry", "_f2");
-                if (f2FieldOff      < 0) f2FieldOff      = 16;
-                int64_t flagsFieldOff   = structOffset("ConstantPoolCacheEntry", "_flags");
-                if (flagsFieldOff   < 0) flagsFieldOff   = 24;
-
-                // CP indices of the new Methodref entries (absolute in mergedCP).
-                int cpIdxTable[5] = {
-                    (int)(P + 16),                              // hook   invokestatic
-                    (int)(P + 17),                              // <init> invokespecial
-                    (int)(P + 18),                              // isCancelled invokespecial
-                    (int)(P + 19),                              // getReturnValue invokespecial
-                    unbox.needsUnbox ? (int)(P + unboxMethodrefCpOff) : 0,
-                };
-
-                // bytecode_1 marker (encoded into _indices high bits). All 5 entries are
-                // single-bytecode invokes; we never set bytecode_2.
-                uint8_t bcTable[5] = { 0xB8, 0xB7, 0xB7, 0xB7, 0xB7 };
-
-                // Resolved Method* for direct dispatch via _f1.
-                uint64_t methodTable[5] = {
-                    hookMethodAddr, cbInitMethodAddr,
-                    cbIsCancelledAddr, cbGetReturnAddr, unboxMethodAddr,
-                };
-
-                // _flags = (tos_state << 28) | parameter_size.
-                // TosState: itos=4, ltos=5, ftos=6, dtos=7, atos=8, vtos=9.
-                // param_size: invokestatic counts args only; invokespecial counts this+args.
-                int64_t flagsTable[5];
-                flagsTable[0] = ((int64_t)9 << 28) | 1;  // hook(FvmCallback)V         vtos, 1 arg
-                flagsTable[1] = ((int64_t)9 << 28) | 3;  // <init>(Object,Object[])V   vtos, this+2
-                flagsTable[2] = ((int64_t)4 << 28) | 1;  // isCancelled()Z             itos, this
-                flagsTable[3] = ((int64_t)8 << 28) | 1;  // getReturnValue()Object     atos, this
-                flagsTable[4] = 0;                       // unbox: filled below
-
-                if (unbox.needsUnbox) {
-                    int unboxTos = 4;
-                    switch (unbox.returnOp) {
-                        case 0xAC: unboxTos = 4; break; // ireturn → itos (also Z/B/C/S)
-                        case 0xAD: unboxTos = 5; break; // lreturn → ltos
-                        case 0xAE: unboxTos = 6; break; // freturn → ftos
-                        case 0xAF: unboxTos = 7; break; // dreturn → dtos
-                        case 0xB0: unboxTos = 8; break; // areturn → atos
-                        default:   unboxTos = 9; break; // return  → vtos
-                    }
-                    flagsTable[4] = ((int64_t)unboxTos << 28) | 1; // invokespecial: this only
-                }
-
-                for (int i = 0; i < numNewCacheEntries; i++) {
-                    uint8_t* entry = newCacheBytes.data() + cacheHdrSize
-                                     + (size_t)(origCacheLen + i) * (size_t)cacheEntrySize;
-
-                    int64_t indicesVal = (int64_t)cpIdxTable[i] | ((int64_t)bcTable[i] << 16);
-                    memcpy(entry + indicesFieldOff, &indicesVal, 8);
-
-                    uint64_t f1Val = methodTable[i];
-                    memcpy(entry + f1FieldOff, &f1Val, 8);
-
-                    uint64_t f2Val = 0;
-                    memcpy(entry + f2FieldOff, &f2Val, 8);
-
-                    int64_t flagsVal = flagsTable[i];
-                    memcpy(entry + flagsFieldOff, &flagsVal, 8);
-                }
-
-                FVM_LOG("CPCache pre-resolved %d new entries (offsets _indices=%lld _f1=%lld _f2=%lld _flags=%lld)",
-                        numNewCacheEntries,
-                        (long long)indicesFieldOff, (long long)f1FieldOff,
-                        (long long)f2FieldOff,     (long long)flagsFieldOff);
-                for (int i = 0; i < numNewCacheEntries; i++) {
-                    FVM_LOG("  cache[%d]: cpIdx=%d bc=0x%02X f1=0x%llX flags=0x%llX",
-                            origCacheLen + i, cpIdxTable[i], bcTable[i],
-                            (unsigned long long)methodTable[i],
-                            (unsigned long long)flagsTable[i]);
-                }
-            }
-
-            newCacheAddr = (uint64_t)VirtualAllocEx(proc, NULL, newCacheSize,
-                                                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (newCacheAddr == 0) { setError("VirtualAllocEx_cache_failed"); return 0; }
-
-            // Update new pool's _cache pointer (back-pointer fixed post-suspend)
-            memcpy(newPoolBytes.data() + cacheOff, &newCacheAddr, 8);
-
-            FVM_LOG("CPCache: origLen=%d, newLen=%d, entrySize=%lld, newAddr=0x%llX (tail entries pre-resolved)",
-                    origCacheLen, newCacheLen, (long long)cacheEntrySize, (unsigned long long)newCacheAddr);
-        }
-    }
-
-    // Guard: if resolved_klasses or CP cache expansion failed, the class is likely loaded
-    // but not yet linked. Injecting bytecode with index 0 would cause VerifyError
-    // when the JVM later verifies/interprets the method. Abort this transform.
-    if (newRKAddr == 0) {
-        FVM_LOG("TRANSFORM ABORTED: resolved_klasses expansion failed (class may not be linked yet)");
-        setError("resolved_klasses_not_available");
-        return 0;
-    }
-    if (newCacheAddr == 0) {
-        FVM_LOG("TRANSFORM ABORTED: ConstantPoolCache expansion failed (class may not be linked yet)");
-        setError("cache_not_available");
-        return 0;
-    }
-
-    // 12. Build new bytecode
-    //
-    // IMPORTANT: invoke operands = CP CACHE indices (not CP indices)
-    //            new/checkcast operands = CP indices
-    uint16_t cbClassCpIdx     = (uint16_t)(P + 11);           // FvmCallback class (for 'new')
-    uint16_t hookCacheIdx16   = (uint16_t)hookCacheIdx;        // invokestatic hook
-    uint16_t initCacheIdx16   = (uint16_t)initCacheIdx;        // invokespecial <init>
-    uint16_t cancelCacheIdx16 = (uint16_t)cancelCacheIdx;      // invokespecial isCancelled
-    uint16_t retValCacheIdx16 = (uint16_t)retValCacheIdx;      // invokespecial getReturnValue
-    uint16_t unboxClassCpIdx  = unbox.needsUnbox ? (uint16_t)(P + unboxMethodrefCpOff - 2) : 0; // wrapper Class (for checkcast)
-    uint16_t unboxCacheIdx16  = unbox.needsUnbox ? (uint16_t)unboxCacheIdx : 0;
-
-    FVM_LOG("bytecode operand indices:");
-    FVM_LOG("  new FvmCallback CP idx = %u (big-endian)", (unsigned)cbClassCpIdx);
-    FVM_LOG("  invokespecial <init>     cache idx = %u (native-endian)", (unsigned)initCacheIdx16);
-    FVM_LOG("  invokestatic hook        cache idx = %u (native-endian)", (unsigned)hookCacheIdx16);
-    FVM_LOG("  invokespecial isCancelled cache idx = %u (native-endian)", (unsigned)cancelCacheIdx16);
-    FVM_LOG("  invokespecial getRetVal   cache idx = %u (native-endian)", (unsigned)retValCacheIdx16);
-    if (unbox.needsUnbox) {
-        FVM_LOG("  checkcast unbox CP idx = %u, invokespecial unbox cache idx = %u",
-                (unsigned)unboxClassCpIdx, (unsigned)unboxCacheIdx16);
-    }
-
-    // Big-endian: for CP indices used by new/checkcast/ifeq (standard Java bytecode format)
-    auto emitIdx = [](std::vector<uint8_t>& bc, uint16_t idx) {
-        bc.push_back((uint8_t)(idx >> 8));
-        bc.push_back((uint8_t)(idx & 0xFF));
-    };
-
-    // Native byte order (little-endian on x86): for CP cache indices used by
-    // invoke bytecodes (invokestatic/invokespecial/invokevirtual).
-    // HotSpot's bytecode rewriter converts invoke operands from big-endian CP indices
-    // to native-endian cache indices. Since our bytecodes bypass the rewriter,
-    // we must emit cache indices in native byte order directly.
-    auto emitNativeIdx = [](std::vector<uint8_t>& bc, uint16_t idx) {
-        bc.push_back((uint8_t)(idx & 0xFF));        // low byte first
-        bc.push_back((uint8_t)((idx >> 8) & 0xFF)); // high byte second
-    };
-
-    // Build cancel branch return sequence
-    std::vector<uint8_t> cancelReturn;
-    if (unbox.returnOp == 0xB1) {
-        // void: pop callback ref and return
-        cancelReturn.push_back(0x57); // pop
-        cancelReturn.push_back(0xB1); // return
-    } else {
-        // invokespecial getReturnValue (cache index, native byte order) → [Object]
-        // Using invokespecial instead of invokevirtual to enable CP cache pre-resolution
-        // (bypasses class loader constraints in modular class loader environments)
-        cancelReturn.push_back(0xB7);
-        cancelReturn.push_back((uint8_t)(retValCacheIdx16 & 0xFF));
-        cancelReturn.push_back((uint8_t)((retValCacheIdx16 >> 8) & 0xFF));
-
-        if (unbox.needsUnbox) {
-            // checkcast WrapperClass (CP index, big-endian) → [WrapperClass]
-            cancelReturn.push_back(0xC0);
-            cancelReturn.push_back((uint8_t)(unboxClassCpIdx >> 8));
-            cancelReturn.push_back((uint8_t)(unboxClassCpIdx & 0xFF));
-            // invokespecial unboxMethod (cache index, native byte order) → [primitive]
-            cancelReturn.push_back(0xB7);
-            cancelReturn.push_back((uint8_t)(unboxCacheIdx16 & 0xFF));
-            cancelReturn.push_back((uint8_t)((unboxCacheIdx16 >> 8) & 0xFF));
-        }
-
-        cancelReturn.push_back(unbox.returnOp);
-    }
-
-    int16_t ifeqOffset = (int16_t)(3 + (int)cancelReturn.size());
-
-    std::vector<uint8_t> newBytecode;
-    std::string injectAtStr(injectAt);
-
-    auto emitCallbackPrologue = [&](std::vector<uint8_t>& bc) {
-        // new FvmCallback(instance, args)
-        bc.push_back(0xBB); emitIdx(bc, cbClassCpIdx);           // new FvmCallback → [cbU]
-        bc.push_back(0x59);                                        // dup → [cbU, cbU]
-
-        // Push instance: this for instance methods, null for static
-        if (targetIsStatic) {
-            bc.push_back(0x01);                                    // aconst_null → [cbU, cbU, null]
-        } else {
-            bc.push_back(0x2A);                                    // aload_0 → [cbU, cbU, this]
-        }
-
-        // Build Object[] args (or null if no params / arg capture disabled)
-        if (!hasArgCapture || targetParams.empty()) {
-            bc.push_back(0x01);                                    // aconst_null → [cbU, cbU, inst, null]
-        } else {
-            int n = (int)targetParams.size();
-            // Push array size
-            if (n <= 5) {
-                bc.push_back((uint8_t)(0x03 + n));                 // iconst_0..iconst_5
-            } else {
-                bc.push_back(0x10); bc.push_back((uint8_t)n);     // bipush N
-            }
-            // anewarray java/lang/Object (CP idx, big-endian)
-            bc.push_back(0xBD); emitIdx(bc, (uint16_t)objClassCpIdx);
-            // Fill array with method arguments
-            for (int i = 0; i < n; i++) {
-                bc.push_back(0x59);                                // dup array ref
-                // Push array index
-                if (i <= 5) {
-                    bc.push_back((uint8_t)(0x03 + i));             // iconst_0..iconst_5
-                } else {
-                    bc.push_back(0x10); bc.push_back((uint8_t)i); // bipush
-                }
-                // Load parameter value
-                if (targetParams[i].isRef) {
-                    int slot = targetParams[i].slot;
-                    if (slot <= 3) {
-                        bc.push_back((uint8_t)(0x2A + slot));      // aload_0..aload_3
-                    } else {
-                        bc.push_back(0x19); bc.push_back((uint8_t)slot); // aload N
-                    }
-                } else {
-                    bc.push_back(0x01);                            // aconst_null (primitive, boxing TODO)
-                }
-                bc.push_back(0x53);                                // aastore
-            }
-        }
-
-        bc.push_back(0xB7); emitNativeIdx(bc, initCacheIdx16);    // invokespecial <init>(Object, Object[]) → [cb]
-        bc.push_back(0x59);                                        // dup → [cb, cb]
-        bc.push_back(0x59);                                        // dup → [cb, cb, cb]
-        bc.push_back(0xB8); emitNativeIdx(bc, hookCacheIdx16);    // invokestatic hook → [cb, cb]
-        bc.push_back(0xB7); emitNativeIdx(bc, cancelCacheIdx16);  // invokespecial isCancelled → [cb, int]
-        bc.push_back(0x99);                                        // ifeq (branch offset, big-endian)
-        bc.push_back((uint8_t)(ifeqOffset >> 8));
-        bc.push_back((uint8_t)(ifeqOffset & 0xFF));
-        // Cancel branch: stack = [cb]
-        bc.insert(bc.end(), cancelReturn.begin(), cancelReturn.end());
-        // CONTINUE: stack = [cb], pop it
-        bc.push_back(0x57); // pop → []
-    };
-
-    // Bytecode instruction length table (per JVM Specification §6.5).
-    // -1 = variable length, handled separately in getInsnLength below
-    //      (0xAA tableswitch, 0xAB lookupswitch, 0xC4 wide).
-    static const int8_t bcLengths[256] = {
-        // 0x00-0x0F: nop, aconst_null, iconst_m1..5, lconst_0/1, fconst_0..2, dconst_0/1
-        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-        // 0x10-0x1F: bipush(2), sipush(3), ldc(2), ldc_w(3), ldc2_w(3),
-        //            iload/lload/fload/dload/aload(2 each), iload_0..3(1 each)
-        2,3,2,3,3,2,2,2,2,2,1,1,1,1,1,1,
-        // 0x20-0x2F: lload_2/3, fload_0..3, dload_0..3, aload_0..3
-        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-        // 0x30-0x3F: iaload..baload(1), istore/lstore/fstore/dstore/astore(2 each), istore_0..3(1)
-        1,1,1,1,1,1,2,2,2,2,2,1,1,1,1,1,
-        // 0x40-0x4F: lstore_1..3, fstore_0..3, dstore_0..3, astore_0..3
-        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-        // 0x50-0x5F: lastore..sastore, pop, pop2, dup, dup_x1/x2, dup2, dup2_x1/x2, swap
-        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-        // 0x60-0x6F: iadd..ineg
-        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-        // 0x70-0x7F: lneg..lxor
-        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-        // 0x80-0x8F: ior, lor, ixor, lxor, iinc(3), conversions...
-        1,1,1,1,3,1,1,1,1,1,1,1,1,1,1,1,
-        // 0x90-0x9F: conversions (1) and if_eq..if_le start of branch ops (3)
-        1,1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,
-        // 0xA0-0xAF: if_icmp*..if_acmpne(3), goto(3), jsr(3), ret(2),
-        //            tableswitch(-1), lookupswitch(-1), ireturn..dreturn(1)
-        3,3,3,3,3,3,3,3,3,2,-1,-1,1,1,1,1,
-        // 0xB0-0xBF: areturn(1), return(1),
-        //            getstatic..invokestatic(3), invokeinterface(5), invokedynamic(5),
-        //            new(3), newarray(2), anewarray(3), arraylength(1), athrow(1)
-        1,1,3,3,3,3,3,3,3,5,5,3,2,3,1,1,
-        // 0xC0-0xCF: checkcast(3), instanceof(3), monitorenter(1), monitorexit(1),
-        //            wide(-1), multianewarray(4), ifnull(3), ifnonnull(3),
-        //            goto_w(5), jsr_w(5), breakpoint(1),
-        //            then HotSpot fast bytecodes start at 0xCB:
-        //            0xCB fast_agetfield(3), 0xCC fast_bgetfield(3), 0xCD fast_cgetfield(3),
-        //            0xCE fast_dgetfield(3), 0xCF fast_fgetfield(3)
-        3,3,1,1,-1,4,3,3,5,5,1,3,3,3,3,3,
-        // 0xD0-0xDF: more HotSpot fast bytecodes (rewritten in-place by HotSpot link).
-        //   0xD0 fast_igetfield(3), 0xD1 fast_lgetfield(3), 0xD2 fast_sgetfield(3),
-        //   0xD3 fast_aputfield(3), 0xD4 fast_bputfield(3), 0xD5 fast_zputfield(3),
-        //   0xD6 fast_cputfield(3), 0xD7 fast_dputfield(3), 0xD8 fast_fputfield(3),
-        //   0xD9 fast_iputfield(3), 0xDA fast_lputfield(3), 0xDB fast_sputfield(3),
-        //   0xDC fast_aload_0(1),
-        //   0xDD fast_iaccess_0(4), 0xDE fast_aaccess_0(4), 0xDF fast_faccess_0(4)
-        3,3,3,3,3,3,3,3,3,3,3,3,1,4,4,4,
-        // 0xE0-0xEF:
-        //   0xE0 fast_iload(2), 0xE1 fast_iload2(4), 0xE2 fast_icaload(3),
-        //   0xE3 fast_invokevfinal(3),
-        //   0xE4 fast_linearswitch(-1), 0xE5 fast_binaryswitch(-1),
-        //   0xE6 fast_aldc(2), 0xE7 fast_aldc_w(3),
-        //   0xE8 return_register_finalizer(1),
-        //   0xE9 invokehandle(3),
-        //   0xEA nofast_getfield(3), 0xEB nofast_putfield(3),
-        //   0xEC nofast_aload_0(1), 0xED nofast_iload(2),
-        //   0xEE shouldnotreachhere(1), 0xEF reserved(1)
-        2,4,3,3,-1,-1,2,3,1,3,3,3,1,2,1,1,
-        // 0xF0-0xFF: reserved, treat as 1
-        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-    };
-
-    // Helper: get instruction length at a given offset
-    auto getInsnLength = [&](size_t off) -> int {
-        uint8_t op = origBytecode[off];
-        if (op == 0xAA) { // tableswitch
-            int pad = (4 - ((off + 1) % 4)) % 4;
-            if (off + 1 + pad + 12 > origBytecode.size()) return -1;
-            int32_t lo, hi;
-            memcpy(&lo, &origBytecode[off + 1 + pad + 4], 4); lo = _byteswap_ulong(lo);
-            memcpy(&hi, &origBytecode[off + 1 + pad + 8], 4); hi = _byteswap_ulong(hi);
-            return 1 + pad + 12 + (hi - lo + 1) * 4;
-        }
-        if (op == 0xAB || op == 0xE4 || op == 0xE5) {
-            // lookupswitch (0xAB), fast_linearswitch (0xE4), fast_binaryswitch (0xE5)
-            // — fast_*switch are HotSpot rewrites of lookupswitch, same layout
-            int pad = (4 - ((off + 1) % 4)) % 4;
-            if (off + 1 + pad + 8 > origBytecode.size()) return -1;
-            int32_t npairs;
-            memcpy(&npairs, &origBytecode[off + 1 + pad + 4], 4); npairs = _byteswap_ulong(npairs);
-            return 1 + pad + 8 + npairs * 8;
-        }
-        if (op == 0xC4) { // wide
-            if (off + 1 >= origBytecode.size()) return -1;
-            uint8_t wideOp = origBytecode[off + 1];
-            return (wideOp == 0x84) ? 6 : 4; // wide iinc = 6, others = 4
-        }
-        int len = bcLengths[op];
-        return len > 0 ? len : 1;
-    };
-
-    // Helper: resolve method name from a CP cache index in bytecode (invoke instructions)
-    // invoke bytecodes use native-endian CP cache indices in rewritten bytecode,
-    // but in original bytecode they use big-endian CP indices.
-    auto resolveInvokeMethodName = [&](size_t invokeOff) -> std::string {
-        if (invokeOff + 2 >= origBytecode.size()) return "";
-        // Original bytecode: big-endian CP index
-        uint16_t cpIdx = ((uint16_t)origBytecode[invokeOff + 1] << 8) | origBytecode[invokeOff + 2];
-        // CP entry at cpIdx is a Methodref: hi16 = class, lo16 = NameAndType
-        // Read the CP slot
-        int64_t cpHeaderSize_ = typeSize("ConstantPool");
-        if (cpHeaderSize_ < 0) cpHeaderSize_ = 0x138;
-        uint64_t cpSlotAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)cpIdx * 8;
-        uint64_t methodrefSlot = 0;
-        if (!readRemotePointer(proc, cpSlotAddr, &methodrefSlot)) return "";
-        // NameAndType index is in the low 16 bits
-        uint16_t natIdx = (uint16_t)(methodrefSlot & 0xFFFF);
-        // Read NameAndType slot: hi16 = descriptor, lo16 = name
-        uint64_t natSlotAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)natIdx * 8;
-        uint64_t natSlot = 0;
-        if (!readRemotePointer(proc, natSlotAddr, &natSlot)) return "";
-        uint16_t nameIdx = (uint16_t)(natSlot & 0xFFFF);
-        // Read name symbol
-        uint64_t nameSymAddr = 0;
-        uint64_t nameEntryAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)nameIdx * 8;
-        if (!readRemotePointer(proc, nameEntryAddr, &nameSymAddr) || nameSymAddr == 0) return "";
-        std::string name;
-        readSymbolBody(proc, nameSymAddr, &name);
-        return name;
-    };
-
-    // Helper: resolve field name from CP index (getfield/putfield/getstatic/putstatic)
-    auto resolveFieldName = [&](size_t fieldOff) -> std::string {
-        if (fieldOff + 2 >= origBytecode.size()) return "";
-        uint16_t cpIdx = ((uint16_t)origBytecode[fieldOff + 1] << 8) | origBytecode[fieldOff + 2];
-        int64_t cpHeaderSize_ = typeSize("ConstantPool");
-        if (cpHeaderSize_ < 0) cpHeaderSize_ = 0x138;
-        uint64_t cpSlotAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)cpIdx * 8;
-        uint64_t fieldrefSlot = 0;
-        if (!readRemotePointer(proc, cpSlotAddr, &fieldrefSlot)) return "";
-        uint16_t natIdx = (uint16_t)(fieldrefSlot & 0xFFFF);
-        uint64_t natSlotAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)natIdx * 8;
-        uint64_t natSlot = 0;
-        if (!readRemotePointer(proc, natSlotAddr, &natSlot)) return "";
-        uint16_t nameIdx = (uint16_t)(natSlot & 0xFFFF);
-        uint64_t nameSymAddr = 0;
-        uint64_t nameEntryAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)nameIdx * 8;
-        if (!readRemotePointer(proc, nameEntryAddr, &nameSymAddr) || nameSymAddr == 0) return "";
-        std::string name;
-        readSymbolBody(proc, nameSymAddr, &name);
-        return name;
-    };
-
-    // Helper: resolve class name from CP index (new instruction)
-    auto resolveNewClassName = [&](size_t newOff) -> std::string {
-        if (newOff + 2 >= origBytecode.size()) return "";
-        uint16_t cpIdx = ((uint16_t)origBytecode[newOff + 1] << 8) | origBytecode[newOff + 2];
-        int64_t cpHeaderSize_ = typeSize("ConstantPool");
-        if (cpHeaderSize_ < 0) cpHeaderSize_ = 0x138;
-        uint64_t cpSlotAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)cpIdx * 8;
-        uint64_t classSlot = 0;
-        if (!readRemotePointer(proc, cpSlotAddr, &classSlot)) return "";
-        // Class entry: name index in low 16 bits
-        uint16_t nameIdx = (uint16_t)(classSlot & 0xFFFF);
-        uint64_t nameSymAddr = 0;
-        uint64_t nameEntryAddr = origConstPoolAddr + (uint64_t)cpHeaderSize_ + (uint64_t)nameIdx * 8;
-        if (!readRemotePointer(proc, nameEntryAddr, &nameSymAddr) || nameSymAddr == 0) return "";
-        std::string name;
-        readSymbolBody(proc, nameSymAddr, &name);
-        return name;
-    };
-
-    // Parse injectAt — may be "HEAD", "RETURN", or "INVOKE:methodName", "FIELD_GET:fieldName", etc.
-    std::string injectType = injectAtStr;
-    std::string injectTargetName;
-    size_t colonPos = injectAtStr.find(':');
-    if (colonPos != std::string::npos) {
-        injectType = injectAtStr.substr(0, colonPos);
-        injectTargetName = injectAtStr.substr(colonPos + 1);
-    }
-
-    // ---------------------------------------------------------------
-    // Zero-displacement trampoline injection (§17.3 / §17.4)
-    //
-    // For any injection point BCI X:
-    //   1. Copy BCI 0..X-1 verbatim into newBytecode.
-    //   2. At BCI X, write goto_w <tail_offset> (5 bytes).
-    //   3. Fill BCI X+5..K-1 with nop (K = next instruction boundary >= X+5).
-    //   4. Copy BCI K..N verbatim — all BCI values preserved, no alignment shift.
-    //   5. Append tail: prologue + rescued bytes (BCI X..K-1) + goto_w K (or return for RETURN).
-    //
-    // This guarantees tableswitch/lookupswitch padding, jump targets,
-    // exception table ranges, and StackMapTable BCI entries are all untouched.
-    // ---------------------------------------------------------------
-
-    // Emit goto_w targeting an absolute BCI within newBytecode.
-    // We write a placeholder offset and fix it up once we know the tail position.
-    // Returns the index in newBytecode where the 4-byte signed offset lives.
-    // JVM goto_w offset is big-endian; write directly via byte shifts (no byteswap needed).
-    auto emitGotoW = [&](std::vector<uint8_t>& bc, int32_t offsetPlaceholder) -> size_t {
-        bc.push_back(0xC8); // goto_w opcode
-        size_t fixupIdx = bc.size();
-        uint32_t v = (uint32_t)offsetPlaceholder;
-        bc.push_back((uint8_t)(v >> 24));
-        bc.push_back((uint8_t)(v >> 16));
-        bc.push_back((uint8_t)(v >> 8));
-        bc.push_back((uint8_t)(v));
-        return fixupIdx;
-    };
-
-    // Patch a previously emitted goto_w offset.
-    // fixupIdx: index of first offset byte in bc.
-    // instrBCI: BCI of the goto_w instruction itself within newBytecode.
-    // targetBCI: desired destination BCI within newBytecode.
-    auto patchGotoW = [&](std::vector<uint8_t>& bc, size_t fixupIdx, size_t instrBCI, size_t targetBCI) {
-        int32_t rel = (int32_t)targetBCI - (int32_t)instrBCI;
-        uint32_t v = (uint32_t)rel;
-        bc[fixupIdx + 0] = (uint8_t)(v >> 24);
-        bc[fixupIdx + 1] = (uint8_t)(v >> 16);
-        bc[fixupIdx + 2] = (uint8_t)(v >> 8);
-        bc[fixupIdx + 3] = (uint8_t)(v);
-    };
-
-    // Find K: the first instruction boundary at or after BCI X+5.
-    // Scans forward from X until we reach a boundary >= X+5.
-    auto findCoverageEnd = [&](size_t x) -> size_t {
-        size_t k = x;
-        while (k < x + 5 && k < origBytecode.size()) {
-            int len = getInsnLength(k);
-            if (len <= 0) len = 1;
-            k += (size_t)len;
-        }
-        // k is now >= x+5 and on an instruction boundary
-        return k;
-    };
-
-    // Core trampoline builder for a single injection point X.
-    // Writes BCI X..K-1 as goto_w+nops in newBytecode, appends tail at end.
-    // Returns false on error (sets error string).
-    // rescued: bytes from BCI X..K-1 to replay in tail.
-    // tailReturnOp: if != 0, tail ends with this return opcode instead of goto_w K.
-    auto buildTrampoline = [&](size_t x, uint8_t tailReturnOp) -> bool {
-        size_t k = findCoverageEnd(x);
-        if (k > origBytecode.size()) k = origBytecode.size();
-
-        // 1. BCI 0..X-1: already copied by caller before calling us (or X==0, nothing to copy).
-        // 2. At BCI X: emit goto_w with placeholder, record instrBCI.
-        size_t gotoWInstrBCI = newBytecode.size(); // = X in the output stream (same as input, since 0..X-1 copied verbatim)
-        size_t fixupIdx = emitGotoW(newBytecode, 0);
-
-        // 3. Fill BCI X+5..K-1 with nop.
-        for (size_t b = x + 5; b < k; b++) {
-            newBytecode.push_back(0x00); // nop
-        }
-
-        // 4. BCI K..N: copy verbatim — caller is responsible for this after we return.
-        //    We just record k so the caller knows where to resume copying.
-        //    (We can't copy here because RETURN mode needs to scan for more return ops.)
-
-        // 5. Record tail start position — will be filled after caller appends BCI K..N.
-        //    We store fixup info and do the patch in a second pass.
-        //    For simplicity: store the rescued bytes and the fixup info in captured locals,
-        //    and the caller drives the tail append.
-
-        // Collect rescued bytes (BCI X..K-1 from original).
-        std::vector<uint8_t> rescued(origBytecode.begin() + x, origBytecode.begin() + k);
-
-        // Sanity check: rescued bytes must not contain switch, wide, jsr/ret, or other
-        // alignment- or context-sensitive instructions. tableswitch/lookupswitch padding
-        // depends on absolute BCI and would break in the tail. Reject these for now.
-        // (In practice, the coverage zone is at most ~5 bytes from the inject point, so
-        // it's extremely unlikely to contain a switch.)
-        for (size_t off = 0; off < rescued.size();) {
-            uint8_t op = rescued[off];
-            // Reject opcodes that depend on absolute BCI alignment or method-local context:
-            //   0xAA tableswitch, 0xAB lookupswitch, 0xC4 wide,
-            //   0xA8 jsr, 0xA9 ret, 0xC9 jsr_w,
-            //   0xE4 fast_linearswitch, 0xE5 fast_binaryswitch
-            if (op == 0xAA || op == 0xAB || op == 0xC4 ||
-                op == 0xA8 || op == 0xA9 || op == 0xC9 ||
-                op == 0xE4 || op == 0xE5) {
-                setError("rescue_zone_contains_unsupported_opcode");
-                return false;
-            }
-            int rlen = bcLengths[op];
-            if (rlen <= 0) rlen = 1;
-            off += (size_t)rlen;
-        }
-
-        // Copy BCI K..N verbatim.
-        for (size_t b = k; b < origBytecode.size(); b++) {
-            newBytecode.push_back(origBytecode[b]);
-        }
-
-        // Tail: record start BCI.
-        size_t tailBCI = newBytecode.size();
-
-        // Patch the goto_w to point to tail.
-        patchGotoW(newBytecode, fixupIdx, gotoWInstrBCI, tailBCI);
-
-        // Emit prologue.
-        emitCallbackPrologue(newBytecode);
-
-        // Record where rescued bytes will start in newBytecode (= after prologue).
-        size_t rescuedStartBCI = newBytecode.size();
-
-        // Emit rescued bytes, fixing up relative-jump offsets so they target the same
-        // original BCI they used to. A jump at original BCI (x + off) with relative
-        // offset R targets (x + off + R). After moving to (rescuedStartBCI + off), the
-        // new relative offset must be (x + off + R) - (rescuedStartBCI + off) = x + R - rescuedStartBCI.
-        // We patch the offset in-place before pushing.
-        int32_t shift = (int32_t)x - (int32_t)rescuedStartBCI;
-        for (size_t off = 0; off < rescued.size();) {
-            uint8_t op = rescued[off];
-            int rlen = bcLengths[op];
-            if (rlen <= 0) rlen = 1;
-
-            // 2-byte signed offset branches: ifeq..if_acmpne (0x99..0xA6), goto (0xA7), ifnull (0xC6), ifnonnull (0xC7)
-            bool is2ByteBranch = (op >= 0x99 && op <= 0xA7) || op == 0xC6 || op == 0xC7;
-            // 4-byte signed offset branches: goto_w (0xC8), jsr_w (0xC9 — already rejected above)
-            bool is4ByteBranch = (op == 0xC8);
-
-            if (is2ByteBranch && off + 2 < rescued.size()) {
-                int16_t origRel = (int16_t)(((uint16_t)rescued[off + 1] << 8) | rescued[off + 2]);
-                int32_t newRel = (int32_t)origRel + shift;
-                // If the new offset overflows int16, we'd need to widen to goto_w.
-                // For now, fail explicitly — rescued zones are tiny so this is rare.
-                if (newRel > 32767 || newRel < -32768) {
-                    setError("rescue_branch_offset_overflow_int16");
-                    return false;
-                }
-                rescued[off + 1] = (uint8_t)((uint16_t)newRel >> 8);
-                rescued[off + 2] = (uint8_t)((uint16_t)newRel & 0xFF);
-            } else if (is4ByteBranch && off + 4 < rescued.size()) {
-                int32_t origRel = (int32_t)(((uint32_t)rescued[off + 1] << 24) |
-                                            ((uint32_t)rescued[off + 2] << 16) |
-                                            ((uint32_t)rescued[off + 3] << 8) |
-                                            ((uint32_t)rescued[off + 4]));
-                int32_t newRel = origRel + shift;
-                rescued[off + 1] = (uint8_t)((uint32_t)newRel >> 24);
-                rescued[off + 2] = (uint8_t)((uint32_t)newRel >> 16);
-                rescued[off + 3] = (uint8_t)((uint32_t)newRel >> 8);
-                rescued[off + 4] = (uint8_t)((uint32_t)newRel & 0xFF);
-            }
-
-            off += (size_t)rlen;
-        }
-
-        newBytecode.insert(newBytecode.end(), rescued.begin(), rescued.end());
-
-        if (tailReturnOp != 0) {
-            /* RETURN variant: tail ends with the return opcode, no jump back. */
-            newBytecode.push_back(tailReturnOp);
-        } else if (k < origBytecode.size()) {
-            /*
-             * Jump back to BCI K (the original instruction past the coverage zone).
-             * BCI K in newBytecode is the same offset as in origBytecode because
-             * BCI 0..K-1 was copied verbatim before the tail.
-             */
-            size_t gotoBackInstrBCI = newBytecode.size();
-            size_t fixupBack = emitGotoW(newBytecode, 0);
-            patchGotoW(newBytecode, fixupBack, gotoBackInstrBCI, k);
-        } else {
-            /*
-             * k == origBytecode.size(): the coverage zone consumed the entire
-             * original method (e.g. a 2-byte `iconst_X; ireturn` getter where
-             * findCoverageEnd hit the end before reaching x+5). The rescued bytes
-             * we just emitted include the original return/athrow, so control flow
-             * ends within the tail.
-             *
-             * A jump back to BCI K here would target the inside of the front
-             * goto_w's operand (BCI 2..4 of `C8 00 00 00 nn`). At runtime the
-             * branch is unreachable, but C1's basic-block scan registers every
-             * goto_w target as a BB entry, so it would form a phantom BB starting
-             * mid-operand and merge an inconsistent stack with the prologue's
-             * join point — leading to a NULL dereference during type inference.
-             */
-            FVM_LOG("trampoline: skipping back-jump (k=%zu == origBytecode.size()=%zu, "
-                    "rescued contains original return)",
-                    k, origBytecode.size());
-        }
-
-        return true;
-    };
-
-    if (injectType == "HEAD") {
-        // X = 0: trampoline from the very first instruction.
-        // buildTrampoline copies the entire original body, so newBytecode is complete after this.
-        newBytecode.reserve(origBytecode.size() + 128);
-        if (!buildTrampoline(0, 0)) return 0;
-
-    } else if (injectType == "RETURN") {
-        // Single-exit trampoline: replace all return opcodes (0xAC..0xB1) with goto_w to a
-        // shared tail. The tail contains prologue + one return opcode.
-        // We scan the original bytecode, copy non-return instructions verbatim, and for the
-        // first return op we encounter we pick the opcode. All return ops get goto_w to the
-        // same tail offset (patched in a second pass).
-        newBytecode.reserve(origBytecode.size() + 128);
-
-        uint8_t returnOp = 0xB1; // default: return (void)
-        std::vector<size_t> returnFixups;  // fixupIdx list
-        std::vector<size_t> returnInstrBCIs; // instrBCI list
-
-        for (size_t i = 0; i < origBytecode.size(); ) {
-            uint8_t op = origBytecode[i];
-            if (op >= 0xAC && op <= 0xB1) {
-                returnOp = op;
-                // Emit goto_w placeholder at this BCI.
-                size_t instrBCI = newBytecode.size();
-                size_t fixupIdx = emitGotoW(newBytecode, 0);
-                returnFixups.push_back(fixupIdx);
-                returnInstrBCIs.push_back(instrBCI);
-                // Fill remaining bytes of the coverage window with nop.
-                // A return opcode is 1 byte; goto_w is 5 bytes; need 4 nops.
-                // But we must also respect instruction boundaries: find K for this return.
-                size_t k = findCoverageEnd(i);
-                for (size_t b = i + 5; b < k; b++) newBytecode.push_back(0x00);
-                i = k;
-            } else {
-                int len = getInsnLength(i);
-                if (len <= 0) len = 1;
-                for (int j = 0; j < len; j++) newBytecode.push_back(origBytecode[i + j]);
-                i += (size_t)len;
-            }
-        }
-
-        // Append shared tail: prologue + return opcode.
-        size_t tailBCI = newBytecode.size();
-        emitCallbackPrologue(newBytecode);
-        newBytecode.push_back(returnOp);
-
-        // Patch all goto_w instructions to point to tailBCI.
-        for (size_t r = 0; r < returnFixups.size(); r++) {
-            patchGotoW(newBytecode, returnFixups[r], returnInstrBCIs[r], tailBCI);
-        }
-
-        FVM_LOG("RETURN trampoline: %zu return point(s) → shared tail at BCI %zu",
-                returnFixups.size(), tailBCI);
-
-    } else if (injectType == "INVOKE") {
-        newBytecode.reserve(origBytecode.size() + 128);
-        bool found = false;
-        for (size_t i = 0; i < origBytecode.size(); ) {
-            uint8_t op = origBytecode[i];
-            int len = getInsnLength(i);
-            if (len <= 0) len = 1;
-
-            // invokevirtual=0xB6, invokespecial=0xB7, invokestatic=0xB8, invokeinterface=0xB9
-            if (!found && op >= 0xB6 && op <= 0xB9) {
-                std::string mName = resolveInvokeMethodName(i);
-                if (mName == injectTargetName) {
-                    FVM_LOG("INVOKE trampoline: found %s at BCI %zu", mName.c_str(), i);
-                    // Copy BCI 0..i-1 (already in newBytecode from loop), then trampoline from i.
-                    if (!buildTrampoline(i, 0)) return 0;
-                    found = true;
-                    break; // buildTrampoline already copied BCI i..N and appended tail
-                }
-            }
-
-            for (int j = 0; j < len; j++) newBytecode.push_back(origBytecode[i + j]);
-            i += (size_t)len;
-        }
-        if (!found) { setError("invoke_target_not_found:" + injectTargetName); return 0; }
-
-    } else if (injectType == "FIELD_GET") {
-        newBytecode.reserve(origBytecode.size() + 128);
-        bool found = false;
-        for (size_t i = 0; i < origBytecode.size(); ) {
-            uint8_t op = origBytecode[i];
-            int len = getInsnLength(i);
-            if (len <= 0) len = 1;
-
-            // getfield=0xB4, getstatic=0xB2
-            if (!found && (op == 0xB4 || op == 0xB2)) {
-                std::string fName = resolveFieldName(i);
-                if (fName == injectTargetName) {
-                    FVM_LOG("FIELD_GET trampoline: found %s at BCI %zu", fName.c_str(), i);
-                    if (!buildTrampoline(i, 0)) return 0;
-                    found = true;
-                    break;
-                }
-            }
-
-            for (int j = 0; j < len; j++) newBytecode.push_back(origBytecode[i + j]);
-            i += (size_t)len;
-        }
-        if (!found) { setError("field_get_target_not_found:" + injectTargetName); return 0; }
-
-    } else if (injectType == "FIELD_PUT") {
-        newBytecode.reserve(origBytecode.size() + 128);
-        bool found = false;
-        for (size_t i = 0; i < origBytecode.size(); ) {
-            uint8_t op = origBytecode[i];
-            int len = getInsnLength(i);
-            if (len <= 0) len = 1;
-
-            // putfield=0xB5, putstatic=0xB3
-            if (!found && (op == 0xB5 || op == 0xB3)) {
-                std::string fName = resolveFieldName(i);
-                if (fName == injectTargetName) {
-                    FVM_LOG("FIELD_PUT trampoline: found %s at BCI %zu", fName.c_str(), i);
-                    if (!buildTrampoline(i, 0)) return 0;
-                    found = true;
-                    break;
-                }
-            }
-
-            for (int j = 0; j < len; j++) newBytecode.push_back(origBytecode[i + j]);
-            i += (size_t)len;
-        }
-        if (!found) { setError("field_put_target_not_found:" + injectTargetName); return 0; }
-
-    } else if (injectType == "NEW") {
-        std::string internalTarget = injectTargetName;
-        for (char& c : internalTarget) { if (c == '.') c = '/'; }
-
-        newBytecode.reserve(origBytecode.size() + 128);
-        bool found = false;
-        for (size_t i = 0; i < origBytecode.size(); ) {
-            uint8_t op = origBytecode[i];
-            int len = getInsnLength(i);
-            if (len <= 0) len = 1;
-
-            // new=0xBB
-            if (!found && op == 0xBB) {
-                std::string cName = resolveNewClassName(i);
-                if (cName == internalTarget) {
-                    FVM_LOG("NEW trampoline: found %s at BCI %zu", cName.c_str(), i);
-                    if (!buildTrampoline(i, 0)) return 0;
-                    found = true;
-                    break;
-                }
-            }
-
-            for (int j = 0; j < len; j++) newBytecode.push_back(origBytecode[i + j]);
-            i += (size_t)len;
-        }
-        if (!found) { setError("new_target_not_found:" + internalTarget); return 0; }
-
-    } else {
-        setError("unknown_inject_point:" + injectAtStr);
-        return 0;
-    }
-
-    FVM_LOG("new bytecode built: %zu bytes (orig %u, delta +%zu)",
-            newBytecode.size(), codeSize, newBytecode.size() - codeSize);
-
-
-    // 13. Build new ConstMethod with updated bytecode
-    // Read entire original ConstMethod
-    int64_t constMethodTypeSize = typeSize("ConstMethod");
-    if (constMethodTypeSize < 0) {
-        setError("cannot_determine_ConstMethod_size");
-        return 0;
-    }
-
-    size_t origTotalConstMethodSize = (size_t)constMethodTypeSize + codeSize;
-    // There may be additional data after bytecode (exception table, etc.)
-    // Read _constMethod_size if available, otherwise estimate
-    int64_t cmSizeOff = structOffset("ConstMethod", "_constMethod_size");
-    if (cmSizeOff >= 0) {
-        int32_t cmFullSize = 0;
-        readRemoteI32(proc, origConstMethodAddr + (uint64_t)cmSizeOff, &cmFullSize);
-        if (cmFullSize > 0) {
-            // _constMethod_size is in words (8 bytes each)
-            origTotalConstMethodSize = (size_t)cmFullSize * 8;
-        }
-    }
-
-    // New ConstMethod total size: header + new bytecode + any trailing data
-    size_t trailingDataSize = 0;
-    if (origTotalConstMethodSize > (size_t)constMethodTypeSize + codeSize) {
-        trailingDataSize = origTotalConstMethodSize - (size_t)constMethodTypeSize - codeSize;
-    }
-    size_t newConstMethodSize = (size_t)constMethodTypeSize + newBytecode.size() + trailingDataSize;
-    // Align to 8
-    newConstMethodSize = (newConstMethodSize + 7) & ~7;
-
-    // Read original ConstMethod fully
-    std::vector<uint8_t> origConstMethodBytes(origTotalConstMethodSize);
-    if (!readRemoteMem(proc, origConstMethodAddr, origConstMethodBytes.data(), origTotalConstMethodSize)) {
-        setError("cannot_read_full_constmethod");
-        return 0;
-    }
-
-    /*
-     * Build the new ConstMethod.
-     *
-     * HotSpot lays a ConstMethod out as
-     *     [header | bytecode | (alignment padding) | trailing tables]
-     * with the whole block aligned up to 8 bytes. The trailing tables
-     * (StackMapTable, exception_table, method_parameters, checked_exceptions,
-     * generic_signature_index, annotation array slots, ...) are addressed
-     * BACKWARDS from constMethod_end (e.g. last_u2_element() = end - 2*(N+1)),
-     * so they must sit flush against the end. Placing the copied block right
-     * after the bytecode would push it forward by the alignment padding, and
-     * HotSpot would then read zero bytes as length/index fields and chase
-     * NULL Symbol or Method pointers during reflection.
-     */
-    std::vector<uint8_t> newConstMethodBytes(newConstMethodSize, 0);
-    memcpy(newConstMethodBytes.data(), origConstMethodBytes.data(), (size_t)constMethodTypeSize);
-    memcpy(newConstMethodBytes.data() + constMethodTypeSize, newBytecode.data(), newBytecode.size());
-    if (trailingDataSize > 0) {
-        size_t trailingStart = newConstMethodSize - trailingDataSize;
-        memcpy(newConstMethodBytes.data() + trailingStart,
-               origConstMethodBytes.data() + constMethodTypeSize + codeSize,
-               trailingDataSize);
-        FVM_LOG("ConstMethod trailing data placed at offset %zu (align padding %zu bytes)",
-                trailingStart,
-                trailingStart - (constMethodTypeSize + newBytecode.size()));
-    }
-
-    // Update _code_size in new ConstMethod
-    int64_t codeSizeOff = structOffset("ConstMethod", "_code_size");
-    if (codeSizeOff >= 0) {
-        uint16_t newCodeSize = (uint16_t)newBytecode.size();
-        memcpy(newConstMethodBytes.data() + codeSizeOff, &newCodeSize, 2);
-    }
-
-    // Update _max_stack: our prologue needs stack slots for FvmCallback + args array construction.
-    // Without args: peak 4 (cbU, cbU, inst, null → init consumed).
-    // With args:    peak 7 during aastore (cbU, cbU, inst, arr, arr, idx, val).
-    int64_t maxStackOff = structOffset("ConstMethod", "_max_stack");
-    if (maxStackOff >= 0) {
-        uint16_t origMaxStack = 0;
-        memcpy(&origMaxStack, newConstMethodBytes.data() + maxStackOff, 2);
-        uint16_t needed = (hasArgCapture && !targetParams.empty()) ? 7 : 4;
-        if (origMaxStack < needed) {
-            FVM_LOG("max_stack: %u -> %u (bumped)", origMaxStack, needed);
-            memcpy(newConstMethodBytes.data() + maxStackOff, &needed, 2);
-        } else {
-            FVM_LOG("max_stack: %u (unchanged)", origMaxStack);
-        }
-    }
-
-    // Update _constMethod_size if present
-    if (cmSizeOff >= 0) {
-        int32_t newCmWords = (int32_t)((newConstMethodSize + 7) / 8);
-        memcpy(newConstMethodBytes.data() + cmSizeOff, &newCmWords, 4);
-    }
-
-    // 14. Allocate and write new ConstantPool + Cache + ConstMethod in target process
-    FVM_LOG("ConstMethod sizes: origTotal=%zu, newTotal=%zu (hdr=%lld, bc=%zu, trailing=%zu)",
-            origTotalConstMethodSize, newConstMethodSize,
-            (long long)constMethodTypeSize, newBytecode.size(), trailingDataSize);
-
-    uint64_t newPoolAddr = (uint64_t)VirtualAllocEx(proc, NULL, newPoolByteSize,
-                                                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (newPoolAddr == 0) {
-        setError("VirtualAllocEx_failed_for_constpool");
-        return 0;
-    }
-
-    uint64_t newConstMethodAlloc = (uint64_t)VirtualAllocEx(proc, NULL, newConstMethodSize,
-                                                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (newConstMethodAlloc == 0) {
-        VirtualFreeEx(proc, (LPVOID)newPoolAddr, 0, MEM_RELEASE);
-        setError("VirtualAllocEx_failed_for_constmethod");
-        return 0;
-    }
-    FVM_LOG("allocated in target: newPool=0x%llX (%zu bytes), newConstMethod=0x%llX (%zu bytes)",
-            (unsigned long long)newPoolAddr, newPoolByteSize,
-            (unsigned long long)newConstMethodAlloc, newConstMethodSize);
-
-    // Update _constants pointer in new ConstMethod to point to new pool
-    if (cmConstsOff >= 0) {
-        memcpy(newConstMethodBytes.data() + cmConstsOff, &newPoolAddr, 8);
-    }
-
-    // ConstantPoolCache write is DEFERRED to after suspendTargetThreads. The prefix
-    // [0, origCacheSize) must be snapshotted from origCache while threads are frozen
-    // to avoid torn reads of in-flight lazy-resolve writes (which manifested as
-    // corrupt receiver oops at invokeinterface, e.g. hs_err_pid64432.log).
-    // See "snapshot CPCache (post-suspend)" block below.
-
-    // Write new ConstantPool
-    if (!writeRemoteMem(proc, newPoolAddr, newPoolBytes.data(), newPoolByteSize)) {
-        setError("write_new_constpool_failed");
-        VirtualFreeEx(proc, (LPVOID)newPoolAddr, 0, MEM_RELEASE);
-        VirtualFreeEx(proc, (LPVOID)newConstMethodAlloc, 0, MEM_RELEASE);
-        return 0;
-    }
-
-    // Write new ConstMethod
-    if (!writeRemoteMem(proc, newConstMethodAlloc, newConstMethodBytes.data(), newConstMethodSize)) {
-        setError("write_new_constmethod_failed");
-        VirtualFreeEx(proc, (LPVOID)newPoolAddr, 0, MEM_RELEASE);
-        VirtualFreeEx(proc, (LPVOID)newConstMethodAlloc, 0, MEM_RELEASE);
-        return 0;
-    }
-
-    // §17.5 Phase A: read all class methods for the per-class CM._constants sweep.
-    std::vector<uint64_t> allClassMethods;
-    if (klassAddr != 0) {
-        int64_t methodsOff = structOffset("InstanceKlass", "_methods");
-        if (methodsOff >= 0) {
-            uint64_t mArr = 0;
-            readRemotePointer(proc, klassAddr + (uint64_t)methodsOff, &mArr);
-            if (mArr != 0) {
-                int64_t arrLenOff = structOffset("Array<int>", "_length");
-                if (arrLenOff < 0) arrLenOff = 0;
-                int64_t arrDataOff = structOffset("Array<int>", "_data");
-                if (arrDataOff < 0) arrDataOff = arrLenOff + 4;
-                if (arrDataOff < 8) arrDataOff = 8;
-                int32_t mc = 0;
-                readRemoteI32(proc, mArr + (uint64_t)arrLenOff, &mc);
-                if (mc > 0 && mc < 10000) {
-                    allClassMethods.resize(mc);
-                    readRemoteMem(proc, mArr + (uint64_t)arrDataOff, allClassMethods.data(), mc * 8);
-                }
-            }
-        }
-    }
-    FVM_LOG("allClassMethods: %zu method(s) in class", allClassMethods.size());
-
-    // 12. Suspend all threads, swap pointers, clear JIT code, resume
-    FVM_LOG("suspending target threads (pid=%lu)...", (unsigned long)g_target.pid);
-    std::vector<DWORD> threadIds;
-    suspendTargetThreads(g_target.pid, threadIds);
-    FVM_LOG("suspended %zu threads", threadIds.size());
-
-    // Snapshot CPCache (post-suspend) — race-free copy of origCache prefix into
-    // newCacheBytes, then write the assembled cache to remote. The pre-resolved
-    // tail entries (1277-1280) were already filled into newCacheBytes earlier;
-    // memcpy of prefix [0, origCacheSize) does NOT overwrite them.
-    if (newCacheAddr != 0 && !newCacheBytes.empty() && origCacheAddr != 0) {
-        std::vector<uint8_t> origCacheBytes(origCacheSize);
-        if (!readRemoteMem(proc, origCacheAddr, origCacheBytes.data(), origCacheSize)) {
-            FVM_LOG("ERROR: post-suspend readRemoteMem(origCache) failed");
-            resumeTargetThreads(threadIds);
-            setError("read_orig_cache_failed");
-            VirtualFreeEx(proc, (LPVOID)newPoolAddr, 0, MEM_RELEASE);
-            VirtualFreeEx(proc, (LPVOID)newConstMethodAlloc, 0, MEM_RELEASE);
-            VirtualFreeEx(proc, (LPVOID)newCacheAddr, 0, MEM_RELEASE);
-            return 0;
-        }
-        memcpy(newCacheBytes.data(), origCacheBytes.data(), origCacheSize);
-
-        // Best-effort hardening for torn CPCache snapshots: if we freeze the JVM
-        // after HotSpot has published bytecode bits in _indices but before the
-        // rest of the entry reaches a self-consistent resolved state, blindly
-        // copying that prefix would preserve the partial entry forever in our new
-        // cache. Clearing only the resolved bytecode bits is safe: HotSpot treats
-        // a zeroed bytecode marker as "unresolved" and will lazily re-resolve the
-        // entry on next use while keeping the original cp_index intact.
-        {
-            int64_t indicesFieldOff = structOffset("ConstantPoolCacheEntry", "_indices");
-            if (indicesFieldOff < 0) indicesFieldOff = 0;
-            int64_t f1FieldOff = structOffset("ConstantPoolCacheEntry", "_f1");
-            if (f1FieldOff < 0) f1FieldOff = 8;
-            int64_t f2FieldOff = structOffset("ConstantPoolCacheEntry", "_f2");
-            if (f2FieldOff < 0) f2FieldOff = 16;
-            int64_t flagsFieldOff = structOffset("ConstantPoolCacheEntry", "_flags");
-            if (flagsFieldOff < 0) flagsFieldOff = 24;
-
-            bool scanableLayout = cacheEntrySize >= 32
-                && indicesFieldOff >= 0 && f1FieldOff >= 0 && f2FieldOff >= 0 && flagsFieldOff >= 0
-                && (indicesFieldOff + 8) <= cacheEntrySize
-                && (f1FieldOff + 8) <= cacheEntrySize
-                && (f2FieldOff + 8) <= cacheEntrySize
-                && (flagsFieldOff + 8) <= cacheEntrySize;
-
-            size_t partialResolvedCount = 0;
-            size_t invokeEntryCount = 0;
-            size_t invokevirtualEntryCount = 0;
-            size_t suspiciousInvokeCount = 0;
-            size_t suppressedSuspiciousLogs = 0;
-            if (!scanableLayout) {
-                FVM_LOG("WARN: CPCache prefix scan skipped (entrySize=%lld indices=%lld f1=%lld f2=%lld flags=%lld)",
-                        (long long)cacheEntrySize,
-                        (long long)indicesFieldOff,
-                        (long long)f1FieldOff,
-                        (long long)f2FieldOff,
-                        (long long)flagsFieldOff);
-            } else {
-                const uint64_t cpIndexMask = 0xFFFFULL;
-                const uint64_t parameterSizeMask = 0xFFULL;
-                const uint64_t isFieldEntryMask = 1ULL << 26;
-                const uint64_t hasLocalSignatureMask = 1ULL << 25;
-                const uint64_t hasAppendixMask = 1ULL << 24;
-                const uint64_t isForcedVirtualMask = 1ULL << 23;
-                const uint64_t isFinalMask = 1ULL << 22;
-                const uint64_t isVolatileMask = 1ULL << 21;
-                const uint64_t isVfinalMask = 1ULL << 20;
-                const uint8_t bcInvokevirtual = 0xB6;
-                const uint8_t bcInvokespecial = 0xB7;
-                const uint8_t bcInvokestatic = 0xB8;
-                const uint8_t bcInvokeinterface = 0xB9;
-                const size_t suspiciousLogLimit = 24;
-
-                auto isInvokeBytecode = [&](unsigned int bc) -> bool {
-                    return bc == bcInvokevirtual
-                        || bc == bcInvokespecial
-                        || bc == bcInvokestatic
-                        || bc == bcInvokeinterface;
-                };
-
-                auto bytecodeName = [&](unsigned int bc) -> const char* {
-                    switch (bc) {
-                        case 0x00: return "-";
-                        case 0xB6: return "invokevirtual";
-                        case 0xB7: return "invokespecial";
-                        case 0xB8: return "invokestatic";
-                        case 0xB9: return "invokeinterface";
-                        default:   return "other";
-                    }
-                };
-
-                auto appendReason = [&](std::string& reasons, const char* reason) {
-                    if (!reasons.empty()) reasons += ",";
-                    reasons += reason;
-                };
-
-                for (int i = 0; i < origCacheLen; i++) {
-                    size_t entryOff = (size_t)cacheHdrSize + (size_t)i * (size_t)cacheEntrySize;
-                    if (entryOff + (size_t)cacheEntrySize > newCacheBytes.size()) break;
-                    uint8_t* entry = newCacheBytes.data() + entryOff;
-
-                    uint64_t rawIndices = 0;
-                    uint64_t rawFlags = 0;
-                    memcpy(&rawIndices, entry + indicesFieldOff, 8);
-                    memcpy(&rawFlags, entry + flagsFieldOff, 8);
-
-                    unsigned int bc1 = (unsigned int)((rawIndices >> 16) & 0xFFULL);
-                    unsigned int bc2 = (unsigned int)((rawIndices >> 24) & 0xFFULL);
-                    bool hasResolvedBytecode = (bc1 != 0 || bc2 != 0);
-                    bool anyInvoke = isInvokeBytecode(bc1) || isInvokeBytecode(bc2);
-                    if (anyInvoke) invokeEntryCount++;
-                    if (bc2 == bcInvokevirtual) invokevirtualEntryCount++;
-
-                    uint64_t rawF1 = 0;
-                    uint64_t rawF2 = 0;
-                    memcpy(&rawF1, entry + f1FieldOff, 8);
-                    memcpy(&rawF2, entry + f2FieldOff, 8);
-
-                    if (hasResolvedBytecode && rawFlags == 0) {
-                        uint64_t sanitizedIndices = rawIndices & cpIndexMask;
-                        memcpy(entry + indicesFieldOff, &sanitizedIndices, 8);
-                        partialResolvedCount++;
-
-                        FVM_LOG("CPCache partial entry scrubbed: cache[%d] cpIdx=%llu b1=0x%02X b2=0x%02X f1=0x%llX f2=0x%llX flags=0x%llX -> indices=0x%llX",
-                                i,
-                                (unsigned long long)(rawIndices & cpIndexMask),
-                                bc1,
-                                bc2,
-                                (unsigned long long)rawF1,
-                                (unsigned long long)rawF2,
-                                (unsigned long long)rawFlags,
-                                (unsigned long long)sanitizedIndices);
-                    }
-
-                    if (anyInvoke) {
-                        unsigned int paramSize = (unsigned int)(rawFlags & parameterSizeMask);
-                        unsigned int tosState = (unsigned int)((rawFlags >> 28) & 0xFULL);
-                        bool isFieldEntry = (rawFlags & isFieldEntryMask) != 0;
-                        bool hasLocalSignature = (rawFlags & hasLocalSignatureMask) != 0;
-                        bool hasAppendix = (rawFlags & hasAppendixMask) != 0;
-                        bool isForcedVirtual = (rawFlags & isForcedVirtualMask) != 0;
-                        bool isFinal = (rawFlags & isFinalMask) != 0;
-                        bool isVolatile = (rawFlags & isVolatileMask) != 0;
-                        bool isVfinal = (rawFlags & isVfinalMask) != 0;
-
-                        std::string reasons;
-                        if (isFieldEntry) appendReason(reasons, "field_flag_on_invoke");
-                        if (isVolatile) appendReason(reasons, "volatile_bit_on_invoke");
-                        if (rawFlags == 0 && hasResolvedBytecode) appendReason(reasons, "resolved_bytecode_with_zero_flags");
-
-                        if (bc1 == bcInvokestatic && rawF1 == 0) {
-                            appendReason(reasons, "invokestatic_null_f1");
-                        }
-                        if (bc1 == bcInvokespecial) {
-                            if (paramSize == 0) appendReason(reasons, "invokespecial_paramsize_zero");
-                            if (rawF1 == 0) appendReason(reasons, "invokespecial_null_f1");
-                        }
-                        if (bc1 == bcInvokeinterface) {
-                            if (paramSize == 0) appendReason(reasons, "invokeinterface_paramsize_zero");
-                            if (rawF1 == 0) appendReason(reasons, "invokeinterface_null_f1");
-                            if (bc2 != bcInvokevirtual && rawF2 == 0) appendReason(reasons, "invokeinterface_zero_f2");
-                        }
-                        if (bc2 == bcInvokevirtual) {
-                            if (paramSize == 0) appendReason(reasons, "invokevirtual_paramsize_zero");
-                            if (hasAppendix) appendReason(reasons, "invokevirtual_has_appendix");
-                            if (hasLocalSignature) appendReason(reasons, "invokevirtual_has_local_signature");
-                            if (isVfinal) {
-                                if (rawF2 == 0) appendReason(reasons, "invokevirtual_vfinal_zero_f2");
-                            } else if (paramSize == 0 && rawF1 != 0) {
-                                appendReason(reasons, "invokevirtual_nonvfinal_zero_param_with_f1");
-                            }
-                        }
-
-                        if (!reasons.empty()) {
-                            suspiciousInvokeCount++;
-                            if (suspiciousInvokeCount <= suspiciousLogLimit) {
-                                FVM_LOG("CPCache suspicious invoke entry: cache[%d] cpIdx=%llu b1=0x%02X(%s) b2=0x%02X(%s) f1=0x%llX f2=0x%llX flags=0x%llX psize=%u tos=%u vfinal=%d final=%d forcedVirtual=%d appendix=%d localSig=%d reason=%s",
-                                        i,
-                                        (unsigned long long)(rawIndices & cpIndexMask),
-                                        bc1,
-                                        bytecodeName(bc1),
-                                        bc2,
-                                        bytecodeName(bc2),
-                                        (unsigned long long)rawF1,
-                                        (unsigned long long)rawF2,
-                                        (unsigned long long)rawFlags,
-                                        paramSize,
-                                        tosState,
-                                        (int)isVfinal,
-                                        (int)isFinal,
-                                        (int)isForcedVirtual,
-                                        (int)hasAppendix,
-                                        (int)hasLocalSignature,
-                                        reasons.c_str());
-                            } else {
-                                suppressedSuspiciousLogs++;
-                            }
-                        }
-                    }
-                }
-            }
-
-            FVM_LOG("CPCache prefix scan complete: partialResolved=%zu, invokeEntries=%zu, invokevirtualEntries=%zu, suspiciousInvoke=%zu, suppressedSuspiciousLogs=%zu, origLen=%d, entrySize=%lld",
-                    partialResolvedCount,
-                    invokeEntryCount,
-                    invokevirtualEntryCount,
-                    suspiciousInvokeCount,
-                    suppressedSuspiciousLogs,
-                    origCacheLen,
-                    (long long)cacheEntrySize);
-        }
-
-        // Restore fields that the prefix copy overwrote.
-        memcpy(newCacheBytes.data() + cacheLenOff, &newCacheLen, 4);
-        if (cacheCpOff >= 0) {
-            memcpy(newCacheBytes.data() + cacheCpOff, &newPoolAddr, 8);
-        }
-        if (!writeRemoteMem(proc, newCacheAddr, newCacheBytes.data(), newCacheBytes.size())) {
-            FVM_LOG("ERROR: post-suspend writeRemoteMem(newCache) failed");
-            resumeTargetThreads(threadIds);
-            setError("write_new_cache_failed");
-            VirtualFreeEx(proc, (LPVOID)newPoolAddr, 0, MEM_RELEASE);
-            VirtualFreeEx(proc, (LPVOID)newConstMethodAlloc, 0, MEM_RELEASE);
-            VirtualFreeEx(proc, (LPVOID)newCacheAddr, 0, MEM_RELEASE);
-            return 0;
-        }
-        FVM_LOG("CPCache snapshot+write done post-suspend (origCacheSize=%zu, newSize=%zu)",
-                origCacheSize, newCacheBytes.size());
-    }
-
-    // §17.5 Phase C — per-class commit (threads are suspended above).
-
-    int64_t codeOff  = structOffset("Method", "_code");
-    int64_t mdoOff   = structOffset("Method", "_method_data");
-    int64_t mctrOff  = structOffset("Method", "_method_counters");
-
-    // Step 6: Capture all class method backups on first patch (before any writes).
-    if (!hasPlan && klassAddr != 0) {
-        ClassTransformPlan& plan = g_plans[klassAddr];
-        plan.className = std::string(className);
-        plan.klassAddr = klassAddr;
-        plan.oldCPAddr = origConstPoolAddr;
-        for (uint64_t mAddr : allClassMethods) {
-            if (mAddr == 0) continue;
-            MethodCMBackup b;
-            b.methodAddr = mAddr;
-            uint64_t cm = 0;
-            readRemotePointer(proc, mAddr + (uint64_t)constMethodOff, &cm);
-            b.origConstMethodAddr = cm;
-            uint64_t csts = 0;
-            if (cm != 0) readRemotePointer(proc, cm + (uint64_t)cmConstsOff, &csts);
-            b.origConstantsPtr = csts;
-            plan.methodBackups.push_back(b);
-        }
-        FVM_LOG("Phase C: captured %zu method backups (first patch)", plan.methodBackups.size());
-    }
-
-    // Step 7a: Update all unpatched class methods' CM._constants → newPoolAddr.
-    FVM_LOG("Phase C: updating all class CM._constants -> newPool=0x%llX", (unsigned long long)newPoolAddr);
-    for (uint64_t mAddr : allClassMethods) {
-        if (mAddr == 0 || mAddr == methodAddr) continue;
-        uint64_t cm = 0;
-        if (!readRemotePointer(proc, mAddr + (uint64_t)constMethodOff, &cm) || cm == 0) continue;
-        writeRemoteMem(proc, cm + (uint64_t)cmConstsOff, &newPoolAddr, 8);
-    }
-
-    // Step 7b: Swap patched method's _constMethod → newCM, clear _code/_method_data/_method_counters.
-    FVM_LOG("Phase C: swap patched method _constMethod 0x%llX -> 0x%llX",
-            (unsigned long long)origConstMethodAddr, (unsigned long long)newConstMethodAlloc);
-    writeRemoteMem(proc, methodAddr + (uint64_t)constMethodOff, &newConstMethodAlloc, 8);
-    if (codeOff >= 0) {
-        uint64_t zero = 0;
-        writeRemoteMem(proc, methodAddr + (uint64_t)codeOff, &zero, 8);
-    }
-    clearMethodProfilingState(methodAddr, /*setDontInline=*/true, "TRANSFORM");
-
-    // Step 7c: Commit barrier — update InstanceKlass._constants → newPoolAddr.
-    if (klassAddr != 0) {
-        int64_t ikConstsOff = structOffset("InstanceKlass", "_constants");
-        if (ikConstsOff < 0) {
-            // Scan first 256 bytes of InstanceKlass for the known-previous CP address.
-            uint64_t expectedCP = hasPlan ? g_plans[klassAddr].newCPAddr : origConstPoolAddr;
-            std::vector<uint8_t> ikHdr(256, 0);
-            if (readRemoteMem(proc, klassAddr, ikHdr.data(), 256)) {
-                for (int off = 0; off + 8 <= 256; off += 8) {
-                    uint64_t v = 0; memcpy(&v, ikHdr.data() + off, 8);
-                    if (v == expectedCP) { ikConstsOff = off; break; }
-                }
-            }
-            if (ikConstsOff >= 0)
-                FVM_LOG("Phase C: found InstanceKlass._constants via scan @offset %lld", (long long)ikConstsOff);
-        }
-        if (ikConstsOff >= 0) {
-            writeRemoteMem(proc, klassAddr + (uint64_t)ikConstsOff, &newPoolAddr, 8);
-            FVM_LOG("Phase C: committed InstanceKlass._constants=0x%llX (barrier)", (unsigned long long)newPoolAddr);
-        } else {
-            FVM_LOG("WARN: cannot find InstanceKlass._constants offset, skipping barrier");
-        }
-    }
-
-    resumeTargetThreads(threadIds);
-    FVM_LOG("resumed %zu threads", threadIds.size());
-
-    // §17.5 Phase C: update plan record.
-    // (Per §17.7: no VirtualFreeEx — in-flight frames may still reference old allocations.)
-    {
-        ClassTransformPlan& plan = g_plans[klassAddr];
-        plan.newCPAddr      = newPoolAddr;
-        plan.newCPCacheAddr = newCacheAddr;
-        plan.newRKAddr      = newRKAddr;
-        PatchedMethodInfo pmi;
-        pmi.methodAddr = methodAddr;
-        pmi.newCMAddr  = newConstMethodAlloc;
-        pmi.hook = HookSpec{ std::string(hookClass), std::string(hookMethod),
-                             std::string(hookDesc), std::string(injectAt) };
-        plan.patchedMethods.push_back(pmi);
-        FVM_LOG("Plan updated: %zu patched method(s) in class %s",
-                plan.patchedMethods.size(), className);
-    }
-
-    // 14. Force deoptimization of ALL compiled methods (unless caller defers it
-    //     for batch transforms — then deopt happens once at end of batch).
-    if (deferDeopt) {
-        FVM_LOG("deferring global deoptimization sweep (batch mode)");
-    } else {
-        FVM_LOG("starting global deoptimization sweep (force JIT to pick up new bytecodes)...");
-        forceDeoptimizeAll();
-    }
-
-    // 15. Readback verification: confirm the swap is intact after deopt sweep
-    {
-        uint64_t readbackCM = 0;
-        if (readRemotePointer(proc, methodAddr + (uint64_t)constMethodOff, &readbackCM)) {
-            if (readbackCM == newConstMethodAlloc) {
-                FVM_LOG("VERIFY: Method::_constMethod = 0x%llX (OK, matches new)",
-                        (unsigned long long)readbackCM);
-            } else {
-                FVM_LOG("VERIFY FAIL: Method::_constMethod = 0x%llX, expected 0x%llX",
-                        (unsigned long long)readbackCM, (unsigned long long)newConstMethodAlloc);
-            }
-        }
-        // Read first 8 bytes of bytecodes from new ConstMethod
-        uint8_t bcCheck[8] = {0};
-        if (readRemoteMem(proc, newConstMethodAlloc + (uint64_t)constMethodTypeSize, bcCheck, 8)) {
-            FVM_LOG("VERIFY bytecodes at ConstMethod+%lld: %02X %02X %02X %02X %02X %02X %02X %02X (expect BB 13 A6 59 2A B7 ...)",
-                    (long long)constMethodTypeSize,
-                    bcCheck[0], bcCheck[1], bcCheck[2], bcCheck[3],
-                    bcCheck[4], bcCheck[5], bcCheck[6], bcCheck[7]);
-        }
-        // Read _constants pointer from new ConstMethod
-        int64_t cmcOff = structOffset("ConstMethod", "_constants");
-        if (cmcOff >= 0) {
-            uint64_t readbackCP = 0;
-            if (readRemotePointer(proc, newConstMethodAlloc + (uint64_t)cmcOff, &readbackCP)) {
-                FVM_LOG("VERIFY: ConstMethod::_constants = 0x%llX (expected newPool=0x%llX) %s",
-                        (unsigned long long)readbackCP, (unsigned long long)newPoolAddr,
-                        readbackCP == newPoolAddr ? "OK" : "MISMATCH!");
-            }
-        }
-    }
-
-    FVM_LOG("=== TRANSFORM SUCCESS: %s ===", key.c_str());
-    setError("ok");
-    return 1;
-}
-
-// ============================================================
-// Restore original method
-// ============================================================
-
-int restoreTransform(const char* className, const char* methodName, const char* paramDesc) {
-    HANDLE proc = g_target.handle;
-
-    FVM_LOG("=== RESTORE BEGIN: %s.%s(%s) ===", className, methodName, paramDesc);
-
-    // Resolve klassAddr from class name.
-    std::string clsInternal = std::string(className);
-    for (char& c : clsInternal) { if (c == '.') c = '/'; }
-    uint64_t klassAddr = 0;
-    if (!findInstanceKlassByName(clsInternal, &klassAddr) || klassAddr == 0) {
-        setError("restore_class_not_found:" + clsInternal);
-        return 0;
-    }
-
-    auto it = g_plans.find(klassAddr);
-    if (it == g_plans.end()) {
-        setError("not_transformed:" + clsInternal);
-        return 0;
-    }
-
-    ClassTransformPlan& plan = it->second;
-    FVM_LOG("RESTORE: plan has %zu patched method(s), %zu total backups",
-            plan.patchedMethods.size(), plan.methodBackups.size());
-
-    int64_t constMethodOff = structOffset("Method", "_constMethod");
-    if (constMethodOff < 0) constMethodOff = 8;
-    int64_t cmConstsOff = structOffset("ConstMethod", "_constants");
-    if (cmConstsOff < 0) cmConstsOff = 8;
-    int64_t codeOff  = structOffset("Method", "_code");
-    int64_t mdoOff   = structOffset("Method", "_method_data");
-    int64_t mctrOff  = structOffset("Method", "_method_counters");
-
-    // Suspend threads.
-    std::vector<DWORD> threadIds;
-    suspendTargetThreads(g_target.pid, threadIds);
-    FVM_LOG("suspended %zu threads for restore", threadIds.size());
-
-    // §17.7 Unload: restore in reverse commit order.
-
-    // Step 1: Commit barrier — restore InstanceKlass._constants → plan.oldCPAddr.
-    {
-        int64_t ikConstsOff = structOffset("InstanceKlass", "_constants");
-        if (ikConstsOff < 0) {
-            // Scan first 256 bytes of InstanceKlass for the last-committed newCPAddr.
-            std::vector<uint8_t> ikHdr(256, 0);
-            if (readRemoteMem(proc, klassAddr, ikHdr.data(), 256)) {
-                for (int off = 0; off + 8 <= 256; off += 8) {
-                    uint64_t v = 0; memcpy(&v, ikHdr.data() + off, 8);
-                    if (v == plan.newCPAddr) { ikConstsOff = off; break; }
-                }
-            }
-            if (ikConstsOff >= 0)
-                FVM_LOG("RESTORE: found InstanceKlass._constants via scan @offset %lld", (long long)ikConstsOff);
-        }
-        if (ikConstsOff >= 0) {
-            writeRemoteMem(proc, klassAddr + (uint64_t)ikConstsOff, &plan.oldCPAddr, 8);
-            FVM_LOG("RESTORE: InstanceKlass._constants -> oldCP=0x%llX (barrier)", (unsigned long long)plan.oldCPAddr);
-        } else {
-            FVM_LOG("WARN: cannot find InstanceKlass._constants offset, skipping barrier");
-        }
-    }
-
-    // Step 2: Restore all class methods from backups.
-    for (const MethodCMBackup& b : plan.methodBackups) {
-        if (b.methodAddr == 0) continue;
-        // Restore _constMethod pointer.
-        if (b.origConstMethodAddr != 0) {
-            writeRemoteMem(proc, b.methodAddr + (uint64_t)constMethodOff, &b.origConstMethodAddr, 8);
-        }
-        // Restore CM._constants pointer in the original ConstMethod.
-        if (b.origConstMethodAddr != 0 && b.origConstantsPtr != 0) {
-            writeRemoteMem(proc, b.origConstMethodAddr + (uint64_t)cmConstsOff, &b.origConstantsPtr, 8);
-        }
-    }
-    FVM_LOG("RESTORE: wrote back %zu method backups", plan.methodBackups.size());
-
-    // Step 3: For each patched method, additionally clear _code/_method_data/_method_counters.
-    for (const PatchedMethodInfo& pmi : plan.patchedMethods) {
-        if (pmi.methodAddr == 0) continue;
-        if (codeOff >= 0) {
-            uint64_t zero = 0;
-            writeRemoteMem(proc, pmi.methodAddr + (uint64_t)codeOff, &zero, 8);
-        }
-        if (mdoOff >= 0) {
-            uint64_t zero = 0;
-            writeRemoteMem(proc, pmi.methodAddr + (uint64_t)mdoOff, &zero, 8);
-        }
-        if (mctrOff >= 0) {
-            uint64_t zero = 0;
-            writeRemoteMem(proc, pmi.methodAddr + (uint64_t)mctrOff, &zero, 8);
-        }
-        clearMethodProfilingState(pmi.methodAddr, /*setDontInline=*/false, "RESTORE");
-        /* Clear NOT_C1/C2_COMPILABLE so the restored original method is JIT-eligible again */
-        {
-            int64_t afOff2 = structOffset("Method", "_access_flags");
-            if (afOff2 >= 0) {
-                uint32_t af = 0;
-                if (readRemoteU32(proc, pmi.methodAddr + (uint64_t)afOff2, &af)) {
-                    uint32_t newAF = af & ~(0x80000u | 0x100000u | 0x200000u);
-                    if (newAF != af) writeRemoteMem(proc, pmi.methodAddr + (uint64_t)afOff2, &newAF, 4);
-                }
-            }
-        }
-        FVM_LOG("RESTORE: cleared JIT state for patched method 0x%llX", (unsigned long long)pmi.methodAddr);
-    }
-
-    resumeTargetThreads(threadIds);
-    FVM_LOG("resumed %zu threads", threadIds.size());
-
-    // §17.7: Do NOT VirtualFreeEx — in-flight frames may still reference new allocations.
-    // Process exit will reclaim them.
-
-    g_plans.erase(it);
-
-    FVM_LOG("starting global deoptimization sweep (restore)...");
-    forceDeoptimizeAll();
-
-    FVM_LOG("=== RESTORE SUCCESS: %s.%s(%s) ===", className, methodName, paramDesc);
-    setError("ok");
-    return 1;
-}
-
-// ============================================================
 // Exported DLL functions
 // ============================================================
 
-// ============================================================
-// Purge Agent — disable a loaded Java agent entirely
-//
-// 1. Find agent Klass, locate its static Instrumentation field
-// 2. Read the InstrumentationImpl OOP
-// 3. Null the mTransformerManager field (stops future transforms)
-// 4. Null the agent's static instrumentation field
-// 5. Overwrite agentmain/premain bytecode with bare return (0xB1)
-// ============================================================
-
-static bool nullifyStaticField(uint64_t klassAddr, const std::string& fieldName) {
-    HANDLE proc = g_target.handle;
-
-    ResolvedField rf = {};
-    // Try common descriptor for object references
-    if (!resolveFieldInKlass(klassAddr, fieldName, "", &rf)) {
-        return false;
-    }
-    if (!rf.isStatic || rf.staticAddress == 0) {
-        setError("field_not_static:" + fieldName);
-        return false;
-    }
-
-    // Write null (zero) to the static field
-    uint64_t zero = 0;
-    size_t writeSize = g_target.useCompressedOops ? 4 : 8;
-    if (!writeRemoteMem(proc, rf.staticAddress, &zero, writeSize)) {
-        setError("write_null_failed:" + fieldName);
-        return false;
-    }
-    FVM_LOG("purge_agent: nullified static field '%s' at 0x%llX", fieldName.c_str(), rf.staticAddress);
-    return true;
-}
-
-static bool readStaticOop(uint64_t klassAddr, const std::string& fieldName, uint64_t* outOop) {
-    HANDLE proc = g_target.handle;
-
-    ResolvedField rf = {};
-    if (!resolveFieldInKlass(klassAddr, fieldName, "", &rf)) {
-        return false;
-    }
-    if (!rf.isStatic || rf.staticAddress == 0) {
-        setError("field_not_static:" + fieldName);
-        return false;
-    }
-
-    *outOop = readOop(proc, rf.staticAddress, g_target.useCompressedOops);
-    return (*outOop != 0);
-}
+/* ============================================================
+ * Purge Agent — disable a loaded Java agent entirely.
+ *
+ * Strategy:
+ *   1. Enumerate ClassLoaderDataGraph; an "agent main class" is any
+ *      InstanceKlass with a static field whose declared type is
+ *      sun/instrument/InstrumentationImpl or java/lang/instrument/Instrumentation.
+ *   2. For each candidate, resolve its source jar via
+ *      Klass._java_mirror -> Class.protection_domain ->
+ *      CodeSource.location -> URL.path (and protocol). This is the same
+ *      jar identity the JVM_EnqueueOperation trampoline observes for
+ *      future attach attempts, so a single jar-path glob filter covers
+ *      both arms of the ban.
+ *   3. Apply the filter; for each match, null the agent's static
+ *      Instrumentation reference + its mTransformerManager + overwrite
+ *      premain/agentmain bytecode with a bare return.
+ *
+ * No class-name input from the caller — purge is byproduct of ban.
+ * ============================================================ */
 
 static bool clearMethodBody(uint64_t klassAddr, const char* methodName) {
     HANDLE proc = g_target.handle;
     uint64_t methodAddr = 0;
-    // Try to find the method — empty paramDesc matches any signature
     if (!findMethodInKlass(klassAddr, methodName, "", &methodAddr) || methodAddr == 0) {
         FVM_LOG("purge_agent: method '%s' not found (may not exist)", methodName);
-        return false; // not an error — method may not exist in this agent
+        return false;
     }
 
-    // Read ConstMethod* from Method
     int64_t constMethodOff = structOffset("Method", "_constMethod");
     if (constMethodOff < 0) constMethodOff = 8;
 
     uint64_t constMethodAddr = 0;
     if (!readRemotePointer(proc, methodAddr + (uint64_t)constMethodOff, &constMethodAddr) || constMethodAddr == 0) {
-        setError("constmethod_read_failed");
         return false;
     }
 
-    // Read bytecode size
     uint32_t codeSize = 0;
     std::vector<uint8_t> bytecode;
     uint64_t bytecodeStart = 0;
     if (!readConstMethodBytecode(constMethodAddr, &bytecode, &bytecodeStart, &codeSize)) {
-        setError("bytecode_read_failed");
         return false;
     }
+    if (codeSize == 0 || bytecodeStart == 0) return false;
 
-    if (codeSize == 0 || bytecodeStart == 0) {
-        setError("bytecode_empty");
-        return false;
-    }
-
-    // Write a single 'return' (0xB1) at the start, fill rest with nop (0x00)
     std::vector<uint8_t> cleared(codeSize, 0x00);
     cleared[0] = 0xB1; // return void
 
-    if (!writeRemoteMem(proc, bytecodeStart, cleared.data(), codeSize)) {
-        setError("bytecode_write_failed");
-        return false;
-    }
+    if (!writeRemoteMem(proc, bytecodeStart, cleared.data(), codeSize)) return false;
 
     FVM_LOG("purge_agent: cleared method '%s' bytecode (%u bytes) at 0x%llX",
             methodName, codeSize, bytecodeStart);
     return true;
 }
 
-static int doPurgeAgent(const char* agentClassName) {
-    HANDLE proc = g_target.handle;
-    if (proc == NULL) {
-        setError("no_target_process");
-        return 0;
-    }
-
-    std::string internalName = std::string(agentClassName);
-    for (char& c : internalName) { if (c == '.') c = '/'; }
-
-    FVM_LOG("=== PURGE AGENT: %s ===", internalName.c_str());
-
-    // Step 1: Find the agent Klass
-    uint64_t agentKlass = 0;
-    if (!findInstanceKlassByName(internalName, &agentKlass)) {
-        setError("agent_class_not_found:" + internalName);
-        return 0;
-    }
-    FVM_LOG("purge_agent: found agent Klass at 0x%llX", agentKlass);
-
-    // Step 2: Suspend all threads for safe memory writes
-    std::vector<DWORD> threads;
-    suspendTargetThreads(g_target.pid, threads);
-
-    bool success = true;
-    int steps = 0;
-
-    // Step 3: Read the static Instrumentation field OOP from the agent class
-    // Common field names used by Java agents for their Instrumentation reference
-    static const char* instFieldNames[] = {
-        "instrumentation", "inst", "INST", "INSTRUMENTATION",
-        "sInstrumentation", "sInst", nullptr
+/* Glob match: '*' any run, '?' single char. Case-insensitive, '\\' == '/'.
+ * Mirrors the agent-side trampoline filter so future-attach and purge
+ * semantics stay identical. */
+static bool agentGlobMatch(const std::string& pattern, const std::string& text) {
+    auto norm = [](unsigned char c) -> unsigned char {
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+        if (c == '\\') c = '/';
+        return c;
     };
+    size_t pi = 0, ti = 0;
+    size_t starPi = std::string::npos, starTi = 0;
+    while (ti < text.size()) {
+        if (pi < pattern.size() && pattern[pi] == '*') {
+            starPi = pi++;
+            starTi = ti;
+        } else if (pi < pattern.size() &&
+                   (pattern[pi] == '?' ||
+                    norm((unsigned char)pattern[pi]) == norm((unsigned char)text[ti]))) {
+            pi++;
+            ti++;
+        } else if (starPi != std::string::npos) {
+            pi = starPi + 1;
+            ti = ++starTi;
+        } else {
+            return false;
+        }
+    }
+    while (pi < pattern.size() && pattern[pi] == '*') pi++;
+    return pi == pattern.size();
+}
 
-    uint64_t instOop = 0;
-    const char* foundFieldName = nullptr;
-    for (int i = 0; instFieldNames[i] != nullptr; i++) {
-        if (readStaticOop(agentKlass, instFieldNames[i], &instOop)) {
-            foundFieldName = instFieldNames[i];
-            FVM_LOG("purge_agent: found Instrumentation OOP=0x%llX in field '%s'",
-                    instOop, foundFieldName);
-            break;
+/* Read a java.lang.String oop into a UTF-8 std::string.
+ * Handles JDK 9+ byte[]+coder layout (Latin1 / UTF-16) and JDK 8 char[].
+ * Returns true on success with `out` populated. */
+static bool readJavaString(uint64_t stringOop, std::string& out) {
+    out.clear();
+    if (stringOop == 0) return false;
+    HANDLE proc = g_target.handle;
+
+    /* Oop layout: markWord(8) + klass(4 compressed | 8 uncompressed) at offset 8. */
+    uint64_t strKlass = readKlass(proc, stringOop + 8, g_target.useCompressedClassPointers);
+    if (strKlass == 0) return false;
+
+    ResolvedField valueField = {};
+    if (!resolveFieldInKlass(strKlass, "value", "", &valueField)) return false;
+    if (valueField.isStatic) return false;
+
+    uint64_t arrOop = readOop(proc, stringOop + (uint64_t)valueField.offset,
+                              g_target.useCompressedOops);
+    if (arrOop == 0) return false;
+
+    /* JDK 9+ has String.coder (byte); JDK 8 does not. */
+    bool hasCoder = false;
+    uint8_t coder = 0;
+    ResolvedField coderField = {};
+    if (resolveFieldInKlass(strKlass, "coder", "", &coderField) && !coderField.isStatic) {
+        if (readRemoteMem(proc, stringOop + (uint64_t)coderField.offset, &coder, 1)) {
+            hasCoder = true;
         }
     }
 
-    // Step 4: If we found an Instrumentation OOP, null the TransformerManager inside it
-    if (instOop != 0 && foundFieldName != nullptr) {
-        // Read the Klass of the InstrumentationImpl object
-        int64_t oopKlassOff = 0; // object header offset for klass
-        uint64_t instKlass = readKlass(proc, instOop + oopKlassOff,
-                                        g_target.useCompressedClassPointers);
+    /* arrayOop layout: markWord(8) + klass(4|8) + length(int32) + padding + data.
+     * With compressed klass: length@12, data@16.
+     * Without: length@16, data@20. */
+    int arrLengthOff = g_target.useCompressedClassPointers ? 12 : 16;
+    int arrDataOff   = g_target.useCompressedClassPointers ? 16 : 20;
 
-        if (instKlass != 0) {
-            FVM_LOG("purge_agent: InstrumentationImpl Klass at 0x%llX", instKlass);
+    int32_t arrLen = 0;
+    if (!readRemoteI32(proc, arrOop + (uint64_t)arrLengthOff, &arrLen)) return false;
+    if (arrLen < 0 || arrLen > (1 << 20)) return false;
+    if (arrLen == 0) return true;
 
-            // Null the mTransformerManager field
-            ResolvedField tmField = {};
-            if (resolveFieldInKlass(instKlass, "mTransformerManager", "", &tmField)) {
-                if (!tmField.isStatic && tmField.offset > 0) {
-                    uint64_t tmAddr = instOop + tmField.offset;
-                    uint64_t zero = 0;
-                    size_t writeSize = g_target.useCompressedOops ? 4 : 8;
-                    if (writeRemoteMem(proc, tmAddr, &zero, writeSize)) {
+    auto pushUtf8 = [&out](uint32_t c) {
+        if (c < 0x80) {
+            out.push_back((char)c);
+        } else if (c < 0x800) {
+            out.push_back((char)(0xC0 | (c >> 6)));
+            out.push_back((char)(0x80 | (c & 0x3F)));
+        } else {
+            out.push_back((char)(0xE0 | (c >> 12)));
+            out.push_back((char)(0x80 | ((c >> 6) & 0x3F)));
+            out.push_back((char)(0x80 | (c & 0x3F)));
+        }
+    };
+
+    if (hasCoder) {
+        /* byte[]: coder=0 Latin1 (1 byte/char), coder=1 UTF-16LE (2 bytes/char).
+         * arrLen is the byte count of the underlying array. */
+        std::vector<uint8_t> bytes(arrLen);
+        if (!readRemoteMem(proc, arrOop + (uint64_t)arrDataOff, bytes.data(), arrLen)) return false;
+        if (coder == 0) {
+            for (uint8_t b : bytes) pushUtf8(b);
+        } else {
+            for (int32_t i = 0; i + 1 < arrLen; i += 2) {
+                uint16_t c = (uint16_t)bytes[i] | ((uint16_t)bytes[i + 1] << 8);
+                pushUtf8(c);
+            }
+        }
+    } else {
+        /* JDK 8 char[]: 2 bytes per element, arrLen is char count. */
+        std::vector<uint8_t> bytes((size_t)arrLen * 2);
+        if (!readRemoteMem(proc, arrOop + (uint64_t)arrDataOff, bytes.data(), bytes.size())) return false;
+        for (int32_t i = 0; i < arrLen; i++) {
+            uint16_t c = (uint16_t)bytes[i * 2] | ((uint16_t)bytes[i * 2 + 1] << 8);
+            pushUtf8(c);
+        }
+    }
+    return true;
+}
+
+/* Read an int constant stored at a VMStructs static field address. */
+static int32_t readStaticInt32(const std::string& typeName, const std::string& fieldName, int32_t fallback) {
+    uint64_t addr = structStaticAddr(typeName, fieldName);
+    if (addr == 0) return fallback;
+    int32_t value = 0;
+    if (!readRemoteI32(g_target.handle, addr, &value)) return fallback;
+    return value;
+}
+
+/* Walk Klass._java_mirror -> Class.protection_domain -> CodeSource.location
+ * -> URL.{protocol,path}, returning a normalized filesystem path to the agent
+ * jar. Returns false when any link in the chain is null (boot loader agents,
+ * dynamically-generated classes — these have no jar identity). */
+static bool resolveAgentJarPath(uint64_t klassAddr, std::string& outPath) {
+    HANDLE proc = g_target.handle;
+    outPath.clear();
+
+    int64_t mirrorOff = structOffset("Klass", "_java_mirror");
+    if (mirrorOff < 0) return false;
+    uint64_t classOop = readOop(proc, klassAddr + (uint64_t)mirrorOff, g_target.useCompressedOops);
+    if (classOop == 0) return false;
+
+    /* Modern JDK: injected field offset exposed as static_field
+     * java_lang_Class::_protection_domain_offset (int). */
+    uint64_t pdOop = 0;
+    int32_t pdOff = readStaticInt32("java_lang_Class", "_protection_domain_offset", -1);
+    if (pdOff > 0) {
+        pdOop = readOop(proc, classOop + (uint64_t)pdOff, g_target.useCompressedOops);
+    }
+    if (pdOop == 0) {
+        /* JDK 8 fallback: stored on InstanceKlass directly. */
+        int64_t ikPdOff = structOffset("InstanceKlass", "_protection_domain");
+        if (ikPdOff >= 0) {
+            pdOop = readOop(proc, klassAddr + (uint64_t)ikPdOff, g_target.useCompressedOops);
+        }
+    }
+    if (pdOop == 0) return false;
+
+    uint64_t pdKlass = readKlass(proc, pdOop + 8, g_target.useCompressedClassPointers);
+    if (pdKlass == 0) return false;
+
+    ResolvedField csField = {};
+    if (!resolveFieldInKlass(pdKlass, "codesource", "", &csField)) return false;
+    if (csField.isStatic) return false;
+    uint64_t csOop = readOop(proc, pdOop + (uint64_t)csField.offset, g_target.useCompressedOops);
+    if (csOop == 0) return false;
+
+    uint64_t csKlass = readKlass(proc, csOop + 8, g_target.useCompressedClassPointers);
+    if (csKlass == 0) return false;
+
+    ResolvedField locField = {};
+    if (!resolveFieldInKlass(csKlass, "location", "", &locField)) return false;
+    if (locField.isStatic) return false;
+    uint64_t urlOop = readOop(proc, csOop + (uint64_t)locField.offset, g_target.useCompressedOops);
+    if (urlOop == 0) return false;
+
+    uint64_t urlKlass = readKlass(proc, urlOop + 8, g_target.useCompressedClassPointers);
+    if (urlKlass == 0) return false;
+
+    ResolvedField pathField = {};
+    if (!resolveFieldInKlass(urlKlass, "path", "", &pathField)) return false;
+    if (pathField.isStatic) return false;
+    uint64_t pathStrOop = readOop(proc, urlOop + (uint64_t)pathField.offset, g_target.useCompressedOops);
+    if (pathStrOop == 0) return false;
+
+    std::string path;
+    if (!readJavaString(pathStrOop, path) || path.empty()) return false;
+
+    /* Read protocol to identify jar:file:..!/ wrapping vs plain file: URL. */
+    std::string protocol;
+    ResolvedField protoField = {};
+    if (resolveFieldInKlass(urlKlass, "protocol", "", &protoField) && !protoField.isStatic) {
+        uint64_t protoStrOop = readOop(proc, urlOop + (uint64_t)protoField.offset,
+                                       g_target.useCompressedOops);
+        if (protoStrOop != 0) readJavaString(protoStrOop, protocol);
+    }
+
+    /* Normalize:
+     *   protocol=jar,  path=file:/D:/foo/agent.jar!/  → D:/foo/agent.jar
+     *   protocol=file, path=/D:/foo/agent.jar         → D:/foo/agent.jar */
+    if (protocol == "jar") {
+        if (path.compare(0, 5, "file:") == 0) path = path.substr(5);
+        size_t bang = path.find('!');
+        if (bang != std::string::npos) path = path.substr(0, bang);
+    }
+    /* Strip the leading '/' on Windows-style URL paths like "/D:/foo/x.jar". */
+    if (path.size() >= 3 && path[0] == '/' && path[2] == ':') {
+        path = path.substr(1);
+    }
+
+    outPath = std::move(path);
+    return !outPath.empty();
+}
+
+/* Scan an InstanceKlass's static fields. If any has declared type
+ * Lsun/instrument/InstrumentationImpl; or Ljava/lang/instrument/Instrumentation;,
+ * write its field name to outFieldName and return true. */
+static bool findInstrumentationStaticField(uint64_t klassAddr, std::string* outFieldName) {
+    HANDLE proc = g_target.handle;
+    outFieldName->clear();
+
+    int64_t ik_fields_off = structOffset("InstanceKlass", "_fields");
+    int64_t ik_constants_off = structOffset("InstanceKlass", "_constants");
+    if (ik_fields_off < 0 || ik_constants_off < 0) return false;
+
+    uint64_t cpAddr = 0;
+    readRemotePointer(proc, klassAddr + ik_constants_off, &cpAddr);
+    if (cpAddr == 0) return false;
+
+    uint64_t fieldsArrayAddr = 0;
+    readRemotePointer(proc, klassAddr + ik_fields_off, &fieldsArrayAddr);
+    if (fieldsArrayAddr == 0) return false;
+
+    /* Array<u2> length: try common header offsets. */
+    int32_t fieldsLen = 0;
+    readRemoteI32(proc, fieldsArrayAddr + 8, &fieldsLen);
+    if (fieldsLen <= 0 || fieldsLen > 100000) {
+        readRemoteI32(proc, fieldsArrayAddr + 12, &fieldsLen);
+    }
+    if (fieldsLen <= 0 || fieldsLen > 100000) return false;
+
+    int64_t cp_header_size = typeSize("ConstantPool");
+    if (cp_header_size <= 0) cp_header_size = 72;
+
+    int64_t cp_length_off = structOffset("ConstantPool", "_length");
+    int32_t cpLength = 0;
+    if (cp_length_off >= 0) readRemoteI32(proc, cpAddr + cp_length_off, &cpLength);
+    if (cpLength <= 0) cpLength = 32767;
+
+    std::vector<uint16_t> fieldData(fieldsLen);
+    bool readOk = false;
+    for (int hdrTry = 16; hdrTry >= 8; hdrTry -= 4) {
+        if (readRemoteMem(proc, fieldsArrayAddr + hdrTry, fieldData.data(),
+                          (size_t)fieldsLen * 2)) {
+            readOk = true;
+            break;
+        }
+    }
+    if (!readOk) return false;
+
+    int32_t javaFieldsCount = fieldsLen / 6;
+    int64_t jfc_off = structOffset("InstanceKlass", "_java_fields_count");
+    if (jfc_off >= 0) {
+        uint16_t jfc = 0;
+        readRemoteU16(proc, klassAddr + jfc_off, &jfc);
+        if (jfc > 0) javaFieldsCount = jfc;
+    }
+
+    for (int fi = 0; fi < javaFieldsCount && (fi * 6 + 2) < fieldsLen; fi++) {
+        int base = fi * 6;
+        uint16_t accessFlags = fieldData[base + 0];
+        uint16_t nameIndex   = fieldData[base + 1];
+        uint16_t sigIndex    = fieldData[base + 2];
+
+        if ((accessFlags & 0x0008) == 0) continue; /* not static */
+        if (sigIndex == 0 || sigIndex >= (uint16_t)cpLength) continue;
+
+        uint64_t sigSymAddr = 0;
+        readRemotePointer(proc, cpAddr + (uint64_t)cp_header_size + (uint64_t)sigIndex * 8,
+                          &sigSymAddr);
+        if (sigSymAddr == 0) continue;
+
+        std::string descriptor;
+        if (!readSymbolBody(proc, sigSymAddr, &descriptor)) continue;
+
+        if (descriptor != "Lsun/instrument/InstrumentationImpl;" &&
+            descriptor != "Ljava/lang/instrument/Instrumentation;") {
+            continue;
+        }
+
+        if (nameIndex == 0 || nameIndex >= (uint16_t)cpLength) continue;
+        uint64_t nameSymAddr = 0;
+        readRemotePointer(proc, cpAddr + (uint64_t)cp_header_size + (uint64_t)nameIndex * 8,
+                          &nameSymAddr);
+        if (nameSymAddr == 0) continue;
+
+        std::string fieldName;
+        if (!readSymbolBody(proc, nameSymAddr, &fieldName)) continue;
+
+        *outFieldName = std::move(fieldName);
+        return true;
+    }
+    return false;
+}
+
+/* Walk ClassLoaderDataGraph -> ClassLoaderData -> Klass chain. For each
+ * InstanceKlass, check if it holds a static Instrumentation reference;
+ * if yes, record (klassAddr, fieldName). */
+static void enumerateAgentMainKlasses(std::vector<std::pair<uint64_t, std::string>>& out) {
+    HANDLE proc = g_target.handle;
+    out.clear();
+
+    uint64_t cldgHeadAddr = structStaticAddr("ClassLoaderDataGraph", "_head");
+    if (cldgHeadAddr == 0) cldgHeadAddr = structStaticAddr("ClassLoaderData", "_head");
+    if (cldgHeadAddr == 0) {
+        FVM_LOG("enumerateAgentMainKlasses: ClassLoaderDataGraph::_head not in VMStructs");
+        return;
+    }
+
+    uint64_t cldAddr = 0;
+    if (!readRemotePointer(proc, cldgHeadAddr, &cldAddr) || cldAddr == 0) {
+        FVM_LOG("enumerateAgentMainKlasses: CLD head is null");
+        return;
+    }
+
+    int64_t cldNextOff = structOffset("ClassLoaderData", "_next");
+    if (cldNextOff < 0) cldNextOff = 8;
+    int64_t cldKlassesOff = structOffset("ClassLoaderData", "_klasses");
+    if (cldKlassesOff < 0) cldKlassesOff = 16;
+    int64_t klassNextOff = structOffset("Klass", "_next_link");
+    if (klassNextOff < 0) klassNextOff = structOffset("InstanceKlass", "_next_link");
+    if (klassNextOff < 0) {
+        FVM_LOG("enumerateAgentMainKlasses: Klass::_next_link not in VMStructs");
+        return;
+    }
+
+    int scanned = 0;
+    for (int cldCount = 0; cldAddr != 0 && cldCount < 10000; cldCount++) {
+        uint64_t klassAddr = 0;
+        readRemotePointer(proc, cldAddr + (uint64_t)cldKlassesOff, &klassAddr);
+
+        for (int klassCount = 0; klassAddr != 0 && klassCount < 100000; klassCount++) {
+            scanned++;
+            std::string fieldName;
+            if (findInstrumentationStaticField(klassAddr, &fieldName)) {
+                std::string klassName;
+                readKlassName(proc, klassAddr, &klassName);
+                FVM_LOG("enumerateAgentMainKlasses: agent main '%s' @ 0x%llX field='%s'",
+                        klassName.c_str(), (unsigned long long)klassAddr, fieldName.c_str());
+                out.emplace_back(klassAddr, std::move(fieldName));
+            }
+
+            uint64_t nextKlass = 0;
+            if (!readRemotePointer(proc, klassAddr + (uint64_t)klassNextOff, &nextKlass)) break;
+            klassAddr = nextKlass;
+        }
+
+        uint64_t nextCld = 0;
+        if (!readRemotePointer(proc, cldAddr + (uint64_t)cldNextOff, &nextCld)) break;
+        cldAddr = nextCld;
+    }
+    FVM_LOG("enumerateAgentMainKlasses: scanned %d klasses, found %zu agent main(s)",
+            scanned, out.size());
+}
+
+/* Purge a single agent given its main InstanceKlass and the field name that
+ * holds its Instrumentation reference. Steps mirror the original implementation
+ * but skip the class-name lookup (caller already located the klass) and use
+ * the correct oop+8 offset for klass reads on InstrumentationImpl instances. */
+static int purgeAgentByKlass(uint64_t agentKlass, const std::string& instFieldName) {
+    HANDLE proc = g_target.handle;
+    if (proc == NULL) return 0;
+
+    std::string klassName;
+    readKlassName(proc, agentKlass, &klassName);
+    FVM_LOG("=== PURGE AGENT: %s (field=%s) ===", klassName.c_str(), instFieldName.c_str());
+
+    std::vector<DWORD> threads;
+    suspendTargetThreads(g_target.pid, threads);
+
+    int steps = 0;
+    size_t writeSize = g_target.useCompressedOops ? 4 : 8;
+    uint64_t zero = 0;
+
+    ResolvedField rf = {};
+    if (resolveFieldInKlass(agentKlass, instFieldName, "", &rf) && rf.isStatic && rf.staticAddress != 0) {
+        uint64_t instOop = readOop(proc, rf.staticAddress, g_target.useCompressedOops);
+
+        if (instOop != 0) {
+            uint64_t instKlass = readKlass(proc, instOop + 8, g_target.useCompressedClassPointers);
+            if (instKlass != 0) {
+                ResolvedField tmField = {};
+                if (resolveFieldInKlass(instKlass, "mTransformerManager", "", &tmField) &&
+                    !tmField.isStatic && tmField.offset > 0) {
+                    if (writeRemoteMem(proc, instOop + tmField.offset, &zero, writeSize)) {
                         FVM_LOG("purge_agent: nullified mTransformerManager at OOP+%d", tmField.offset);
                         steps++;
                     }
                 }
-            }
-
-            // Also null mRetransfomerManager (yes, JDK has this typo in some versions)
-            ResolvedField rtmField = {};
-            if (resolveFieldInKlass(instKlass, "mRetransfomerManager", "", &rtmField)) {
-                if (!rtmField.isStatic && rtmField.offset > 0) {
-                    uint64_t rtmAddr = instOop + rtmField.offset;
-                    uint64_t zero = 0;
-                    size_t writeSize = g_target.useCompressedOops ? 4 : 8;
-                    if (writeRemoteMem(proc, rtmAddr, &zero, writeSize)) {
+                ResolvedField rtmField = {};
+                if (resolveFieldInKlass(instKlass, "mRetransfomerManager", "", &rtmField) &&
+                    !rtmField.isStatic && rtmField.offset > 0) {
+                    if (writeRemoteMem(proc, instOop + rtmField.offset, &zero, writeSize)) {
                         FVM_LOG("purge_agent: nullified mRetransfomerManager at OOP+%d", rtmField.offset);
                         steps++;
                     }
                 }
             }
-        }
 
-        // Step 5: Null the agent's static instrumentation field
-        if (nullifyStaticField(agentKlass, foundFieldName)) {
-            steps++;
+            if (writeRemoteMem(proc, rf.staticAddress, &zero, writeSize)) {
+                FVM_LOG("purge_agent: nullified static '%s' at 0x%llX",
+                        instFieldName.c_str(), (unsigned long long)rf.staticAddress);
+                steps++;
+            }
         }
-    } else {
-        FVM_LOG("purge_agent: no Instrumentation field found — skipping Instrumentation cleanup");
     }
 
-    // Step 6: Clear agentmain and premain method bodies
     if (clearMethodBody(agentKlass, "agentmain")) steps++;
     if (clearMethodBody(agentKlass, "premain")) steps++;
 
-    // Resume threads
     resumeTargetThreads(threads);
 
-    // Force deoptimization so JIT-compiled code picks up the changes
-    FVM_LOG("purge_agent: starting deoptimization sweep...");
+    FVM_LOG("purge_agent: deopt sweep");
     forceDeoptimizeAll();
 
-    if (steps > 0) {
-        FVM_LOG("=== PURGE AGENT SUCCESS: %s (%d steps) ===", internalName.c_str(), steps);
-        setError("ok");
-        return 1;
-    } else {
-        FVM_LOG("=== PURGE AGENT: no operations succeeded for %s ===", internalName.c_str());
-        setError("no_operations_succeeded");
+    FVM_LOG("=== PURGE AGENT DONE: %s (%d steps) ===", klassName.c_str(), steps);
+    return steps > 0 ? 1 : 0;
+}
+
+/* Public export: scan every loaded Java agent, apply the jar-path filter,
+ * purge each match. The same filter mode/patterns are used by the
+ * JVM_EnqueueOperation trampoline for future-attach blocking, so a single
+ * AgentFilter on the Java side gives symmetric "already loaded + future"
+ * behavior.
+ *
+ *   filterMode = 0 (NONE) : purge ALL loaded agents (including unknown-jar)
+ *   filterMode = 1 (BLACKLIST) : purge agents whose jar matches any pattern
+ *   filterMode = 2 (WHITELIST) : purge agents whose jar does NOT match
+ *
+ * Returns the number of agents purged. */
+extern "C" __declspec(dllexport) int forgevm_purge_agents_matching(
+        int filterMode,
+        const char* const* patterns,
+        int patternsCount) {
+
+    if (g_target.handle == NULL || !g_target.structMapReady) {
+        setError("not_bootstrapped");
         return 0;
     }
-}
 
-extern "C" __declspec(dllexport) int forgevm_purge_agent(const char* agentClassName) {
-    return doPurgeAgent(agentClassName);
-}
+    FVM_LOG("forgevm_purge_agents_matching: mode=%d patternsCount=%d",
+            filterMode, patternsCount);
 
-extern "C" __declspec(dllexport) int forgevm_transform_load(
-    const char* className, const char* methodName, const char* paramDesc,
-    const char* injectAt, const char* hookClass, const char* hookMethod,
-    const char* hookDesc) {
-    return applyTransform(className, methodName, paramDesc, injectAt,
-                          hookClass, hookMethod, hookDesc, false);
-}
+    std::vector<std::pair<uint64_t, std::string>> agents;
+    enumerateAgentMainKlasses(agents);
+    if (agents.empty()) {
+        setError("ok");
+        return 0;
+    }
 
-// Same as forgevm_transform_load, but skips the global deopt sweep.
-// Caller is responsible for invoking forgevm_force_deopt_now() once after a batch.
-extern "C" __declspec(dllexport) int forgevm_transform_load_v2(
-    const char* className, const char* methodName, const char* paramDesc,
-    const char* injectAt, const char* hookClass, const char* hookMethod,
-    const char* hookDesc, int deferDeopt) {
-    return applyTransform(className, methodName, paramDesc, injectAt,
-                          hookClass, hookMethod, hookDesc, deferDeopt != 0);
+    int purged = 0;
+    for (auto& entry : agents) {
+        uint64_t klassAddr = entry.first;
+        const std::string& fieldName = entry.second;
+
+        std::string jarPath;
+        bool gotJar = resolveAgentJarPath(klassAddr, jarPath);
+
+        bool shouldPurge;
+        if (filterMode == 0) {
+            shouldPurge = true;
+        } else if (!gotJar) {
+            /* Strict: filter is set, jar identity unknown → don't purge.
+             * If user wants these too, they call banJavaAgent() with no filter. */
+            FVM_LOG("forgevm_purge_agents_matching: skip 0x%llX (no jar identity)",
+                    (unsigned long long)klassAddr);
+            shouldPurge = false;
+        } else {
+            bool matched = false;
+            for (int i = 0; i < patternsCount; i++) {
+                if (patterns[i] != nullptr &&
+                    agentGlobMatch(std::string(patterns[i]), jarPath)) {
+                    matched = true;
+                    break;
+                }
+            }
+            shouldPurge = (filterMode == 1) ? matched : !matched;
+        }
+
+        FVM_LOG("forgevm_purge_agents_matching: klass=0x%llX jar='%s' %s",
+                (unsigned long long)klassAddr, jarPath.c_str(),
+                shouldPurge ? "PURGE" : "keep");
+
+        if (shouldPurge && purgeAgentByKlass(klassAddr, fieldName) == 1) {
+            purged++;
+        }
+    }
+
+    FVM_LOG("forgevm_purge_agents_matching: purged %d of %zu loaded agents",
+            purged, agents.size());
+    setError("ok");
+    return purged;
 }
 
 // Trigger a single global deoptimization sweep — used after a batch of deferred transforms.
@@ -3084,13 +1386,8 @@ extern "C" __declspec(dllexport) int forgevm_force_deopt_now() {
     return 1;
 }
 
-extern "C" __declspec(dllexport) int forgevm_transform_unload(
-    const char* className, const char* methodName, const char* paramDesc) {
-    return restoreTransform(className, methodName, paramDesc);
-}
-
 // ============================================================
-// Subclass-aware forge: find all subclasses and apply transform
+// Subclass traversal helpers (used by commitClassPlan / unloadClassPlan)
 // ============================================================
 
 static bool isSubclassOf(uint64_t klassAddr, uint64_t targetKlassAddr) {
@@ -3119,11 +1416,11 @@ static std::vector<uint64_t> findAllSubclasses(uint64_t targetKlassAddr) {
     uint64_t cldAddr = 0;
     if (!readRemotePointer(proc, cldgHeadAddr, &cldAddr) || cldAddr == 0) return result;
 
-    int64_t cldNextOff = structOffset("ClassLoaderData", "_next");
+    int64_t cldNextOff   = structOffset("ClassLoaderData", "_next");
     if (cldNextOff < 0) cldNextOff = 8;
     int64_t cldKlassesOff = structOffset("ClassLoaderData", "_klasses");
     if (cldKlassesOff < 0) cldKlassesOff = 16;
-    int64_t klassNextOff = structOffset("Klass", "_next_link");
+    int64_t klassNextOff  = structOffset("Klass", "_next_link");
     if (klassNextOff < 0) klassNextOff = structOffset("InstanceKlass", "_next_link");
 
     for (int cldCount = 0; cldAddr != 0 && cldCount < 10000; cldCount++) {
@@ -3148,117 +1445,12 @@ static std::vector<uint64_t> findAllSubclasses(uint64_t targetKlassAddr) {
     return result;
 }
 
-static int forgeLoadSubclassesImpl(
-    const char* className, const char* methodName, const char* paramDesc,
-    const char* injectAt, const char* hookClass, const char* hookMethod,
-    const char* hookDesc, bool deferDeopt) {
-
-    // First, apply to the target class itself (always defer per-call, since we
-    // also need to transform subclasses; one global deopt covers everything).
-    int result = applyTransform(className, methodName, paramDesc, injectAt,
-                                hookClass, hookMethod, hookDesc, true);
-
-    // Find the target Klass
-    std::string internalName = toInternalName(className);
-    uint64_t targetKlassAddr = 0;
-    if (!findInstanceKlassByName(internalName, &targetKlassAddr)) {
-        FVM_LOG("forge_subclasses: target class not found, skipping subclass scan");
-        return result;
-    }
-
-    // Find and forge all subclasses
-    std::vector<uint64_t> subclasses = findAllSubclasses(targetKlassAddr);
-    FVM_LOG("forge_subclasses: found %zu subclasses of %s", subclasses.size(), className);
-
-    int forgedCount = result == 1 ? 1 : 0;
-    for (uint64_t subKlass : subclasses) {
-        // Read subclass name
-        std::string subName;
-        if (!readKlassName(g_target.handle, subKlass, &subName)) continue;
-
-        // Check if this subclass has the target method (i.e., overrides it)
-        uint64_t subMethodAddr = 0;
-        if (!findMethodInKlass(subKlass, methodName, paramDesc, &subMethodAddr)) {
-            continue; // no override, parent's forged method applies via vtable
-        }
-
-        // Convert internal name back to dot-separated for applyTransform
-        std::string dotName = subName;
-        for (char& c : dotName) { if (c == '/') c = '.'; }
-
-        FVM_LOG("forge_subclasses: forging override in %s", dotName.c_str());
-        int subResult = applyTransform(dotName.c_str(), methodName, paramDesc,
-                                        injectAt, hookClass, hookMethod, hookDesc, true);
-        if (subResult == 1) forgedCount++;
-    }
-
-    FVM_LOG("forge_subclasses: total forged = %d (target + %d subclasses)", forgedCount, forgedCount - (result == 1 ? 1 : 0));
-
-    // Single deopt sweep covers target + all subclasses (and any callers)
-    if (!deferDeopt) {
-        FVM_LOG("forge_subclasses: running global deopt sweep for batch");
-        forceDeoptimizeAll();
-    }
-
-    if (forgedCount > 0) {
-        setError("ok");
-        return 1;
-    }
-    return result;
-}
-
-extern "C" __declspec(dllexport) int forgevm_forge_load_subclasses(
-    const char* className, const char* methodName, const char* paramDesc,
-    const char* injectAt, const char* hookClass, const char* hookMethod,
-    const char* hookDesc) {
-    return forgeLoadSubclassesImpl(className, methodName, paramDesc, injectAt,
-                                    hookClass, hookMethod, hookDesc, false);
-}
-
-// Same as forgevm_forge_load_subclasses but skips the final deopt sweep.
-extern "C" __declspec(dllexport) int forgevm_forge_load_subclasses_v2(
-    const char* className, const char* methodName, const char* paramDesc,
-    const char* injectAt, const char* hookClass, const char* hookMethod,
-    const char* hookDesc, int deferDeopt) {
-    return forgeLoadSubclassesImpl(className, methodName, paramDesc, injectAt,
-                                    hookClass, hookMethod, hookDesc, deferDeopt != 0);
-}
-
-extern "C" __declspec(dllexport) int forgevm_forge_unload_subclasses(
-    const char* className, const char* methodName, const char* paramDesc) {
-
-    // Restore the target class
-    int result = restoreTransform(className, methodName, paramDesc);
-
-    // Find the target Klass
-    std::string internalName = toInternalName(className);
-    uint64_t targetKlassAddr = 0;
-    if (!findInstanceKlassByName(internalName, &targetKlassAddr)) {
-        return result;
-    }
-
-    // Restore all subclasses
-    std::vector<uint64_t> subclasses = findAllSubclasses(targetKlassAddr);
-    for (uint64_t subKlass : subclasses) {
-        std::string subName;
-        if (!readKlassName(g_target.handle, subKlass, &subName)) continue;
-
-        std::string dotName = subName;
-        for (char& c : dotName) { if (c == '/') c = '.'; }
-
-        restoreTransform(dotName.c_str(), methodName, paramDesc);
-    }
-
-    setError("ok");
-    return 1;
-}
-
 // ============================================================
-// §17.14 Stage 3.1: True mergedCP — one CP/Cache/RK per class per commit
+// Per-class bytecode transform — core implementation
 // ============================================================
 
 /* Per-hook resolved data collected during Phase A (no suspend needed). */
-struct MergeHookData {
+struct HookData {
     /* Hook identity */
     std::string methodName, paramDesc;
     std::string injectAt, hookClass, hookMethod, hookDesc;
@@ -3275,6 +1467,11 @@ struct MergeHookData {
     bool     hasArgCapture  = false;
     std::vector<ParamSlotInfo> targetParams;
     std::string targetReturnDesc;
+
+    /* True when a CP entry for java/lang/Object must be allocated even without
+       arg capture (e.g., HEAD with `this` or any reference parameter — the
+       rebuilt StackMapTable types those locals as ITEM_Object(Object)). */
+    bool     needObjectCp = false;
 
     /* Return / unbox */
     bool     needsUnbox       = false;
@@ -3296,7 +1493,7 @@ struct MergeHookData {
     uint64_t symObjectClass = 0;
     uint64_t symUnboxClass = 0, symUnboxMethod = 0, symUnboxDesc = 0;
 
-    /* Assigned layout (filled by assignMergedLayout) */
+    /* Assigned layout (filled by assignPoolLayout) */
     uint32_t cpBase           = 0;
     int      hookCacheIdx     = 0, initCacheIdx   = 0;
     int      cancelCacheIdx   = 0, retValCacheIdx = 0, unboxCacheIdx = 0;
@@ -3306,32 +1503,66 @@ struct MergeHookData {
     uint16_t unboxClassCpIdx  = 0;
     uint32_t unboxMethodrefCpOff = 0;  /* offset from cpBase */
 
-    /* Built CM (filled by buildMergedHookCM) */
+    /* Extra Class CP entries for INVOKE/FIELD_PUT reference parameter types
+       whose declared class is not already addressable via an existing
+       Methodref/Fieldref class component. Deduped by internal name. */
+    struct ExtraClassEntry {
+        std::string internalName;
+        uint64_t    klassAddr   = 0;
+        uint64_t    symbolAddr  = 0;
+        uint16_t    nameCpIdx   = 0;
+        uint16_t    classCpIdx  = 0;
+        int         rkIdx       = 0;
+    };
+    std::vector<ExtraClassEntry> extraClasses;
+
+    /* Built CM (filled by buildHookCM) */
     std::vector<uint8_t> newCMBytes;
     uint64_t newCMRemoteAddr = 0;
 
+    /* Rebuilt StackMapTable. When haveNewStackMap is set, commitKlass allocates
+       a remote Array<u1>, writes [int32 length][u1 data...], and points
+       ConstMethod::_stackmap_data at it instead of NULLing it + downgrading
+       _major_version. */
+    std::vector<uint8_t> newStackMapBytes;
+    bool                 haveNewStackMap       = false;
+    uint64_t             newStackMapRemoteAddr = 0;
+
+    /* Extra stack slots consumed by the target instruction's operands (set by
+       buildHookCM for INVOKE/FIELD/NEW; used when updating _max_stack). */
+    uint16_t extraMaxStack = 0;
+
+    bool wantObjectCpEntry() const {
+        return (hasArgCapture && !targetParams.empty()) || needObjectCp;
+    }
     uint32_t numCPEntries() const {
         uint32_t n = 20;
-        if (hasArgCapture && !targetParams.empty()) n += 2;
+        if (wantObjectCpEntry()) n += 2;
         if (needsUnbox) n += 6;
+        n += (uint32_t)extraClasses.size() * 2;
         return n;
     }
     uint32_t numCacheEntries() const { return needsUnbox ? 5u : 4u; }
     uint32_t numRKEntries()    const {
         uint32_t n = 2;
-        if (hasArgCapture && !targetParams.empty()) n++;
+        if (wantObjectCpEntry()) n++;
         if (needsUnbox) n++;
+        n += (uint32_t)extraClasses.size();
         return n;
     }
 };
 
+/* Forward declaration — implementation appears after helper zone. */
+static bool preResolveInjectionTargets(HookData& h, const std::string& kind,
+                                        const std::string& targetSpec);
+
 /* Phase A: resolve all klass/method/symbol addresses for one hook.
    Returns false on any lookup failure (sets g_lastError). */
-static bool resolveMergeHookData(uint64_t klassAddr,
+static bool resolveHookData(uint64_t klassAddr,
                                   const std::string& methodName,
                                   const std::string& paramDesc,
                                   const HookSpecExtended& spec,
-                                  MergeHookData& out) {
+                                  HookData& out) {
     HANDLE proc = g_target.handle;
 
     out.methodName = methodName;
@@ -3375,10 +1606,43 @@ static bool resolveMergeHookData(uint64_t klassAddr,
                     std::string fullSig;
                     if (readSymbolBody(proc, sigSym, &fullSig)) {
                         size_t cp2 = fullSig.find(')');
-                        if (cp2 != std::string::npos && cp2 + 1 < fullSig.size())
+                        if (cp2 != std::string::npos && cp2 + 1 < fullSig.size()) {
                             out.targetReturnDesc = fullSig.substr(cp2 + 1);
+                            /* Replace any caller-supplied paramDesc (which may
+                               be empty for wildcard candidates) with the
+                               authoritative "(...)" portion of the resolved
+                               method's signature. Downstream code that needs to
+                               walk the param list — including the rebuilt
+                               StackMapTable — depends on this. */
+                            out.paramDesc = fullSig.substr(0, cp2 + 1);
+                        }
                         out.targetParams = parseParamSlots(fullSig, out.targetIsStatic);
                         out.hasArgCapture = !out.targetParams.empty();
+                    }
+                    /* All route-2 inject points rebuild a StackMapTable that
+                       declares method-entry locals at the trampoline tail; ref
+                       slots are encoded as ITEM_Object(java/lang/Object), so the
+                       Object CP entry must be allocated regardless of arg-
+                       capture state. */
+                    {
+                        const std::string& ia = spec.injectAt;
+                        bool anyRoute2 =
+                            (ia == "HEAD" || ia == "RETURN" ||
+                             ia.compare(0, 7,  "INVOKE:")    == 0 ||
+                             ia.compare(0, 10, "FIELD_GET:") == 0 ||
+                             ia.compare(0, 10, "FIELD_PUT:") == 0 ||
+                             ia.compare(0, 4,  "NEW:")       == 0);
+                        if (anyRoute2) {
+                            if (!out.targetIsStatic) out.needObjectCp = true;
+                            for (auto& p : out.targetParams)
+                                if (p.isRef) { out.needObjectCp = true; break; }
+                            if (ia == "RETURN" &&
+                                !out.targetReturnDesc.empty() &&
+                                (out.targetReturnDesc[0] == 'L' ||
+                                 out.targetReturnDesc[0] == '[')) {
+                                out.needObjectCp = true;
+                            }
+                        }
                     }
                 }
             }
@@ -3410,9 +1674,14 @@ static bool resolveMergeHookData(uint64_t klassAddr,
     if (!findMethodInKlass(out.cbKlassAddr, "isCancelled",     "()Z",                                      &out.cbIsCancelledAddr)) return false;
     if (!findMethodInKlass(out.cbKlassAddr, "getReturnValue",  "()Ljava/lang/Object;",                     &out.cbGetReturnAddr))   return false;
 
-    /* java/lang/Object for anewarray */
-    if (out.hasArgCapture) {
-        if (!findInstanceKlassByName("java/lang/Object", &out.objectKlassAddr)) out.hasArgCapture = false;
+    /* java/lang/Object — needed for anewarray (arg capture) and/or as the
+       supertype for ITEM_Object verification types in the rebuilt
+       StackMapTable. */
+    if (out.hasArgCapture || out.needObjectCp) {
+        if (!findInstanceKlassByName("java/lang/Object", &out.objectKlassAddr)) {
+            out.hasArgCapture = false;
+            out.needObjectCp  = false;
+        }
     }
 
     /* Unbox wrapper */
@@ -3428,9 +1697,9 @@ static bool resolveMergeHookData(uint64_t klassAddr,
     if (!readMethodSymbols(out.cbInitAddr,        &out.symInit,         &out.symInitDesc))   return false;
     if (!readMethodSymbols(out.cbIsCancelledAddr, &out.symIsCancelled,  &out.symIsCancelledD)) return false;
     if (!readMethodSymbols(out.cbGetReturnAddr,   &out.symGetRetVal,    &out.symGetRetValD)) return false;
-    if (out.hasArgCapture) {
+    if (out.hasArgCapture || out.needObjectCp) {
         out.symObjectClass = readKlassNameSymbol(out.objectKlassAddr);
-        if (!out.symObjectClass) out.hasArgCapture = false;
+        if (!out.symObjectClass) { out.hasArgCapture = false; out.needObjectCp = false; }
     }
     if (out.needsUnbox) {
         out.symUnboxClass = readKlassNameSymbol(out.unboxKlassAddr);
@@ -3443,12 +1712,31 @@ static bool resolveMergeHookData(uint64_t klassAddr,
         !out.symGetRetVal   || !out.symGetRetValD) {
         setError("failed_to_read_interned_symbols"); return false;
     }
+
+    /* For INVOKE/FIELD/NEW: pre-scan original bytecode to accumulate the
+       extraClasses needed for the rebuilt SMT. Must run before assignPoolLayout
+       so CP entry counts are correct. */
+    {
+        std::string kind, targetSpec;
+        size_t c = out.injectAt.find(':');
+        if (c != std::string::npos) {
+            kind = out.injectAt.substr(0, c);
+            targetSpec = out.injectAt.substr(c + 1);
+        } else {
+            kind = out.injectAt;
+        }
+        if (kind == "INVOKE" || kind == "FIELD_GET" ||
+            kind == "FIELD_PUT" || kind == "NEW") {
+            if (!preResolveInjectionTargets(out, kind, targetSpec)) return false;
+        }
+    }
+
     return true;
 }
 
 /* Assign CP / CPCache / RK slot indices for every hook given the true-oldCP base. */
-static void assignMergedLayout(uint32_t oldPoolLen, int32_t origRKLen, int origCacheLen,
-                                std::vector<MergeHookData>& hooks) {
+static void assignPoolLayout(uint32_t oldPoolLen, int32_t origRKLen, int origCacheLen,
+                                std::vector<HookData>& hooks) {
     uint32_t cpCur    = oldPoolLen;
     int      rkCur    = (int)origRKLen;
     int      cacheCur = origCacheLen;
@@ -3458,7 +1746,7 @@ static void assignMergedLayout(uint32_t oldPoolLen, int32_t origRKLen, int origC
 
         h.hookClassRKIdx   = rkCur++;
         h.cbClassRKIdx     = rkCur++;
-        if (h.hasArgCapture && !h.targetParams.empty()) h.objectClassRKIdx = rkCur++;
+        if (h.wantObjectCpEntry()) h.objectClassRKIdx = rkCur++;
         if (h.needsUnbox)  h.unboxClassRKIdx = rkCur++;
 
         h.hookCacheIdx   = cacheCur++;
@@ -3471,7 +1759,7 @@ static void assignMergedLayout(uint32_t oldPoolLen, int32_t origRKLen, int origC
         h.cbClassCpIdx = (uint16_t)(P + 11);
 
         uint32_t E = 20;
-        if (h.hasArgCapture && !h.targetParams.empty()) {
+        if (h.wantObjectCpEntry()) {
             h.objClassCpIdx = (uint16_t)(P + E + 1);
             E += 2;
         }
@@ -3479,6 +1767,12 @@ static void assignMergedLayout(uint32_t oldPoolLen, int32_t origRKLen, int origC
             h.unboxClassCpIdx    = (uint16_t)(P + E + 3);
             h.unboxMethodrefCpOff = E + 5;
             E += 6;
+        }
+        for (auto& ex : h.extraClasses) {
+            ex.rkIdx      = rkCur++;
+            ex.nameCpIdx  = (uint16_t)(P + E);
+            ex.classCpIdx = (uint16_t)(P + E + 1);
+            E += 2;
         }
 
         cpCur += h.numCPEntries();
@@ -3488,12 +1782,12 @@ static void assignMergedLayout(uint32_t oldPoolLen, int32_t origRKLen, int origC
 /* Build the merged ConstantPool byte buffer from TRUE oldCP₀.
    newRKRemoteAddr / newCacheRemoteAddr / newTagsRemoteAddr must be
    pre-allocated remote addresses (written into header fields here). */
-static std::vector<uint8_t> buildMergedPoolBytes(
+static std::vector<uint8_t> buildPoolBytes(
     const std::vector<uint8_t>& oldPoolBytes,
     uint32_t oldPoolLen,
     size_t   oldPoolByteSize,
     int64_t  cpHeaderSize,
-    const std::vector<MergeHookData>& hooks,
+    const std::vector<HookData>& hooks,
     uint32_t newPoolLen,
     uint64_t newRKAddr,
     uint64_t newCacheAddr,
@@ -3512,6 +1806,78 @@ static std::vector<uint8_t> buildMergedPoolBytes(
     if (cacheOff >= 0 && newCacheAddr) memcpy(nb.data() + cacheOff, &newCacheAddr, 8);
     if (rkOff    >= 0 && newRKAddr)    memcpy(nb.data() + rkOff,    &newRKAddr,    8);
     if (tagsOff  >= 0 && newTagsAddr)  memcpy(nb.data() + tagsOff,  &newTagsAddr,  8);
+
+    /* _major_version downgrade is only needed by the legacy goto_w-trampoline
+     * path, which NULLs _stackmap_data and relies on the old type-inference
+     * verifier. If every hook on this class rebuilt a consistent StackMapTable
+     * (HEAD clean-prepend), the split verifier is satisfied and we MUST keep
+     * the original major version — downgrading to 50 would make Java 8+
+     * bytecode (e.g. invokestatic to an InterfaceMethodref) illegal and break
+     * any not-yet-linked class that uses such bytecode. */
+    bool needLegacyVerifierBypass = false;
+    for (const auto& hk : hooks)
+        if (!hk.haveNewStackMap) { needLegacyVerifierBypass = true; break; }
+
+    /* For class major version >= 51 (Java 7+) HotSpot's split verifier is
+     * authoritative and FailOverToOldVerifier does NOT apply: a NULL or
+     * inconsistent _stackmap_data causes a hard VerifyError with no recovery.
+     * Patching _major_version to 50 (Java 6) here forces the old type-inference
+     * verifier for any class that hasn't been linked yet, which ignores the
+     * stackmap entirely and infers types from bytecode flow.
+     * For already-linked classes this field is never re-consulted, so the change
+     * is invisible at runtime.
+     *
+     * ConstantPool::_major_version was removed from VMStructs in JDK 11+.
+     * Fallback: scan the CP header for the native-LE u2 pattern [MV, 0] where
+     * MV ∈ [45,67], adjacent u2 == 0 (minor_version).  Known 8-byte pointer
+     * regions (tags / cache / pool_holder / operands / resolved_klasses) and
+     * the 4-byte _length field are skipped to minimise false positives. */
+    int64_t mvOff = structOffset("ConstantPool", "_major_version");
+    if (!needLegacyVerifierBypass) {
+        FVM_LOG("buildPoolBytes: _major_version preserved (all hooks rebuilt StackMapTable)");
+    } else if (mvOff >= 0 && (size_t)(mvOff + 2) <= nb.size()) {
+        uint16_t v50 = 50;
+        memcpy(nb.data() + mvOff, &v50, 2);
+        FVM_LOG("buildPoolBytes: _major_version→50 via VMStructs off=%lld", (long long)mvOff);
+    } else if (cpHeaderSize >= 4) {
+        int64_t phOff  = structOffset("ConstantPool", "_pool_holder");
+        int64_t opOff  = structOffset("ConstantPool", "_operands");
+        /* pointer-field regions to skip (8 bytes each) */
+        int64_t ptrFlds[] = { tagsOff, cacheOff, phOff, opOff, rkOff };
+        int64_t probeEnd = cpHeaderSize < (int64_t)nb.size() - 3
+                         ? cpHeaderSize : (int64_t)nb.size() - 3;
+        bool patched = false;
+        for (int64_t off = 8; !patched && off + 4 <= probeEnd; off += 2) {
+            bool skip = false;
+            for (int64_t pf : ptrFlds)
+                if (pf >= 0 && off >= pf && off < pf + 8) { skip = true; break; }
+            if (!skip && lenOff >= 0 && off >= lenOff && off < lenOff + 4) skip = true;
+            if (skip) continue;
+            /* native little-endian u16 reads */
+            uint16_t v0 = (uint16_t)nb[off]   | ((uint16_t)nb[off+1] << 8);
+            uint16_t v1 = (uint16_t)nb[off+2] | ((uint16_t)nb[off+3] << 8);
+            int64_t  mvOff2   = -1;
+            uint16_t found_mv = 0;
+            /* major first (HotSpot layout), minor first (fallback) */
+            if      (v0 >= 45 && v0 <= 67 && (v1 == 0 || v1 == 0xFFFF))
+                { mvOff2 = off;     found_mv = v0; }
+            else if (v1 >= 45 && v1 <= 67 && (v0 == 0 || v0 == 0xFFFF))
+                { mvOff2 = off + 2; found_mv = v1; }
+            if (mvOff2 < 0) continue;
+            FVM_LOG("buildPoolBytes: probed _major_version=%u at off=%lld",
+                    (unsigned)found_mv, (long long)mvOff2);
+            if (found_mv >= 51) {
+                uint16_t v50 = 50;
+                memcpy(nb.data() + mvOff2, &v50, 2);
+                FVM_LOG("buildPoolBytes: _major_version→50 via probe");
+            }
+            patched = true;
+        }
+        if (!patched)
+            FVM_LOG("buildPoolBytes: WARN _major_version not found in CP header "
+                    "(off range [8,%lld]) — split verifier may reject unlinked patched classes",
+                    (long long)probeEnd);
+    }
 
     uint64_t* slots = (uint64_t*)(nb.data() + cpHeaderSize);
     for (auto& h : hooks) {
@@ -3536,7 +1902,7 @@ static std::vector<uint8_t> buildMergedPoolBytes(
         slots[P+18] = (uint64_t)(((uint32_t)(P+14) << 16) | (uint32_t)(P+11));
         slots[P+19] = (uint64_t)(((uint32_t)(P+15) << 16) | (uint32_t)(P+11));
 
-        if (h.hasArgCapture && !h.targetParams.empty()) {
+        if (h.wantObjectCpEntry()) {
             slots[P+E]   = h.symObjectClass;
             slots[P+E+1] = (uint64_t)(((uint32_t)(P+E) << 16) | (uint32_t)h.objectClassRKIdx);
             E += 2;
@@ -3550,15 +1916,19 @@ static std::vector<uint8_t> buildMergedPoolBytes(
             slots[P+E+5] = (uint64_t)(((uint32_t)(P+E+4) << 16) | (uint32_t)(P+E+3));
             E += 6;
         }
+        for (auto& ex : h.extraClasses) {
+            slots[ex.nameCpIdx]  = ex.symbolAddr;
+            slots[ex.classCpIdx] = (uint64_t)(((uint32_t)ex.nameCpIdx << 16) | (uint32_t)ex.rkIdx);
+        }
     }
     return nb;
 }
 
 /* Build tags array from TRUE oldCP₀ tags + new hook tags. */
-static std::vector<uint8_t> buildMergedTagsBytes(
+static std::vector<uint8_t> buildPoolTagsBytes(
     HANDLE proc, uint64_t origTagsAddr,
     uint32_t newPoolLen,
-    const std::vector<MergeHookData>& hooks)
+    const std::vector<HookData>& hooks)
 {
     int64_t tagLenOff  = structOffset("Array<u1>", "_length");  if (tagLenOff  < 0) tagLenOff  = 0;
     int64_t tagDataOff = structOffset("Array<u1>", "_data");    if (tagDataOff < 0) tagDataOff = 4;
@@ -3583,14 +1953,18 @@ static std::vector<uint8_t> buildMergedTagsBytes(
         td[P+10]=7; td[P+11]=7;
         td[P+12]=12; td[P+13]=12; td[P+14]=12; td[P+15]=12;
         td[P+16]=10; td[P+17]=10; td[P+18]=10; td[P+19]=10;
-        if (h.hasArgCapture && !h.targetParams.empty()) { td[P+E]=1; td[P+E+1]=7; E+=2; }
+        if (h.wantObjectCpEntry()) { td[P+E]=1; td[P+E+1]=7; E+=2; }
         if (h.needsUnbox) { td[P+E]=1; td[P+E+1]=1; td[P+E+2]=1; td[P+E+3]=7; td[P+E+4]=12; td[P+E+5]=10; E+=6; }
+        for (auto& ex : h.extraClasses) {
+            td[ex.nameCpIdx]  = 1;
+            td[ex.classCpIdx] = 7;
+        }
     }
     return tb;
 }
 
 /* Build RK array from TRUE oldCP₀ RK + new hook entries. */
-static std::vector<uint8_t> buildMergedRKBytes(
+static std::vector<uint8_t> buildPoolRKBytes(
     HANDLE proc, uint64_t origRKAddr, int32_t origRKLen, int32_t newRKLen)
 {
     int64_t rkLenOff  = structOffset("Array<Klass*>", "_length"); if (rkLenOff  < 0) rkLenOff  = 0;
@@ -3607,10 +1981,10 @@ static std::vector<uint8_t> buildMergedRKBytes(
 /* Fill pre-resolved tail entries into the CPCache byte buffer (already sized for
    origCacheLen + total new entries; prefix [0, origCacheLen) left for post-suspend
    snapshot). */
-static void fillMergedCacheTail(
+static void fillPoolCacheTail(
     std::vector<uint8_t>& cacheBytes,
     int64_t cacheHdrSize, int64_t cacheEntrySize,
-    const std::vector<MergeHookData>& hooks)
+    const std::vector<HookData>& hooks)
 {
     int64_t iOff = structOffset("ConstantPoolCacheEntry", "_indices"); if (iOff < 0) iOff = 0;
     int64_t fOff = structOffset("ConstantPoolCacheEntry", "_f1");      if (fOff < 0) fOff = 8;
@@ -3655,13 +2029,981 @@ static void fillMergedCacheTail(
     }
 }
 
-/* Build the new ConstMethod bytes for a single hook.
-   Replicates the bytecode-injection logic from applyTransform as a standalone
-   function so the merged-CP path can call it N times without re-entering applyTransform. */
-static bool buildMergedHookCM(MergeHookData& h, uint64_t newPoolRemoteAddr) {
+/* ============================================================
+ * StackMapTable rebuild for goto_w-trampoline HEAD injection.
+ *
+ * Layout: [goto_w → tailBCI][nop pad up to bci J][orig[J..end) verbatim]
+ *         [prologue @ tailBCI ... ifeq → pop @ popBci]
+ *         [rescued copy of orig[0..J) with branches rebased][goto J]
+ *
+ * Where J is the bci of the first original StackMapTable frame (or
+ * origBytecode.size() when the method has no frames). With this choice every
+ * original bci ≥ J is preserved verbatim in the new bytecode, so any trailing
+ * ConstMethod section that carries a bci (LocalVariableTable, exception_table,
+ * LineNumberTable) remains valid without rebasing.
+ *
+ * New StackMapTable contents:
+ *   • All original frames verbatim — their absolute bcis are unchanged, so the
+ *     first frame's offset_delta (== J) and every subsequent frame's delta are
+ *     copied byte-for-byte.
+ *   • full_frame @ tailBCI: locals describe the method-entry frame derived from
+ *     the method descriptor + ACC_STATIC. Reference slots are encoded as
+ *     ITEM_Null (subtype of every reference type ⇒ verifier accepts it for
+ *     aload / aastore / invokespecial-receiver), so we avoid synthesizing a CP
+ *     entry for the declaring class. Primitives map to ITEM_Integer / Long /
+ *     Float / Double per JVMS §4.10.1.2.
+ *   • same_locals_1_stack_item_extended @ popBci: ifeq branch target, locals
+ *     inherited from tailBCI's full_frame, stack=[ ITEM_Object(FvmCallback) ].
+ *
+ * Frames at fall-through bcis (rescuedBCI, J) need no explicit entry; the
+ * verifier walks instructions from the nearest explicit frame.
+ *
+ * StackMapTable is class-file byte order: all u2 are BIG-ENDIAN.
+ * ============================================================ */
+
+static inline uint16_t smReadU2BE(const uint8_t* p) {
+    return (uint16_t)((uint16_t)p[0] << 8 | (uint16_t)p[1]);
+}
+static inline void smPushU2BE(std::vector<uint8_t>& o, uint16_t v) {
+    o.push_back((uint8_t)(v >> 8)); o.push_back((uint8_t)(v & 0xFF));
+}
+
+/* Length in bytes of one verification_type_info at buf[pos]. 0 = malformed. */
+static size_t smVtiLen(const std::vector<uint8_t>& buf, size_t pos) {
+    if (pos >= buf.size()) return 0;
+    uint8_t tag = buf[pos];
+    if (tag <= 6) return 1;          /* Top/Int/Float/Double/Long/Null/UninitThis */
+    if (tag == 7 || tag == 8) return 3; /* Object(cp u2) / Uninitialized(bci u2) */
+    return 0;                        /* invalid tag */
+}
+
+/* Parse one stack_map_frame at src@pos: extract offset_delta, total byte
+   length, and the [start,end) span of its verification_type_info content.
+   Returns false on malformed input. */
+struct SmFrameInfo {
+    uint16_t tag;
+    uint16_t offsetDelta;
+    size_t   totalLen;     /* full frame size in bytes */
+    size_t   vtiStart;     /* first vti byte (or == frameEnd if none) */
+    size_t   vtiEnd;       /* one past last vti byte */
+};
+static bool smParseFrame(const std::vector<uint8_t>& src, size_t pos, SmFrameInfo& fi) {
+    if (pos >= src.size()) return false;
+    uint8_t tag = src[pos];
+    fi.tag = tag;
+    if (tag <= 63) {                              /* same_frame */
+        fi.offsetDelta = tag; fi.totalLen = 1;
+        fi.vtiStart = fi.vtiEnd = pos + 1; return true;
+    }
+    if (tag >= 64 && tag <= 127) {                /* same_locals_1_stack_item */
+        fi.offsetDelta = (uint16_t)(tag - 64);
+        size_t vl = smVtiLen(src, pos + 1); if (!vl) return false;
+        fi.totalLen = 1 + vl; fi.vtiStart = pos + 1; fi.vtiEnd = pos + 1 + vl;
+        return true;
+    }
+    if (tag == 247) {                             /* same_locals_1_stack_item_extended */
+        if (pos + 3 > src.size()) return false;
+        fi.offsetDelta = smReadU2BE(&src[pos + 1]);
+        size_t vl = smVtiLen(src, pos + 3); if (!vl) return false;
+        fi.totalLen = 3 + vl; fi.vtiStart = pos + 3; fi.vtiEnd = pos + 3 + vl;
+        return true;
+    }
+    if (tag >= 248 && tag <= 250) {               /* chop_frame */
+        if (pos + 3 > src.size()) return false;
+        fi.offsetDelta = smReadU2BE(&src[pos + 1]);
+        fi.totalLen = 3; fi.vtiStart = fi.vtiEnd = pos + 3; return true;
+    }
+    if (tag == 251) {                             /* same_frame_extended */
+        if (pos + 3 > src.size()) return false;
+        fi.offsetDelta = smReadU2BE(&src[pos + 1]);
+        fi.totalLen = 3; fi.vtiStart = fi.vtiEnd = pos + 3; return true;
+    }
+    if (tag >= 252 && tag <= 254) {               /* append_frame */
+        if (pos + 3 > src.size()) return false;
+        fi.offsetDelta = smReadU2BE(&src[pos + 1]);
+        int nLocals = tag - 251;
+        size_t p = pos + 3;
+        for (int i = 0; i < nLocals; i++) {
+            size_t vl = smVtiLen(src, p); if (!vl || p + vl > src.size()) return false;
+            p += vl;
+        }
+        fi.totalLen = p - pos; fi.vtiStart = pos + 3; fi.vtiEnd = p; return true;
+    }
+    if (tag == 255) {                             /* full_frame */
+        if (pos + 3 > src.size()) return false;
+        fi.offsetDelta = smReadU2BE(&src[pos + 1]);
+        size_t p = pos + 3;
+        if (p + 2 > src.size()) return false;
+        uint16_t nLoc = smReadU2BE(&src[p]); p += 2;
+        for (int i = 0; i < nLoc; i++) {
+            size_t vl = smVtiLen(src, p); if (!vl || p + vl > src.size()) return false;
+            p += vl;
+        }
+        if (p + 2 > src.size()) return false;
+        uint16_t nStk = smReadU2BE(&src[p]); p += 2;
+        for (int i = 0; i < nStk; i++) {
+            size_t vl = smVtiLen(src, p); if (!vl || p + vl > src.size()) return false;
+            p += vl;
+        }
+        fi.totalLen = p - pos; fi.vtiStart = pos + 3; fi.vtiEnd = p; return true;
+    }
+    return false;  /* reserved/invalid tag range 128..246 */
+}
+
+/* ============================================================
+ * Route-2 helper zone: CP readers, extra-class registry, abstract
+ * interpretation, match helpers, stack-prefix VTI builders, and
+ * pre-resolve scan for INVOKE / FIELD_GET / FIELD_PUT / NEW.
+ * ============================================================ */
+
+static bool readCPSlotU8(uint64_t cpAddr, int64_t cpHdrSize, uint16_t idx, uint64_t* outU8) {
+    if (idx == 0) return false;
+    uint64_t slotAddr = cpAddr + (uint64_t)cpHdrSize + (uint64_t)idx * 8;
+    return readRemoteMem(g_target.handle, slotAddr, outU8, 8);
+}
+
+static bool readCPMethodOrFieldRef(uint64_t cpAddr, int64_t cpHdrSize, uint16_t idx,
+                                    uint16_t* outClassIdx, uint16_t* outNameIdx,
+                                    uint16_t* outDescIdx) {
+    uint64_t slot;
+    if (!readCPSlotU8(cpAddr, cpHdrSize, idx, &slot)) return false;
+    uint16_t classIdx = (uint16_t)( slot        & 0xFFFF);
+    uint16_t natIdx   = (uint16_t)((slot >> 16) & 0xFFFF);
+    if (classIdx == 0 || natIdx == 0) return false;
+    uint64_t natSlot;
+    if (!readCPSlotU8(cpAddr, cpHdrSize, natIdx, &natSlot)) return false;
+    uint16_t nameIdx = (uint16_t)( natSlot        & 0xFFFF);
+    uint16_t descIdx = (uint16_t)((natSlot >> 16) & 0xFFFF);
+    if (nameIdx == 0 || descIdx == 0) return false;
+    *outClassIdx = classIdx; *outNameIdx = nameIdx; *outDescIdx = descIdx;
+    return true;
+}
+
+static bool readCPClassNameIdx(uint64_t cpAddr, int64_t cpHdrSize, uint16_t idx,
+                                uint16_t* outNameIdx) {
+    uint64_t slot;
+    if (!readCPSlotU8(cpAddr, cpHdrSize, idx, &slot)) return false;
+    *outNameIdx = (uint16_t)((slot >> 16) & 0xFFFF);
+    return (*outNameIdx != 0);
+}
+
+static bool readCPUtf8Symbol(uint64_t cpAddr, int64_t cpHdrSize, uint16_t idx,
+                              uint64_t* outSymbolAddr) {
+    return readCPSlotU8(cpAddr, cpHdrSize, idx, outSymbolAddr) && *outSymbolAddr != 0;
+}
+
+static bool readCPMethodNameDesc(uint64_t cpAddr, int64_t cpHdrSize, uint16_t mrefIdx,
+                                  std::string* outName, std::string* outDesc) {
+    uint16_t ci, ni, di;
+    if (!readCPMethodOrFieldRef(cpAddr, cpHdrSize, mrefIdx, &ci, &ni, &di)) return false;
+    uint64_t nameSym, descSym;
+    if (!readCPUtf8Symbol(cpAddr, cpHdrSize, ni, &nameSym)) return false;
+    if (!readCPUtf8Symbol(cpAddr, cpHdrSize, di, &descSym)) return false;
+    if (!readSymbolBody(g_target.handle, nameSym, outName)) return false;
+    if (!readSymbolBody(g_target.handle, descSym, outDesc)) return false;
+    return true;
+}
+
+static bool readCPClassName(uint64_t cpAddr, int64_t cpHdrSize, uint16_t classIdx,
+                             std::string* outInternalName) {
+    uint16_t ni;
+    if (!readCPClassNameIdx(cpAddr, cpHdrSize, classIdx, &ni)) return false;
+    uint64_t nameSym;
+    if (!readCPUtf8Symbol(cpAddr, cpHdrSize, ni, &nameSym)) return false;
+    return readSymbolBody(g_target.handle, nameSym, outInternalName);
+}
+
+static int registerExtraClass(HookData& h, const std::string& internalName) {
+    for (size_t i = 0; i < h.extraClasses.size(); i++)
+        if (h.extraClasses[i].internalName == internalName) return (int)i;
+    HookData::ExtraClassEntry e;
+    e.internalName = internalName;
+    if (!findInstanceKlassByName(internalName, &e.klassAddr)) return -1;
+    e.symbolAddr = readKlassNameSymbol(e.klassAddr);
+    if (e.symbolAddr == 0) return -1;
+    h.extraClasses.push_back(e);
+    return (int)(h.extraClasses.size() - 1);
+}
+
+static bool methodHasExceptionTable(uint64_t origConstMethodAddr) {
+    int64_t flagsOff = structOffset("ConstMethod", "_flags");
+    if (flagsOff < 0) return false;
+    uint16_t flags = 0;
+    if (!readRemoteU16(g_target.handle, origConstMethodAddr + (uint64_t)flagsOff, &flags))
+        return false;
+    return (flags & 0x0008) != 0;
+}
+
+static uint64_t readOrigCMConstants(uint64_t origConstMethodAddr) {
+    int64_t cmcOff = structOffset("ConstMethod", "_constants");
+    if (cmcOff < 0) cmcOff = 8;
+    uint64_t cp = 0;
+    readRemotePointer(g_target.handle, origConstMethodAddr + (uint64_t)cmcOff, &cp);
+    return cp;
+}
+
+static bool matchInvokeTarget(const std::string& spec, const std::string& aName,
+                               const std::string& aDesc) {
+    size_t lp = spec.find('(');
+    if (lp == std::string::npos) return spec == aName;
+    if (spec.substr(0, lp) != aName) return false;
+    std::string sTail = spec.substr(lp);
+    if (sTail.size() > aDesc.size()) return false;
+    return aDesc.compare(0, sTail.size(), sTail) == 0;
+}
+
+static bool matchFieldTarget(const std::string& spec, const std::string& aName,
+                              const std::string& aDesc) {
+    size_t cp = spec.find(':');
+    if (cp == std::string::npos) return spec == aName;
+    return spec.substr(0, cp) == aName && spec.substr(cp + 1) == aDesc;
+}
+
+static bool matchClassName(const std::string& spec, const std::string& aInternal) {
+    std::string s = spec;
+    for (char& c : s) if (c == '.') c = '/';
+    return s == aInternal;
+}
+
+/* Per-opcode stack delta. INT32_MIN = data-dependent, handled by caller. */
+static int stackDeltaForOp(uint8_t op) {
+    switch (op) {
+    case 0x00: return 0;  /* nop */
+    /* constants */
+    case 0x01: return 1;  /* aconst_null */
+    case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: return 1; /* iconst */
+    case 0x09: case 0x0A: return 2; /* lconst */
+    case 0x0B: case 0x0C: case 0x0D: return 1; /* fconst */
+    case 0x0E: case 0x0F: return 2; /* dconst */
+    case 0x10: return 1;  /* bipush */
+    case 0x11: return 1;  /* sipush */
+    case 0x12: return 1;  /* ldc */
+    case 0x13: return 1;  /* ldc_w */
+    case 0x14: return 2;  /* ldc2_w */
+    /* loads */
+    case 0x15: case 0x17: case 0x19: return 1; /* iload, fload, aload */
+    case 0x16: case 0x18: return 2; /* lload, dload */
+    case 0x1A: case 0x1B: case 0x1C: case 0x1D: return 1; /* iload_N */
+    case 0x1E: case 0x1F: case 0x20: case 0x21: return 2; /* lload_N */
+    case 0x22: case 0x23: case 0x24: case 0x25: return 1; /* fload_N */
+    case 0x26: case 0x27: case 0x28: case 0x29: return 2; /* dload_N */
+    case 0x2A: case 0x2B: case 0x2C: case 0x2D: return 1; /* aload_N */
+    /* array loads: pop array+idx(2), push element */
+    case 0x2E: case 0x30: return -1; /* iaload/faload: push 1-slot val */
+    case 0x32: case 0x33: case 0x34: case 0x35: return -1; /* aaload/baload/caload/saload */
+    case 0x2F: case 0x31: return 0;  /* laload/daload: pop 2, push 2 */
+    /* stores */
+    case 0x36: case 0x38: case 0x3A: return -1; /* istore, fstore, astore */
+    case 0x37: case 0x39: return -2; /* lstore, dstore */
+    case 0x3B: case 0x3C: case 0x3D: case 0x3E: return -1; /* istore_N */
+    case 0x3F: case 0x40: case 0x41: case 0x42: return -2; /* lstore_N */
+    case 0x43: case 0x44: case 0x45: case 0x46: return -1; /* fstore_N */
+    case 0x47: case 0x48: case 0x49: case 0x4A: return -2; /* dstore_N */
+    case 0x4B: case 0x4C: case 0x4D: case 0x4E: return -1; /* astore_N */
+    /* array stores */
+    case 0x4F: case 0x51: case 0x53: case 0x54: case 0x55: case 0x56: return -3; /* iastore/fastore/aastore/bastore/castore/sastore */
+    case 0x50: case 0x52: return -4; /* lastore, dastore */
+    /* stack */
+    case 0x57: return -1; /* pop */
+    case 0x58: return -2; /* pop2 */
+    case 0x59: return 1;  /* dup */
+    case 0x5A: return 1;  /* dup_x1 */
+    case 0x5B: return 1;  /* dup_x2 */
+    case 0x5C: return 2;  /* dup2 */
+    case 0x5D: return 2;  /* dup2_x1 */
+    case 0x5E: return 2;  /* dup2_x2 */
+    case 0x5F: return 0;  /* swap */
+    /* arithmetic (int/float: pop 2 push 1 = -1; long/double: pop 4 push 2 = -2) */
+    case 0x60: case 0x62: case 0x64: case 0x66: return -1; /* iadd fadd isub fsub */
+    case 0x61: case 0x63: case 0x65: case 0x67: return -2; /* ladd dadd lsub dsub */
+    case 0x68: case 0x6A: case 0x6C: case 0x6E: return -1; /* imul fmul idiv fdiv */
+    case 0x69: case 0x6B: case 0x6D: case 0x6F: return -2; /* lmul dmul ldiv ddiv */
+    case 0x70: case 0x72: return -1; /* irem frem */
+    case 0x71: case 0x73: return -2; /* lrem drem */
+    case 0x74: case 0x76: return 0;  /* ineg fneg (pop 1 push 1) */
+    case 0x75: case 0x77: return 0;  /* lneg dneg (pop 2 push 2) */
+    case 0x78: case 0x7A: case 0x7C: return -1; /* ishl ishr iushr */
+    case 0x79: case 0x7B: case 0x7D: return -1; /* lshl/lshr/lushr: pop long(2)+int(1)=3, push long(2), net=-1 */
+    case 0x7E: return -1; /* iand */
+    case 0x7F: return -2; /* land: pop 4, push 2 = -2 */
+    case 0x80: return -1; /* ior */
+    case 0x81: return -2; /* lor */
+    case 0x82: return -1; /* ixor */
+    case 0x83: return -2; /* lxor */
+    case 0x84: return 0;  /* iinc */
+    /* conversions */
+    case 0x85: return 1;  /* i2l */
+    case 0x86: return 0;  /* i2f */
+    case 0x87: return 1;  /* i2d */
+    case 0x88: return -1; /* l2i */
+    case 0x89: return -1; /* l2f */
+    case 0x8A: return 0;  /* l2d */
+    case 0x8B: return 0;  /* f2i */
+    case 0x8C: return 1;  /* f2l */
+    case 0x8D: return 1;  /* f2d */
+    case 0x8E: return -1; /* d2i */
+    case 0x8F: return -1; /* d2f */
+    case 0x90: return 0;  /* d2l: pop double(2) push long(2) = 0... actually -2+2=0 */
+    case 0x91: return 0;  /* i2b */
+    case 0x92: return 0;  /* i2c */
+    case 0x93: return 0;  /* i2s */
+    /* comparisons */
+    case 0x94: return -3; /* lcmp: pop 2J push I = -4+1=-3 */
+    case 0x95: case 0x96: return -1; /* fcmpl/fcmpg */
+    case 0x97: case 0x98: return -3; /* dcmpl/dcmpg: pop 2D push I = -4+1=-3 */
+    /* conditional branches (pop 1 or 2) */
+    case 0x99: case 0x9A: case 0x9B: case 0x9C: case 0x9D: case 0x9E: return -1; /* ifeq..ifle */
+    case 0x9F: case 0xA0: case 0xA1: case 0xA2: case 0xA3: case 0xA4: return -2; /* if_icmp* */
+    case 0xA5: case 0xA6: return -2; /* if_acmpeq/ne */
+    case 0xC6: case 0xC7: return -1; /* ifnull/ifnonnull */
+    /* unconditional branches */
+    case 0xA7: return 0;  /* goto */
+    case 0xC8: return 0;  /* goto_w */
+    /* returns — treated as terminators by caller */
+    case 0xAC: case 0xAE: case 0xB0: return -1; /* ireturn freturn areturn */
+    case 0xAD: case 0xAF: return -2; /* lreturn dreturn */
+    case 0xB1: return 0;  /* return */
+    /* field/invoke/new — data-dependent */
+    case 0xB2: case 0xB3: case 0xB4: case 0xB5: return INT32_MIN;
+    case 0xB6: case 0xB7: case 0xB8: case 0xB9: case 0xBA: return INT32_MIN;
+    case 0xBB: return 1;  /* new */
+    case 0xBC: return 0;  /* newarray: pop int push array = 0 */
+    case 0xBD: return 0;  /* anewarray */
+    case 0xBE: return 0;  /* arraylength: pop arr push int = 0 */
+    case 0xBF: return INT32_MIN; /* athrow — terminator */
+    case 0xC0: return 0;  /* checkcast */
+    case 0xC1: return 0;  /* instanceof */
+    case 0xC2: case 0xC3: return -1; /* monitorenter/exit */
+    case 0xC4: return INT32_MIN; /* wide — fail-fast */
+    case 0xC5: return INT32_MIN; /* multianewarray — data-dependent */
+    case 0xC9: return INT32_MIN; /* jsr_w — fail-fast */
+    case 0xA8: case 0xA9: return INT32_MIN; /* jsr/ret — fail-fast */
+    case 0xAA: case 0xAB: return INT32_MIN; /* tableswitch/lookupswitch — fail-fast */
+    default:
+        return INT32_MIN;
+    }
+}
+
+/* Compute the stack depth (in slots) at targetBci by abstract interpretation
+   starting from the nearest StackMapTable frame at bci ≤ targetBci. */
+static bool computeStackDepthAtBci(const std::vector<uint8_t>& code,
+                                    const std::vector<uint8_t>& origSM,
+                                    uint64_t cpAddr, int64_t cpHdrSize,
+                                    size_t targetBci,
+                                    int* outStackDepth) {
+    /* Parse all frames, find the last one with abs bci ≤ targetBci. */
+    size_t startBci = 0;
+    int    startDepth = 0;
+
+    if (origSM.size() >= 2) {
+        uint16_t fc = smReadU2BE(&origSM[0]);
+        size_t pos = 2;
+        uint32_t abs_ = 0;
+        for (uint16_t i = 0; i < fc; i++) {
+            SmFrameInfo fi;
+            if (!smParseFrame(origSM, pos, fi)) {
+                setError("inject_abstract_interp_smt_parse_failed"); return false;
+            }
+            uint32_t thisBci = (i == 0) ? fi.offsetDelta : (abs_ + (uint32_t)fi.offsetDelta + 1);
+            abs_ = thisBci;
+
+            if (thisBci <= (uint32_t)targetBci) {
+                startBci = (size_t)thisBci;
+                /* Count stack items in this frame (Long/Double each count as 1 VTI). */
+                startDepth = 0;
+                if (fi.tag >= 64 && fi.tag <= 127) {
+                    startDepth = 1; /* same_locals_1_stack_item: always 1 stack item at entry */
+                    /* Actually at frame entry stack has 1 item */
+                    startDepth = 1;
+                } else if (fi.tag == 247) {
+                    startDepth = 1;
+                } else if (fi.tag == 255) {
+                    /* full_frame: read stack count from vti payload */
+                    /* vtiStart points after locals count+vtis; we need to skip locals */
+                    size_t p = fi.vtiStart;
+                    /* Skip locals u2 + locals vtis (already accounted for in vtiStart) */
+                    /* Actually for full_frame vtiStart is after tag+offsetDelta, before locals_count */
+                    /* Re-read: smParseFrame sets vtiStart = pos + 3 (after tag+offsetDelta)
+                       for full_frame. From that point: u2 nLoc, nLoc vtis, u2 nStk, nStk vtis. */
+                    if (p + 2 <= origSM.size()) {
+                        uint16_t nLoc = smReadU2BE(&origSM[p]); p += 2;
+                        for (int j = 0; j < nLoc; j++) {
+                            size_t vl = smVtiLen(origSM, p);
+                            if (!vl) { setError("inject_abstract_interp_smt_parse_failed"); return false; }
+                            p += vl;
+                        }
+                        if (p + 2 <= origSM.size()) {
+                            uint16_t nStk = smReadU2BE(&origSM[p]); p += 2;
+                            startDepth = 0;
+                            for (int j = 0; j < nStk; j++) {
+                                size_t vl = smVtiLen(origSM, p);
+                                if (!vl) { setError("inject_abstract_interp_smt_parse_failed"); return false; }
+                                /* Long/Double VTI tag 4 or 3 still counts as 1 VTI but 2 slots */
+                                if (p < origSM.size()) {
+                                    uint8_t vtag = origSM[p];
+                                    startDepth += (vtag == 4 || vtag == 3) ? 2 : 1;
+                                }
+                                p += vl;
+                            }
+                        }
+                    }
+                } else {
+                    startDepth = 0; /* same_frame / chop / append — stack is empty at entry */
+                }
+            } else {
+                break; /* frames past targetBci */
+            }
+            pos += fi.totalLen;
+        }
+    }
+
+    /* Walk from startBci to targetBci, accumulating stack depth. */
+    int depth = startDepth;
+    static const int8_t bcL2[256] = {
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 2,3,2,3,3,2,2,2,2,2,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,2,2,2,2,2,1,1,1,1,1,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+        1,1,1,1,3,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,
+        3,3,3,3,3,3,3,3,3,2,-1,-1,1,1,1,1, 1,1,3,3,3,3,3,3,3,5,5,3,2,3,1,1,
+        3,3,1,1,-1,4,3,3,5,5,1,3,3,3,3,3, 3,3,3,3,3,3,3,3,3,3,3,3,1,4,4,4,
+        2,4,3,3,-1,-1,2,3,1,3,3,3,1,2,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    };
+    auto getL2 = [&](size_t off) -> int {
+        if (off >= code.size()) return -1;
+        uint8_t op = code[off];
+        if (op == 0xAA) { int pad=(4-((off+1)%4))%4; if(off+1+pad+12>code.size()) return -1;
+            int32_t lo,hi; memcpy(&lo,&code[off+1+pad+4],4); lo=_byteswap_ulong(lo);
+            memcpy(&hi,&code[off+1+pad+8],4); hi=_byteswap_ulong(hi);
+            return 1+pad+12+(hi-lo+1)*4; }
+        if (op==0xAB) { int pad=(4-((off+1)%4))%4; if(off+1+pad+8>code.size()) return -1;
+            int32_t np; memcpy(&np,&code[off+1+pad+4],4); np=_byteswap_ulong(np);
+            return 1+pad+8+np*8; }
+        if (op==0xC4) { if(off+1>=code.size()) return -1; return code[off+1]==0x84?6:4; }
+        int l = bcL2[op]; return l > 0 ? l : 1;
+    };
+
+    /* Parse a single JVM type char at desc[pos] and return its slot count; advance pos. */
+    auto descTypeSlots = [](const std::string& desc, size_t& pos) -> int {
+        if (pos >= desc.size()) return 0;
+        char c = desc[pos++];
+        if (c == 'J' || c == 'D') return 2;
+        if (c == 'L') { while (pos < desc.size() && desc[pos] != ';') pos++; if (pos < desc.size()) pos++; return 1; }
+        if (c == '[') {
+            while (pos < desc.size() && desc[pos] == '[') pos++;
+            if (pos < desc.size() && desc[pos] == 'L') { while (pos < desc.size() && desc[pos] != ';') pos++; if (pos < desc.size()) pos++; }
+            else if (pos < desc.size()) pos++;
+            return 1;
+        }
+        return 1; /* Z B C S I F */
+    };
+
+    for (size_t off = startBci; off < targetBci;) {
+        if (off >= code.size()) { setError("inject_abstract_interp_out_of_bounds"); return false; }
+        uint8_t op = code[off];
+        int len = getL2(off); if (len <= 0) { setError("inject_abstract_interp_decode_failed"); return false; }
+
+        /* Terminators before targetBci → unreachable */
+        if ((op >= 0xAC && op <= 0xB1) || op == 0xBF) {
+            setError("inject_abstract_interp_unreachable_target"); return false;
+        }
+
+        /* fail-fast unsupported in cover zone */
+        if (op == 0xAA || op == 0xAB || op == 0xC4 || op == 0xA8 || op == 0xA9 || op == 0xC9) {
+            setError("inject_abstract_interp_unsupported_opcode"); return false;
+        }
+
+        /* forward goto: check if it skips past targetBci */
+        if (op == 0xA7 && off + 2 < code.size()) {
+            int16_t br = (int16_t)(((uint16_t)code[off+1] << 8) | code[off+2]);
+            if (br < 0) { setError("inject_abstract_interp_back_branch"); return false; }
+            size_t dst = off + (size_t)(int)br;
+            if (dst > targetBci) { setError("inject_abstract_interp_back_branch"); return false; }
+            off += (size_t)len; continue;
+        }
+        if (op == 0xC8 && off + 4 < code.size()) {
+            int32_t br = (int32_t)(((uint32_t)code[off+1]<<24)|((uint32_t)code[off+2]<<16)|((uint32_t)code[off+3]<<8)|(uint32_t)code[off+4]);
+            if (br < 0) { setError("inject_abstract_interp_back_branch"); return false; }
+            size_t dst = off + (size_t)(int32_t)br;
+            if (dst > targetBci) { setError("inject_abstract_interp_back_branch"); return false; }
+            off += (size_t)len; continue;
+        }
+        /* conditional branches: don't follow, continue straight */
+        if ((op >= 0x99 && op <= 0xA6) || op == 0xC6 || op == 0xC7) {
+            /* check for backward branch target */
+            if (off + 2 < code.size()) {
+                int16_t br = (int16_t)(((uint16_t)code[off+1] << 8) | code[off+2]);
+                if ((int)off + (int)br < 0) { setError("inject_abstract_interp_back_branch"); return false; }
+            }
+            depth += stackDeltaForOp(op);
+            off += (size_t)len; continue;
+        }
+
+        int delta = stackDeltaForOp(op);
+        if (delta != INT32_MIN) {
+            depth += delta;
+        } else {
+            /* Data-dependent opcodes */
+            if ((op >= 0xB6 && op <= 0xB9) || op == 0xBA) {
+                /* invoke* */
+                if (off + 2 < code.size()) {
+                    uint16_t cpIdx = ((uint16_t)code[off+1] << 8) | code[off+2];
+                    std::string mName, mDesc;
+                    if (readCPMethodNameDesc(cpAddr, cpHdrSize, cpIdx, &mName, &mDesc)) {
+                        size_t p = 1; /* skip '(' */
+                        int argSlots = 0;
+                        while (p < mDesc.size() && mDesc[p] != ')') argSlots += descTypeSlots(mDesc, p);
+                        int retSlots = 0;
+                        if (p < mDesc.size()) p++; /* skip ')' */
+                        if (p < mDesc.size() && mDesc[p] != 'V') retSlots = descTypeSlots(mDesc, p);
+                        int recv = (op == 0xB8) ? 0 : 1;
+                        depth += retSlots - argSlots - recv;
+                    }
+                }
+            } else if (op == 0xB4) { /* getfield */
+                if (off + 2 < code.size()) {
+                    uint16_t cpIdx = ((uint16_t)code[off+1] << 8) | code[off+2];
+                    std::string fn, fd; readCPMethodNameDesc(cpAddr, cpHdrSize, cpIdx, &fn, &fd);
+                    size_t p = 0; int fs = descTypeSlots(fd, p);
+                    depth += fs - 1;
+                }
+            } else if (op == 0xB2) { /* getstatic */
+                if (off + 2 < code.size()) {
+                    uint16_t cpIdx = ((uint16_t)code[off+1] << 8) | code[off+2];
+                    std::string fn, fd; readCPMethodNameDesc(cpAddr, cpHdrSize, cpIdx, &fn, &fd);
+                    size_t p = 0; int fs = descTypeSlots(fd, p);
+                    depth += fs;
+                }
+            } else if (op == 0xB5) { /* putfield */
+                if (off + 2 < code.size()) {
+                    uint16_t cpIdx = ((uint16_t)code[off+1] << 8) | code[off+2];
+                    std::string fn, fd; readCPMethodNameDesc(cpAddr, cpHdrSize, cpIdx, &fn, &fd);
+                    size_t p = 0; int fs = descTypeSlots(fd, p);
+                    depth += -1 - fs;
+                }
+            } else if (op == 0xB3) { /* putstatic */
+                if (off + 2 < code.size()) {
+                    uint16_t cpIdx = ((uint16_t)code[off+1] << 8) | code[off+2];
+                    std::string fn, fd; readCPMethodNameDesc(cpAddr, cpHdrSize, cpIdx, &fn, &fd);
+                    size_t p = 0; int fs = descTypeSlots(fd, p);
+                    depth += -fs;
+                }
+            } else if (op == 0xC5) { /* multianewarray */
+                if (off + 3 < code.size()) {
+                    int dim = code[off + 3];
+                    depth += 1 - dim;
+                }
+            } else if (op == 0xBF) {
+                break; /* athrow — terminator */
+            }
+        }
+        off += (size_t)len;
+    }
+    *outStackDepth = depth;
+    return true;
+}
+
+/* Pre-resolve injection targets: scan origBytecode for matching instructions,
+   register any required ref-type extra classes. Sets g_lastError on F1/F7. */
+static bool preResolveInjectionTargets(HookData& h, const std::string& kind,
+                                        const std::string& targetSpec) {
+    /* F1: method has exception table */
+    if (methodHasExceptionTable(h.origConstMethodAddr)) {
+        setError("head_invoke_field_new_exception_table_unsupported");
+        FVM_LOG("preResolveInjectionTargets: %s skipped %s%s — exception table present",
+                kind.c_str(), h.methodName.c_str(), h.paramDesc.c_str());
+        return false;
+    }
+
+    uint64_t cpAddr = readOrigCMConstants(h.origConstMethodAddr);
+    if (!cpAddr) return true; /* no CP → nothing to resolve; buildHookCM will fail-fast */
+    int64_t cpHdrSize = typeSize("ConstantPool"); if (cpHdrSize < 0) cpHdrSize = 0x138;
+
+    /* Helper: parse a single type from a descriptor string (L…;, […, prim). */
+    auto parseSingleInternalName = [](const std::string& typeStr) -> std::string {
+        if (typeStr.empty()) return "";
+        if (typeStr[0] == 'L') {
+            size_t end = typeStr.find(';');
+            if (end != std::string::npos) return typeStr.substr(1, end - 1);
+        }
+        if (typeStr[0] == '[') return typeStr; /* array descriptor itself */
+        return "";
+    };
+
+    /* Scan bytecode for candidate opcodes. */
+    for (size_t i = 0; i < h.origBytecode.size();) {
+        uint8_t op = h.origBytecode[i];
+
+        bool isCandidate = false;
+        if      (kind == "INVOKE")    isCandidate = (op==0xB6||op==0xB7||op==0xB8||op==0xB9);
+        else if (kind == "FIELD_GET") isCandidate = (op==0xB4||op==0xB2);
+        else if (kind == "FIELD_PUT") isCandidate = (op==0xB5||op==0xB3);
+        else if (kind == "NEW")       isCandidate = (op==0xBB);
+
+        if (!isCandidate || i + 2 >= h.origBytecode.size()) {
+            /* get instruction length */
+            uint8_t op2 = h.origBytecode[i];
+            int l2 = 1;
+            if (op2 == 0xAA) { int pad=(4-((i+1)%4))%4; int32_t hi,lo; if(i+1+pad+12<=h.origBytecode.size()){memcpy(&lo,&h.origBytecode[i+1+pad+4],4);lo=_byteswap_ulong(lo);memcpy(&hi,&h.origBytecode[i+1+pad+8],4);hi=_byteswap_ulong(hi);l2=1+pad+12+(hi-lo+1)*4;} }
+            else if (op2==0xAB) { int pad=(4-((i+1)%4))%4; int32_t np; if(i+1+pad+8<=h.origBytecode.size()){memcpy(&np,&h.origBytecode[i+1+pad+4],4);np=_byteswap_ulong(np);l2=1+pad+8+np*8;} }
+            else if (op2==0xC4) { if(i+1<h.origBytecode.size()) l2=h.origBytecode[i+1]==0x84?6:4; }
+            else { static const int8_t bL[256]={1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,3,2,3,3,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,3,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,2,-1,-1,1,1,1,1,1,1,3,3,3,3,3,3,3,5,5,3,2,3,1,1,3,3,1,1,-1,4,3,3,5,5,1,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,1,4,4,4,2,4,3,3,-1,-1,2,3,1,3,3,3,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1}; int v=bL[op2]; l2=v>0?v:1; }
+            i += (size_t)(l2 > 0 ? l2 : 1);
+            continue;
+        }
+
+        uint16_t cpIdx = ((uint16_t)h.origBytecode[i+1] << 8) | (uint16_t)h.origBytecode[i+2];
+        int instrLen = 1; /* will refine below */
+        {
+            uint8_t op3 = h.origBytecode[i];
+            if (op3==0xAA){int pad=(4-((i+1)%4))%4;int32_t lo,hi;if(i+1+pad+12<=h.origBytecode.size()){memcpy(&lo,&h.origBytecode[i+1+pad+4],4);lo=_byteswap_ulong(lo);memcpy(&hi,&h.origBytecode[i+1+pad+8],4);hi=_byteswap_ulong(hi);instrLen=1+pad+12+(hi-lo+1)*4;}}
+            else if(op3==0xAB){int pad=(4-((i+1)%4))%4;int32_t np;if(i+1+pad+8<=h.origBytecode.size()){memcpy(&np,&h.origBytecode[i+1+pad+4],4);np=_byteswap_ulong(np);instrLen=1+pad+8+np*8;}}
+            else if(op3==0xC4){if(i+1<h.origBytecode.size())instrLen=h.origBytecode[i+1]==0x84?6:4;}
+            else{static const int8_t bL[256]={1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,3,2,3,3,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,3,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,2,-1,-1,1,1,1,1,1,1,3,3,3,3,3,3,3,5,5,3,2,3,1,1,3,3,1,1,-1,4,3,3,5,5,1,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,1,4,4,4,2,4,3,3,-1,-1,2,3,1,3,3,3,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};int v=bL[op3];instrLen=v>0?v:1;}
+        }
+
+        bool matched = false;
+        if (kind == "INVOKE") {
+            std::string mName, mDesc;
+            if (!readCPMethodNameDesc(cpAddr, cpHdrSize, cpIdx, &mName, &mDesc)) {
+                i += (size_t)instrLen; continue;
+            }
+            if (matchInvokeTarget(targetSpec, mName, mDesc)) {
+                matched = true;
+                /* Register ref parameter types */
+                size_t p = 1;
+                while (p < mDesc.size() && mDesc[p] != ')') {
+                    char c = mDesc[p];
+                    std::string iname;
+                    if (c == 'L') {
+                        size_t e = mDesc.find(';', p); if (e == std::string::npos) break;
+                        iname = mDesc.substr(p + 1, e - p - 1); p = e + 1;
+                    } else if (c == '[') {
+                        size_t s = p;
+                        while (p < mDesc.size() && mDesc[p] == '[') p++;
+                        if (p < mDesc.size() && mDesc[p] == 'L') {
+                            size_t e = mDesc.find(';', p); if (e == std::string::npos) break;
+                            iname = mDesc.substr(s, e - s + 1); p = e + 1;
+                        } else if (p < mDesc.size()) {
+                            iname = mDesc.substr(s, p - s + 1); p++;
+                        }
+                    } else {
+                        if (c == 'J' || c == 'D') {} /* 2-slot prim, no extra class */
+                        p++;
+                        continue;
+                    }
+                    if (!iname.empty()) {
+                        int idx = registerExtraClass(h, iname);
+                        if (idx < 0) {
+                            setError("inject_extra_class_not_loaded:" + iname);
+                            FVM_LOG("preResolveInjectionTargets: INVOKE extra class not loaded: %s", iname.c_str());
+                            return false;
+                        }
+                    }
+                }
+            }
+        } else if (kind == "FIELD_GET") {
+            std::string fName, fDesc;
+            if (readCPMethodNameDesc(cpAddr, cpHdrSize, cpIdx, &fName, &fDesc))
+                matched = matchFieldTarget(targetSpec, fName, fDesc);
+            /* No extra classes needed for FIELD_GET */
+        } else if (kind == "FIELD_PUT") {
+            std::string fName, fDesc;
+            if (readCPMethodNameDesc(cpAddr, cpHdrSize, cpIdx, &fName, &fDesc) &&
+                matchFieldTarget(targetSpec, fName, fDesc)) {
+                matched = true;
+                /* Register value type if ref */
+                if (!fDesc.empty()) {
+                    std::string iname;
+                    if (fDesc[0] == 'L') {
+                        size_t e = fDesc.find(';'); if (e != std::string::npos) iname = fDesc.substr(1, e - 1);
+                    } else if (fDesc[0] == '[') {
+                        iname = fDesc; /* array descriptor */
+                    }
+                    if (!iname.empty()) {
+                        int idx = registerExtraClass(h, iname);
+                        if (idx < 0) {
+                            setError("inject_extra_class_not_loaded:" + iname);
+                            FVM_LOG("preResolveInjectionTargets: FIELD_PUT extra class not loaded: %s", iname.c_str());
+                            return false;
+                        }
+                    }
+                }
+            }
+        } else if (kind == "NEW") {
+            std::string cName;
+            if (readCPClassName(cpAddr, cpHdrSize, cpIdx, &cName))
+                matched = matchClassName(targetSpec, cName);
+            /* No extra classes needed for NEW */
+        }
+        (void)matched;
+        i += (size_t)instrLen;
+    }
+    return true;
+}
+
+/* Specification for one goto_w-trampoline tail's SMT frames. */
+struct TrampolineFrameSpec {
+    uint32_t             tailBCI;
+    uint32_t             popBCI;
+    std::vector<uint8_t> stackPrefixVtis;   /* VTI bytes for stack at tailBCI (no Cb) */
+    uint16_t             stackPrefixCount;  /* number of VTI entries above */
+};
+
+/* Type specification for one operand-stack slot in a trampoline tail. */
+struct StackTypeSpec {
+    enum Kind { PRIM_INT, PRIM_LONG, PRIM_FLOAT, PRIM_DOUBLE, REF };
+    Kind     kind;
+    uint16_t refClassCpIdx;
+};
+
+static void appendStackPrefixVtis(const std::vector<StackTypeSpec>& types,
+                                   std::vector<uint8_t>& outBytes,
+                                   uint16_t& outCount) {
+    outCount = 0;
+    for (const auto& t : types) {
+        switch (t.kind) {
+            case StackTypeSpec::PRIM_INT:    outBytes.push_back(1); break;
+            case StackTypeSpec::PRIM_LONG:   outBytes.push_back(4); break;
+            case StackTypeSpec::PRIM_FLOAT:  outBytes.push_back(2); break;
+            case StackTypeSpec::PRIM_DOUBLE: outBytes.push_back(3); break;
+            case StackTypeSpec::REF:
+                outBytes.push_back(7);
+                smPushU2BE(outBytes, t.refClassCpIdx);
+                break;
+        }
+        outCount++;
+    }
+}
+
+static size_t countSlotsOf(const std::vector<StackTypeSpec>& s) {
+    size_t n = 0;
+    for (const auto& t : s)
+        n += (t.kind == StackTypeSpec::PRIM_LONG || t.kind == StackTypeSpec::PRIM_DOUBLE) ? 2 : 1;
+    return n;
+}
+
+/* Look up an extra class's classCpIdx by internal name. Returns 0 if not found. */
+static uint16_t lookupExtraClassCpIdx(const HookData& h, const std::string& internalName) {
+    for (const auto& ex : h.extraClasses)
+        if (ex.internalName == internalName) return ex.classCpIdx;
+    return 0;
+}
+
+/* Parse a method descriptor's parameter list "(...)" into StackTypeSpecs.
+   Ref types are resolved via h.extraClasses. Returns false on lookup failure. */
+static bool parseDescParamsToStackSpecs(const std::string& methodDesc,
+                                         const HookData& h,
+                                         std::vector<StackTypeSpec>& outStack) {
+    if (methodDesc.empty() || methodDesc[0] != '(') return true;
+    size_t i = 1;
+    while (i < methodDesc.size() && methodDesc[i] != ')') {
+        char c = methodDesc[i];
+        StackTypeSpec spec;
+        if      (c == 'Z' || c == 'B' || c == 'C' || c == 'S' || c == 'I') { spec.kind = StackTypeSpec::PRIM_INT;    i++; }
+        else if (c == 'F') { spec.kind = StackTypeSpec::PRIM_FLOAT;   i++; }
+        else if (c == 'J') { spec.kind = StackTypeSpec::PRIM_LONG;    i++; }
+        else if (c == 'D') { spec.kind = StackTypeSpec::PRIM_DOUBLE;  i++; }
+        else if (c == 'L') {
+            spec.kind = StackTypeSpec::REF;
+            size_t e = methodDesc.find(';', i); if (e == std::string::npos) return false;
+            std::string iname = methodDesc.substr(i + 1, e - i - 1);
+            spec.refClassCpIdx = lookupExtraClassCpIdx(h, iname);
+            if (spec.refClassCpIdx == 0) { setError("inject_extra_class_cp_not_found:" + iname); return false; }
+            i = e + 1;
+        } else if (c == '[') {
+            spec.kind = StackTypeSpec::REF;
+            size_t s = i;
+            while (i < methodDesc.size() && methodDesc[i] == '[') i++;
+            std::string iname;
+            if (i < methodDesc.size() && methodDesc[i] == 'L') {
+                size_t e = methodDesc.find(';', i); if (e == std::string::npos) return false;
+                iname = methodDesc.substr(s, e - s + 1); i = e + 1;
+            } else if (i < methodDesc.size()) {
+                iname = methodDesc.substr(s, i - s + 1); i++;
+            }
+            spec.refClassCpIdx = lookupExtraClassCpIdx(h, iname);
+            if (spec.refClassCpIdx == 0) { setError("inject_extra_class_cp_not_found:" + iname); return false; }
+        } else {
+            return false;
+        }
+        outStack.push_back(spec);
+    }
+    return true;
+}
+
+/* Parse a single field descriptor into a StackTypeSpec. */
+static bool parseSingleDescTypeToStackSpec(const std::string& fieldDesc,
+                                            const HookData& h,
+                                            std::vector<StackTypeSpec>& outStack) {
+    if (fieldDesc.empty()) return true;
+    StackTypeSpec spec;
+    char c = fieldDesc[0];
+    if      (c == 'Z' || c == 'B' || c == 'C' || c == 'S' || c == 'I') spec.kind = StackTypeSpec::PRIM_INT;
+    else if (c == 'F') spec.kind = StackTypeSpec::PRIM_FLOAT;
+    else if (c == 'J') spec.kind = StackTypeSpec::PRIM_LONG;
+    else if (c == 'D') spec.kind = StackTypeSpec::PRIM_DOUBLE;
+    else if (c == 'L') {
+        spec.kind = StackTypeSpec::REF;
+        size_t e = fieldDesc.find(';');
+        if (e == std::string::npos) return false;
+        std::string iname = fieldDesc.substr(1, e - 1);
+        spec.refClassCpIdx = lookupExtraClassCpIdx(h, iname);
+        if (spec.refClassCpIdx == 0) { setError("inject_extra_class_cp_not_found:" + iname); return false; }
+    } else if (c == '[') {
+        spec.kind = StackTypeSpec::REF;
+        spec.refClassCpIdx = lookupExtraClassCpIdx(h, fieldDesc);
+        if (spec.refClassCpIdx == 0) { setError("inject_extra_class_cp_not_found:" + fieldDesc); return false; }
+    } else {
+        return false;
+    }
+    outStack.push_back(spec);
+    return true;
+}
+
+/* ============================================================
+ * End of route-2 helper zone.
+ * ============================================================ */
+
+/* Append method-entry locals as a packed verification_type_info[] to `out`,
+   returning the locals_count in `outCount`. Every reference slot is encoded as
+   ITEM_Object(java/lang/Object) — Object is a supertype of every reference
+   type so the implicit method-entry frame (whose ref slots carry the precise
+   declared types) is assignable to it per JVMS §4.10.1.2, while a single CP
+   entry suffices for any number of ref locals. Primitives map to ITEM_Integer
+   / Long / Float / Double; Long and Double take one VTI slot each per JVMS
+   §4.7.4 (the JVM's "two-slot" rule for J/D applies to slot indices, not to
+   the SMT entry count). */
+static bool appendMethodEntryLocalsVtis(bool isStatic,
+                                        const std::string& paramDesc,
+                                        uint16_t objClassCpIdx,
+                                        std::vector<uint8_t>& out,
+                                        uint16_t& outCount) {
+    outCount = 0;
+    auto pushObject = [&]() {
+        out.push_back(7);                  /* ITEM_Object */
+        smPushU2BE(out, objClassCpIdx);
+        outCount++;
+    };
+    if (!isStatic) pushObject();           /* locals[0] = this */
+
+    if (paramDesc.empty() || paramDesc[0] != '(') {
+        setError("invalid_param_descriptor"); return false;
+    }
+    size_t i = 1;
+    while (i < paramDesc.size() && paramDesc[i] != ')') {
+        char c = paramDesc[i];
+        if      (c == 'B' || c == 'C' || c == 'I' || c == 'S' || c == 'Z') {
+            out.push_back(1); outCount++; i++;
+        } else if (c == 'F') { out.push_back(2); outCount++; i++; }
+        else   if (c == 'J') { out.push_back(4); outCount++; i++; }
+        else   if (c == 'D') { out.push_back(3); outCount++; i++; }
+        else   if (c == 'L') {
+            pushObject();
+            while (i < paramDesc.size() && paramDesc[i] != ';') i++;
+            if (i < paramDesc.size()) i++;
+        } else if (c == '[') {
+            pushObject();
+            while (i < paramDesc.size() && paramDesc[i] == '[') i++;
+            if (i < paramDesc.size() && paramDesc[i] == 'L') {
+                while (i < paramDesc.size() && paramDesc[i] != ';') i++;
+                if (i < paramDesc.size()) i++;
+            } else if (i < paramDesc.size()) {
+                i++;
+            }
+        } else {
+            setError("invalid_param_descriptor_char"); return false;
+        }
+    }
+    return true;
+}
+
+/* Build the rebuilt StackMapTable body ([u2 count][frames]) for any goto_w
+   trampoline injection. Original frames are copied verbatim (bcis preserved);
+   each TrampolineFrameSpec contributes a full_frame@tailBCI and a (247 or 255)
+   frame@popBCI. Tails must be sorted by tailBCI ascending. */
+static bool rebuildStackMapTrampoline(
+    const std::vector<uint8_t>& origSM,
+    const std::vector<TrampolineFrameSpec>& tails,
+    bool isStatic, const std::string& paramDesc,
+    uint16_t cbClassCpIdx, uint16_t objClassCpIdx,
+    std::vector<uint8_t>& out) {
+    out.clear();
+
+    /* Parse original frames once. */
+    std::vector<SmFrameInfo> frames;
+    if (origSM.size() >= 2) {
+        uint16_t origCount = smReadU2BE(&origSM[0]);
+        size_t pos = 2;
+        for (uint16_t i = 0; i < origCount; i++) {
+            SmFrameInfo fi;
+            if (!smParseFrame(origSM, pos, fi)) { setError("smt_parse_failed"); return false; }
+            frames.push_back(fi);
+            pos += fi.totalLen;
+        }
+    }
+
+    /* Pre-build method-entry locals VTI bytes (reused by every tail frame). */
+    std::vector<uint8_t> localsVtiBytes;
+    uint16_t numLocals = 0;
+    if (!appendMethodEntryLocalsVtis(isStatic, paramDesc, objClassCpIdx,
+                                     localsVtiBytes, numLocals)) return false;
+
+    smPushU2BE(out, (uint16_t)(frames.size() + 2 * tails.size()));
+
+    /* Copy each original frame verbatim. Absolute bcis are unchanged in the
+       new bytecode, so the delta encoding is preserved exactly. */
+    uint32_t prevBci = 0;
+    uint32_t origAbs = 0;
+    for (size_t i = 0; i < frames.size(); i++) {
+        const SmFrameInfo& fi = frames[i];
+        origAbs = (i == 0) ? fi.offsetDelta : (origAbs + (uint32_t)fi.offsetDelta + 1);
+        size_t frameStart = fi.vtiStart - ((fi.tag <= 127) ? 1u : 3u);
+        out.insert(out.end(), origSM.begin() + (ptrdiff_t)frameStart,
+                              origSM.begin() + (ptrdiff_t)(frameStart + fi.totalLen));
+        prevBci = origAbs;
+    }
+
+    /* For each tail: full_frame@tailBCI + (247 or full_frame)@popBCI. */
+    for (size_t t = 0; t < tails.size(); t++) {
+        const TrampolineFrameSpec& spec = tails[t];
+        uint32_t tailDelta = (t == 0 && frames.empty())
+                           ? spec.tailBCI
+                           : (spec.tailBCI - prevBci - 1);
+        out.push_back(255);
+        smPushU2BE(out, (uint16_t)tailDelta);
+        smPushU2BE(out, numLocals);
+        out.insert(out.end(), localsVtiBytes.begin(), localsVtiBytes.end());
+        smPushU2BE(out, spec.stackPrefixCount);
+        out.insert(out.end(), spec.stackPrefixVtis.begin(), spec.stackPrefixVtis.end());
+        prevBci = spec.tailBCI;
+
+        uint32_t popDelta = spec.popBCI - prevBci - 1;
+        if (spec.stackPrefixCount == 0) {
+            out.push_back(247);
+            smPushU2BE(out, (uint16_t)popDelta);
+            out.push_back(7);
+            smPushU2BE(out, cbClassCpIdx);
+        } else {
+            out.push_back(255);
+            smPushU2BE(out, (uint16_t)popDelta);
+            smPushU2BE(out, numLocals);
+            out.insert(out.end(), localsVtiBytes.begin(), localsVtiBytes.end());
+            smPushU2BE(out, (uint16_t)(spec.stackPrefixCount + 1));
+            out.insert(out.end(), spec.stackPrefixVtis.begin(), spec.stackPrefixVtis.end());
+            out.push_back(7);
+            smPushU2BE(out, cbClassCpIdx);
+        }
+        prevBci = spec.popBCI;
+    }
+    return true;
+}
+
+/* Build the new ConstMethod bytes for a single hook (bytecode injection + trailing data). */
+static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
     HANDLE proc = g_target.handle;
 
-    /* bcLengths table — identical to the one inside applyTransform */
+    /* bcLengths table */
     static const int8_t bcL[256] = {
         1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 2,3,2,3,3,2,2,2,2,2,1,1,1,1,1,1,
         1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,2,2,2,2,2,1,1,1,1,1,
@@ -3810,10 +3152,190 @@ static bool buildMergedHookCM(MergeHookData& h, uint64_t newPoolRemoteAddr) {
     newBytecode.reserve(h.origBytecode.size() + 128);
 
     if (injectType == "HEAD") {
-        if (!buildTramp(0, 0)) return false;
+        /* goto_w-trampoline layout — original bcis ≥ J are preserved verbatim,
+         * so LocalVariableTable / exception_table / LineNumberTable need no
+         * rebase. J is the bci of the first original StackMapTable frame (or
+         * origSize when there are none). Methods whose first frame is too
+         * early to host a goto_w prefix, or whose rescue zone contains opcodes
+         * that cannot be safely relocated, are rejected up-front. */
+
+        /* Read original StackMapTable (Array<u1>{ int _length; u1 _data[] }). */
+        std::vector<uint8_t> origSM;
+        {
+            int64_t smOff0 = structOffset("ConstMethod", "_stackmap_data");
+            if (smOff0 >= 0) {
+                uint64_t smArr = 0;
+                if (readRemotePointer(proc, h.origConstMethodAddr + (uint64_t)smOff0, &smArr)
+                    && smArr != 0) {
+                    int64_t aLen  = structOffset("Array<u1>", "_length"); if (aLen  < 0) aLen  = 0;
+                    int64_t aData = structOffset("Array<u1>", "_data");   if (aData < 0) aData = 4;
+                    int32_t n = 0;
+                    if (readRemoteI32(proc, smArr + (uint64_t)aLen, &n) && n > 0 && n < (1 << 24)) {
+                        origSM.resize((size_t)n);
+                        if (!readRemoteMem(proc, smArr + (uint64_t)aData, origSM.data(), (size_t)n))
+                            origSM.clear();
+                    }
+                }
+            }
+        }
+
+        /* Compute J = first original frame's absolute bci, or origSize. */
+        size_t J;
+        if (origSM.size() >= 2 && smReadU2BE(&origSM[0]) > 0) {
+            SmFrameInfo f0;
+            if (!smParseFrame(origSM, 2, f0)) {
+                setError("smt_parse_failed");
+                FVM_LOG("buildHookCM: HEAD skipped %s%s — StackMapTable parse failed",
+                        h.methodName.c_str(), h.paramDesc.c_str());
+                return false;
+            }
+            J = (size_t)f0.offsetDelta;
+        } else {
+            J = h.origBytecode.size();
+        }
+
+        if (J < 5 || J > h.origBytecode.size()) {
+            setError("head_rescue_zone_invalid_size");
+            FVM_LOG("buildHookCM: HEAD skipped %s%s — rescue size J=%zu out of "
+                    "range (need 5..%zu)", h.methodName.c_str(), h.paramDesc.c_str(),
+                    J, h.origBytecode.size());
+            return false;
+        }
+
+        /* Validate orig[0..J): every instruction boundary, no opcode that
+           cannot be safely relocated to the rescued tail (tableswitch,
+           lookupswitch, wide, jsr/ret, goto_w/jsr_w in rescue zone). */
+        for (size_t off = 0; off < J;) {
+            uint8_t op = h.origBytecode[off];
+            if (op==0xAA||op==0xAB||op==0xC4||op==0xA8||op==0xA9||op==0xC9||op==0xE4||op==0xE5) {
+                setError("head_rescue_zone_unsupported_opcode");
+                FVM_LOG("buildHookCM: HEAD skipped %s%s — rescue zone contains "
+                        "unsupported opcode 0x%02X at bci %zu",
+                        h.methodName.c_str(), h.paramDesc.c_str(), op, off);
+                return false;
+            }
+            int l = getLen(off);
+            if (l <= 0) {
+                setError("head_rescue_zone_decode_failed");
+                return false;
+            }
+            off += (size_t)l;
+            if (off > J) {
+                setError("head_J_not_on_instr_boundary");
+                FVM_LOG("buildHookCM: HEAD skipped %s%s — first frame bci %zu "
+                        "is not on an instruction boundary",
+                        h.methodName.c_str(), h.paramDesc.c_str(), J);
+                return false;
+            }
+        }
+
+        /* Build trampoline bytecode.
+         *   bci 0..4         : goto_w → tailBCI (patched once tailBCI is known)
+         *   bci 5..J-1       : nop pad
+         *   bci J..origEnd-1 : orig[J..end) verbatim
+         *   bci tailBCI..    : prologue, rescued copy of orig[0..J), goto J */
+        size_t gwBCI = newBytecode.size();           /* = 0 for HEAD */
+        size_t gwFi  = emitGW(newBytecode, 0);
+        for (size_t b = gwBCI + 5; b < J; b++) newBytecode.push_back(0x00);
+        for (size_t b = J; b < h.origBytecode.size(); b++) newBytecode.push_back(h.origBytecode[b]);
+
+        size_t tailBCI = newBytecode.size();
+        patchGW(newBytecode, gwFi, gwBCI, tailBCI);
+
+        emitPrologue(newBytecode);
+        size_t popBCI = newBytecode.size() - 1;       /* the trailing `pop` (0x57) */
+
+        size_t rescuedBCI = newBytecode.size();
+        std::vector<uint8_t> rescued(h.origBytecode.begin(),
+                                     h.origBytecode.begin() + (ptrdiff_t)J);
+        int32_t shift = (int32_t)gwBCI - (int32_t)rescuedBCI;
+        for (size_t off = 0; off < rescued.size();) {
+            uint8_t op = rescued[off];
+            int rl = bcL[op]; if (rl <= 0) rl = 1;
+            bool b2 = (op >= 0x99 && op <= 0xA7) || op == 0xC6 || op == 0xC7;
+            bool b4 = (op == 0xC8);
+            if (b2 && off + 2 < rescued.size()) {
+                int16_t or2 = (int16_t)(((uint16_t)rescued[off+1] << 8) | rescued[off+2]);
+                int32_t nr  = (int32_t)or2 + shift;
+                if (nr > 32767 || nr < -32768) {
+                    setError("head_rescue_branch_offset_overflow_int16");
+                    return false;
+                }
+                rescued[off+1] = (uint8_t)((uint16_t)nr >> 8);
+                rescued[off+2] = (uint8_t)((uint16_t)nr & 0xFF);
+            } else if (b4 && off + 4 < rescued.size()) {
+                int32_t or4 = (int32_t)(((uint32_t)rescued[off+1] << 24)
+                                      | ((uint32_t)rescued[off+2] << 16)
+                                      | ((uint32_t)rescued[off+3] <<  8)
+                                      |  (uint32_t)rescued[off+4]);
+                int32_t nr  = or4 + shift;
+                rescued[off+1] = (uint8_t)((uint32_t)nr >> 24);
+                rescued[off+2] = (uint8_t)((uint32_t)nr >> 16);
+                rescued[off+3] = (uint8_t)((uint32_t)nr >>  8);
+                rescued[off+4] = (uint8_t)((uint32_t)nr & 0xFF);
+            }
+            off += (size_t)rl;
+        }
+        newBytecode.insert(newBytecode.end(), rescued.begin(), rescued.end());
+        if (J < h.origBytecode.size()) {
+            size_t gbBCI = newBytecode.size();
+            size_t gbFi  = emitGW(newBytecode, 0);
+            patchGW(newBytecode, gbFi, gbBCI, J);
+        }
+
+        if (h.needObjectCp && h.objClassCpIdx == 0) {
+            setError("head_object_cp_idx_not_allocated");
+            FVM_LOG("buildHookCM: HEAD skipped %s%s — Object CP entry was not "
+                    "allocated (resolveHookData layout state inconsistent)",
+                    h.methodName.c_str(), h.paramDesc.c_str());
+            return false;
+        }
+        {
+            TrampolineFrameSpec spec;
+            spec.tailBCI = (uint32_t)tailBCI;
+            spec.popBCI  = (uint32_t)popBCI;
+            spec.stackPrefixCount = 0;
+            if (!rebuildStackMapTrampoline(origSM, { spec },
+                                           h.targetIsStatic, h.paramDesc,
+                                           h.cbClassCpIdx, h.objClassCpIdx,
+                                           h.newStackMapBytes))
+                return false;
+        }
+        h.haveNewStackMap = true;
+        FVM_LOG("buildHookCM: HEAD goto_w-tramp J=%zu tailBCI=%zu popBCI=%zu "
+                "origSM=%zuB newSM=%zuB",
+                J, tailBCI, popBCI, origSM.size(), h.newStackMapBytes.size());
     } else if (injectType == "RETURN") {
+        /* Each `*return` is replaced in-place with goto_w → tailBCI plus nop
+         * padding extending to the original instruction boundary at the end of
+         * a 5-byte (or longer) cover zone. The cover zone preserves every bci
+         * outside it, so trailing ConstMethod sections (LocalVariableTable /
+         * exception_table / LineNumberTable) need no rebase — same property
+         * the HEAD trampoline relies on. */
+
+        /* Read original StackMapTable (Array<u1>{ int _length; u1 _data[] }). */
+        std::vector<uint8_t> origSM;
+        {
+            int64_t smOff0 = structOffset("ConstMethod", "_stackmap_data");
+            if (smOff0 >= 0) {
+                uint64_t smArr = 0;
+                if (readRemotePointer(proc, h.origConstMethodAddr + (uint64_t)smOff0, &smArr)
+                    && smArr != 0) {
+                    int64_t aLen  = structOffset("Array<u1>", "_length"); if (aLen  < 0) aLen  = 0;
+                    int64_t aData = structOffset("Array<u1>", "_data");   if (aData < 0) aData = 4;
+                    int32_t n = 0;
+                    if (readRemoteI32(proc, smArr + (uint64_t)aLen, &n) && n > 0 && n < (1 << 24)) {
+                        origSM.resize((size_t)n);
+                        if (!readRemoteMem(proc, smArr + (uint64_t)aData, origSM.data(), (size_t)n))
+                            origSM.clear();
+                    }
+                }
+            }
+        }
+
         uint8_t retOp = 0xB1;
         std::vector<size_t> retFi, retBCI;
+        std::vector<std::pair<size_t,size_t>> coverZones;   /* (X, k) per *return */
         for (size_t i=0; i<h.origBytecode.size();) {
             uint8_t op = h.origBytecode[i];
             if (op>=0xAC&&op<=0xB1) {
@@ -3823,59 +3345,346 @@ static bool buildMergedHookCM(MergeHookData& h, uint64_t newPoolRemoteAddr) {
                 retFi.push_back(fi); retBCI.push_back(instrBCI);
                 size_t k = coverEnd(i);
                 for (size_t b=i+5; b<k; b++) newBytecode.push_back(0x00);
+                coverZones.push_back({ i, k });
                 i = k;
             } else {
                 int l=getLen(i); if(l<=0)l=1;
                 for(int j=0;j<l;j++) newBytecode.push_back(h.origBytecode[i+j]); i+=(size_t)l;
             }
         }
+
+        /* Reject the hook if any original frame falls strictly inside a cover
+           zone — those bcis no longer correspond to instruction boundaries. */
+        if (origSM.size() >= 2) {
+            uint16_t fc = smReadU2BE(&origSM[0]);
+            size_t pos = 2;
+            uint32_t abs_ = 0;
+            for (uint16_t fi = 0; fi < fc; fi++) {
+                SmFrameInfo si;
+                if (!smParseFrame(origSM, pos, si)) {
+                    setError("smt_parse_failed");
+                    FVM_LOG("buildHookCM: RETURN skipped %s%s — StackMapTable parse failed",
+                            h.methodName.c_str(), h.paramDesc.c_str());
+                    return false;
+                }
+                abs_ = (fi == 0) ? si.offsetDelta : (abs_ + (uint32_t)si.offsetDelta + 1);
+                for (auto& z : coverZones) {
+                    if (abs_ > z.first && abs_ < z.second) {
+                        setError("return_frame_inside_cover_zone");
+                        FVM_LOG("buildHookCM: RETURN skipped %s%s — original "
+                                "frame bci %u falls inside cover zone (%zu,%zu)",
+                                h.methodName.c_str(), h.paramDesc.c_str(),
+                                abs_, z.first, z.second);
+                        return false;
+                    }
+                }
+                pos += si.totalLen;
+            }
+        }
+
         size_t tailBCI = newBytecode.size();
         emitPrologue(newBytecode);
+        size_t popBCI = newBytecode.size() - 1;          /* the trailing `pop` (0x57) */
         newBytecode.push_back(retOp);
         for (size_t r=0; r<retFi.size(); r++) patchGW(newBytecode, retFi[r], retBCI[r], tailBCI);
-    } else if (injectType == "INVOKE" || injectType == "FIELD_GET" || injectType == "FIELD_PUT" || injectType == "NEW") {
-        /* Scan original bytecode for the target instruction and inject at that BCI */
-        bool found = false;
-        for (size_t i=0; i<h.origBytecode.size();) {
-            uint8_t op = h.origBytecode[i];
-            int len = getLen(i); if (len<=0) len=1;
-            /* Copy bytes up to this point for non-target instructions */
-            if (!found) {
-                bool isTarget = false;
-                if (injectType == "INVOKE" && (op==0xB6||op==0xB7||op==0xB8||op==0xB9||op==0xB2)) {
-                    /* read CP index from the original bytecode (big-endian) to resolve method name */
-                    if (i+2 < h.origBytecode.size()) {
-                        /* crude name match: just check BCI exists for the right invoke op */
-                        /* For simplicity: inject at first matching invoke with the right target name */
-                        /* We pass injectTargetName; fall back to first occurrence if empty */
-                        if (injectTargetName.empty()) isTarget = true;
-                        /* otherwise: keep scanning (target name match requires RPM into oldCP) */
-                        /* TODO: name matching requires passing oldCP; for now first match */
-                        else isTarget = true; /* conservative: first invoke of any matching type */
-                    }
-                } else if (injectType == "FIELD_GET" && (op==0xB4||op==0xB2)) {
-                    isTarget = true;
-                } else if (injectType == "FIELD_PUT" && (op==0xB5||op==0xB3)) {
-                    isTarget = true;
-                } else if (injectType == "NEW" && op==0xBB) {
-                    isTarget = true;
-                }
 
-                if (isTarget) {
-                    /* Copy original bytes 0..i-1 into newBytecode */
-                    /* (already done incrementally, this path builds from scratch) */
-                    /* Restart: build up to BCI i, then inject */
-                    newBytecode.clear();
-                    for (size_t b=0; b<i; b++) newBytecode.push_back(h.origBytecode[b]);
-                    if (!buildTramp(i, 0)) return false;
-                    found = true;
-                    break;
+        if (h.needObjectCp && h.objClassCpIdx == 0) {
+            setError("return_object_cp_idx_not_allocated");
+            FVM_LOG("buildHookCM: RETURN skipped %s%s — Object CP entry was not "
+                    "allocated (resolveHookData layout state inconsistent)",
+                    h.methodName.c_str(), h.paramDesc.c_str());
+            return false;
+        }
+        {
+            TrampolineFrameSpec spec;
+            spec.tailBCI = (uint32_t)tailBCI;
+            spec.popBCI  = (uint32_t)popBCI;
+            spec.stackPrefixCount = 0;
+            /* For non-void RETURN, stack at tailBCI has the return value. */
+            bool hasRetVal = !h.targetReturnDesc.empty() && h.targetReturnDesc[0] != 'V';
+            if (hasRetVal) {
+                char c = h.targetReturnDesc[0];
+                StackTypeSpec st;
+                if      (c=='Z'||c=='B'||c=='C'||c=='S'||c=='I') st.kind = StackTypeSpec::PRIM_INT;
+                else if (c=='F') st.kind = StackTypeSpec::PRIM_FLOAT;
+                else if (c=='J') st.kind = StackTypeSpec::PRIM_LONG;
+                else if (c=='D') st.kind = StackTypeSpec::PRIM_DOUBLE;
+                else { st.kind = StackTypeSpec::REF; st.refClassCpIdx = h.objClassCpIdx; }
+                appendStackPrefixVtis({ st }, spec.stackPrefixVtis, spec.stackPrefixCount);
+            }
+            if (!rebuildStackMapTrampoline(origSM, { spec },
+                                           h.targetIsStatic, h.paramDesc,
+                                           h.cbClassCpIdx, h.objClassCpIdx,
+                                           h.newStackMapBytes))
+                return false;
+        }
+        h.haveNewStackMap = true;
+        FVM_LOG("buildHookCM: RETURN goto_w-tramp tailBCI=%zu popBCI=%zu "
+                "retDesc=%s origSM=%zuB newSM=%zuB",
+                tailBCI, popBCI, h.targetReturnDesc.c_str(),
+                origSM.size(), h.newStackMapBytes.size());
+    } else if (injectType == "INVOKE" || injectType == "FIELD_GET" ||
+               injectType == "FIELD_PUT" || injectType == "NEW") {
+
+        /* ── F1: exception table ── */
+        if (methodHasExceptionTable(h.origConstMethodAddr)) {
+            setError("head_invoke_field_new_exception_table_unsupported");
+            FVM_LOG("buildHookCM: %s skipped %s%s — method has an exception table",
+                    injectType.c_str(), h.methodName.c_str(), h.paramDesc.c_str());
+            return false;
+        }
+
+        /* ── read original SMT ── */
+        std::vector<uint8_t> origSM;
+        {
+            int64_t smOff0 = structOffset("ConstMethod", "_stackmap_data");
+            if (smOff0 >= 0) {
+                uint64_t smArr = 0;
+                if (readRemotePointer(proc, h.origConstMethodAddr + (uint64_t)smOff0, &smArr) && smArr) {
+                    int64_t aLen  = structOffset("Array<u1>", "_length"); if (aLen  < 0) aLen  = 0;
+                    int64_t aData = structOffset("Array<u1>", "_data");   if (aData < 0) aData = 4;
+                    int32_t n = 0;
+                    if (readRemoteI32(proc, smArr + (uint64_t)aLen, &n) && n > 0 && n < (1<<24)) {
+                        origSM.resize((size_t)n);
+                        if (!readRemoteMem(proc, smArr + (uint64_t)aData, origSM.data(), (size_t)n))
+                            origSM.clear();
+                    }
                 }
             }
-            for (int j=0;j<len;j++) newBytecode.push_back(h.origBytecode[i+j]);
-            i += (size_t)len;
         }
-        if (!found) { setError("inject_target_not_found:" + injectTargetName); return false; }
+
+        /* ── CP base for lookups ── */
+        uint64_t cpAddr = readOrigCMConstants(h.origConstMethodAddr);
+        int64_t cpHdrSize = typeSize("ConstantPool"); if (cpHdrSize < 0) cpHdrSize = 0x138;
+
+        /* ── Step 4: scan matching bcis ── */
+        struct Match {
+            size_t bciX;
+            size_t instrLen;
+            size_t coverEndV;
+            std::vector<StackTypeSpec> stackPrefix;
+            uint16_t oldCPClassIdx; /* for INVOKE receiver / FIELD receiver (old CP idx) */
+        };
+        std::vector<Match> matches;
+
+        for (size_t i = 0; i < h.origBytecode.size();) {
+            uint8_t op = h.origBytecode[i];
+            int l = getLen(i); if (l <= 0) { setError("inject_abstract_interp_decode_failed"); return false; }
+
+            bool isCandidate = false;
+            if      (injectType == "INVOKE")    isCandidate = (op==0xB6||op==0xB7||op==0xB8||op==0xB9);
+            else if (injectType == "FIELD_GET") isCandidate = (op==0xB4||op==0xB2);
+            else if (injectType == "FIELD_PUT") isCandidate = (op==0xB5||op==0xB3);
+            else if (injectType == "NEW")       isCandidate = (op==0xBB);
+
+            if (!isCandidate || i + 2 >= h.origBytecode.size()) { i += (size_t)l; continue; }
+
+            if (op == 0xBA) { /* invokedynamic — skip */
+                i += (size_t)l; continue;
+            }
+
+            uint16_t cpIdx = ((uint16_t)h.origBytecode[i+1] << 8) | (uint16_t)h.origBytecode[i+2];
+            bool matched = false;
+            std::vector<StackTypeSpec> stackPrefix;
+            uint16_t oldClassCpIdx = 0;
+
+            if (injectType == "INVOKE") {
+                std::string mName, mDesc;
+                if (!readCPMethodNameDesc(cpAddr, cpHdrSize, cpIdx, &mName, &mDesc)) {
+                    setError("inject_cp_resolve_failed");
+                    FVM_LOG("buildHookCM: INVOKE failed to read CP@%u at bci %zu", (unsigned)cpIdx, i);
+                    return false;
+                }
+                if (matchInvokeTarget(injectTargetName, mName, mDesc)) {
+                    matched = true;
+                    uint16_t ci = 0, ni = 0, di = 0;
+                    readCPMethodOrFieldRef(cpAddr, cpHdrSize, cpIdx, &ci, &ni, &di);
+                    oldClassCpIdx = ci;
+                    bool isStatic = (op == 0xB8);
+                    if (!isStatic && ci != 0) {
+                        StackTypeSpec s; s.kind = StackTypeSpec::REF; s.refClassCpIdx = ci;
+                        stackPrefix.push_back(s);
+                    }
+                    if (!parseDescParamsToStackSpecs(mDesc, h, stackPrefix)) return false;
+                }
+            } else if (injectType == "FIELD_GET" || injectType == "FIELD_PUT") {
+                std::string fName, fDesc;
+                if (!readCPMethodNameDesc(cpAddr, cpHdrSize, cpIdx, &fName, &fDesc)) {
+                    setError("inject_cp_resolve_failed"); return false;
+                }
+                if (matchFieldTarget(injectTargetName, fName, fDesc)) {
+                    matched = true;
+                    uint16_t ci = 0, ni = 0, di = 0;
+                    readCPMethodOrFieldRef(cpAddr, cpHdrSize, cpIdx, &ci, &ni, &di);
+                    oldClassCpIdx = ci;
+                    bool isStaticAccess = (op == 0xB2 || op == 0xB3);
+                    if (!isStaticAccess && ci != 0) {
+                        StackTypeSpec s; s.kind = StackTypeSpec::REF; s.refClassCpIdx = ci;
+                        stackPrefix.push_back(s);
+                    }
+                    if (injectType == "FIELD_PUT") {
+                        if (!parseSingleDescTypeToStackSpec(fDesc, h, stackPrefix)) return false;
+                    }
+                }
+            } else if (injectType == "NEW") {
+                std::string cName;
+                if (!readCPClassName(cpAddr, cpHdrSize, cpIdx, &cName)) {
+                    setError("inject_cp_resolve_failed"); return false;
+                }
+                if (matchClassName(injectTargetName, cName)) {
+                    matched = true;
+                    /* stack prefix is empty: `new` has no inputs */
+                }
+            }
+
+            if (matched) {
+                Match m;
+                m.bciX = i;
+                m.instrLen = (size_t)l;
+                m.coverEndV = coverEnd(i);
+                m.stackPrefix = std::move(stackPrefix);
+                m.oldCPClassIdx = oldClassCpIdx;
+                matches.push_back(m);
+            }
+            i += (size_t)l;
+        }
+
+        /* ── F8: no matches ── */
+        if (matches.empty()) {
+            setError("inject_target_not_found:" + injectTargetName);
+            FVM_LOG("buildHookCM: %s skipped %s%s — no target matches '%s'",
+                    injectType.c_str(), h.methodName.c_str(), h.paramDesc.c_str(),
+                    injectTargetName.c_str());
+            return false;
+        }
+
+        /* ── F3: outer stack depth at each bci must equal stackPrefix slot count ── */
+        for (auto& m : matches) {
+            int depth = 0;
+            if (!computeStackDepthAtBci(h.origBytecode, origSM, cpAddr, cpHdrSize, m.bciX, &depth)) {
+                FVM_LOG("buildHookCM: %s skipped %s%s — abstract interp failed at bci %zu (%s)",
+                        injectType.c_str(), h.methodName.c_str(), h.paramDesc.c_str(),
+                        m.bciX, g_lastError.c_str());
+                return false;
+            }
+            size_t expected = countSlotsOf(m.stackPrefix);
+            if ((size_t)depth != expected) {
+                setError("inject_outer_stack_nonempty");
+                FVM_LOG("buildHookCM: %s skipped %s%s — outer stack non-empty at bci %zu "
+                        "(depth=%d, prefix needs %zu slots)",
+                        injectType.c_str(), h.methodName.c_str(), h.paramDesc.c_str(),
+                        m.bciX, depth, expected);
+                return false;
+            }
+        }
+
+        /* ── F2: no original frame inside a cover zone ── */
+        if (origSM.size() >= 2) {
+            uint16_t fc = smReadU2BE(&origSM[0]);
+            size_t pos = 2; uint32_t abs_ = 0;
+            for (uint16_t fi = 0; fi < fc; fi++) {
+                SmFrameInfo si;
+                if (!smParseFrame(origSM, pos, si)) { setError("smt_parse_failed"); return false; }
+                abs_ = (fi == 0) ? si.offsetDelta : (abs_ + (uint32_t)si.offsetDelta + 1);
+                for (auto& m : matches) {
+                    if (abs_ > m.bciX && abs_ < m.coverEndV) {
+                        setError("inject_frame_inside_cover_zone");
+                        FVM_LOG("buildHookCM: %s skipped %s%s — original frame bci %u inside "
+                                "cover zone (%zu,%zu)",
+                                injectType.c_str(), h.methodName.c_str(), h.paramDesc.c_str(),
+                                abs_, m.bciX, m.coverEndV);
+                        return false;
+                    }
+                }
+                pos += si.totalLen;
+            }
+        }
+
+        /* ── F11: needObjectCp but no objClassCpIdx ── */
+        if (h.needObjectCp && h.objClassCpIdx == 0) {
+            setError("inject_object_cp_idx_not_allocated");
+            FVM_LOG("buildHookCM: %s skipped %s%s — Object CP idx not allocated",
+                    injectType.c_str(), h.methodName.c_str(), h.paramDesc.c_str());
+            return false;
+        }
+
+        /* ── Step 7: build new bytecode ── */
+        /* Pass 1: copy main flow, replacing each match bci with goto_w placeholder. */
+        std::vector<size_t> gwFis(matches.size()), gwBcis(matches.size());
+        {
+            size_t mi = 0;
+            for (size_t i = 0; i < h.origBytecode.size();) {
+                if (mi < matches.size() && i == matches[mi].bciX) {
+                    gwBcis[mi] = newBytecode.size();
+                    gwFis[mi]  = emitGW(newBytecode, 0);
+                    size_t cEnd = matches[mi].coverEndV;
+                    for (size_t b = i + 5; b < cEnd; b++) newBytecode.push_back(0x00);
+                    i = cEnd; mi++;
+                } else {
+                    int l = getLen(i); if (l <= 0) l = 1;
+                    for (int j = 0; j < l; j++) newBytecode.push_back(h.origBytecode[i+j]);
+                    i += (size_t)l;
+                }
+            }
+        }
+
+        /* Pass 2: append each tail, patch its goto_w. */
+        std::vector<size_t> tailStarts(matches.size()), tailPopBcis(matches.size());
+        for (size_t t = 0; t < matches.size(); t++) {
+            size_t tailBCI = newBytecode.size();
+            tailStarts[t] = tailBCI;
+            patchGW(newBytecode, gwFis[t], gwBcis[t], tailBCI);
+
+            emitPrologue(newBytecode);
+            tailPopBcis[t] = newBytecode.size() - 1; /* the trailing `pop` (0x57) */
+
+            /* Rescued copy of orig[bciX..coverEndV). */
+            size_t cEnd = matches[t].coverEndV;
+            for (size_t b = matches[t].bciX; b < cEnd; b++)
+                newBytecode.push_back(h.origBytecode[b]);
+
+            /* If coverEnd < origSize: goto_w back to coverEnd in main flow. */
+            if (cEnd < h.origBytecode.size()) {
+                size_t gbBCI = newBytecode.size();
+                size_t fib = emitGW(newBytecode, 0);
+                patchGW(newBytecode, fib, gbBCI, cEnd);
+            } else {
+                /* coverEnd == origSize: rescued bytes must end in a terminator. */
+                uint8_t lastOp = (cEnd > matches[t].bciX) ? h.origBytecode[cEnd - 1] : 0;
+                bool isTerminator = (lastOp >= 0xAC && lastOp <= 0xB1) || lastOp == 0xBF;
+                if (!isTerminator) {
+                    setError("rescued_falls_off_end");
+                    FVM_LOG("buildHookCM: %s skipped %s%s — rescued code falls off bytecode end at bci %zu",
+                            injectType.c_str(), h.methodName.c_str(), h.paramDesc.c_str(), matches[t].bciX);
+                    return false;
+                }
+            }
+        }
+
+        /* ── Step 8: TrampolineFrameSpec per match ── */
+        std::vector<TrampolineFrameSpec> tailSpecs(matches.size());
+        size_t maxPrefixSlots = 0;
+        for (size_t t = 0; t < matches.size(); t++) {
+            TrampolineFrameSpec& spec = tailSpecs[t];
+            spec.tailBCI = (uint32_t)tailStarts[t];
+            spec.popBCI  = (uint32_t)tailPopBcis[t];
+            appendStackPrefixVtis(matches[t].stackPrefix, spec.stackPrefixVtis, spec.stackPrefixCount);
+            size_t ps = countSlotsOf(matches[t].stackPrefix);
+            if (ps > maxPrefixSlots) maxPrefixSlots = ps;
+        }
+        h.extraMaxStack = (uint16_t)maxPrefixSlots;
+
+        /* ── Step 9: rebuild SMT ── */
+        if (!rebuildStackMapTrampoline(origSM, tailSpecs,
+                                       h.targetIsStatic, h.paramDesc,
+                                       h.cbClassCpIdx, h.objClassCpIdx,
+                                       h.newStackMapBytes)) {
+            return false;
+        }
+        h.haveNewStackMap = true;
+        FVM_LOG("buildHookCM: %s goto_w-tramp %zu match(es) %s%s newSM=%zuB",
+                injectType.c_str(), matches.size(), h.methodName.c_str(),
+                h.paramDesc.c_str(), h.newStackMapBytes.size());
     } else {
         setError("unknown_inject_point_merged:" + injectType); return false;
     }
@@ -3915,6 +3724,38 @@ static bool buildMergedHookCM(MergeHookData& h, uint64_t newPoolRemoteAddr) {
     int64_t cmcOff = structOffset("ConstMethod", "_constants"); if (cmcOff < 0) cmcOff = 8;
     memcpy(h.newCMBytes.data() + cmcOff, &newPoolRemoteAddr, 8);
 
+    /* _stackmap_data handling.
+     *
+     * HEAD clean-prepend path (h.haveNewStackMap): a consistent StackMapTable
+     * was rebuilt in buildHookCM. Leave the field pointing at the original
+     * Array<u1> for now; commitKlass allocates a remote Array<u1> for
+     * h.newStackMapBytes and repoints _stackmap_data at it. _major_version is
+     * NOT downgraded for these classes, so Java 8+ bytecode (e.g. invokestatic
+     * to an InterfaceMethodref) stays legal.
+     *
+     * Legacy goto_w-trampoline path (!haveNewStackMap): the original stackmap
+     * references pre-injection BCIs and is inconsistent with the new code. NULL
+     * it; buildPoolBytes downgraded _major_version to 50 so the old
+     * type-inference verifier (which ignores _stackmap_data) is used. */
+    int64_t smOff = structOffset("ConstMethod", "_stackmap_data");
+    if (h.haveNewStackMap) {
+        if (smOff < 0) {
+            setError("stackmap_data_offset_unknown_for_HEAD");
+            return false;
+        }
+        /* pointer patched later by commitKlass once the remote array exists */
+    } else if (smOff >= 0) {
+        uint64_t origSm = 0;
+        memcpy(&origSm, h.newCMBytes.data() + smOff, 8);
+        uint64_t nullPtr = 0;
+        memcpy(h.newCMBytes.data() + smOff, &nullPtr, 8);
+        FVM_LOG("buildCM: cleared _stackmap_data (off=%lld, was 0x%llX)",
+                (long long)smOff, (unsigned long long)origSm);
+    } else {
+        FVM_LOG("buildCM: WARN ConstMethod::_stackmap_data not in VMStructs — "
+                "verify may fail on classes with strict stackmap");
+    }
+
     /* Update _code_size */
     int64_t codeSzOff = structOffset("ConstMethod", "_code_size");
     if (codeSzOff >= 0) { uint16_t cs=(uint16_t)newBytecode.size(); memcpy(h.newCMBytes.data()+codeSzOff,&cs,2); }
@@ -3923,7 +3764,7 @@ static bool buildMergedHookCM(MergeHookData& h, uint64_t newPoolRemoteAddr) {
     int64_t maxStkOff = structOffset("ConstMethod", "_max_stack");
     if (maxStkOff >= 0) {
         uint16_t origMS=0; memcpy(&origMS, h.newCMBytes.data()+maxStkOff, 2);
-        uint16_t need=(h.hasArgCapture&&!h.targetParams.empty())?7:4;
+        uint16_t need=(uint16_t)((h.hasArgCapture&&!h.targetParams.empty()?7:4) + h.extraMaxStack);
         if (origMS < need) memcpy(h.newCMBytes.data()+maxStkOff, &need, 2);
     }
 
@@ -3934,12 +3775,12 @@ static bool buildMergedHookCM(MergeHookData& h, uint64_t newPoolRemoteAddr) {
 }
 
 // ============================================================
-// §17 Per-class plan-once-commit-once API  (Stage 3.1)
+// Per-class plan-once-commit-once API
 //
-// commitClassPlan implements the per-class §17.5 Phase A→D transform:
+// commitClassPlan implements the per-class transform (§17.5 Phase A→D):
 //   * unload any existing plan (→ oldCP₀)
 //   * resolve all hooks (replay existing + new candidates)
-//   * single VirtualAllocEx for mergedCP / mergedRK / mergedTags / mergedCache
+//   * single VirtualAllocEx for new CP / RK / Tags / Cache
 //   * one suspend window → snapshot CPCache prefix → leaf-then-root swap → resume
 //   * deopt sweep (unless deferDeopt)
 //
@@ -4106,18 +3947,16 @@ int unloadClassPlan(const char* targetClassName, bool includeSubclasses) {
     return 0;
 }
 
-/* Stage 3.1 true-mergedCP commit for one klass.
-   Assumes the klass currently has NO active plan (caller unloaded it first).
-   hooks: full hook list (existing replays + new).
-   outResults: parallel to hooks (same size), filled with match outcomes for NEW hooks only;
-               existing (replay) hooks are prepended with matched=true entries. */
-static int commitKlassMerged(uint64_t klassAddr,
-                              std::vector<MergeHookData>& hooks,
+/* Commit a single klass: build new CP/RK/Tags/Cache, suspend, swap, resume.
+   Assumes no active plan on this klass (caller unloaded first).
+   outResults: parallel to hooks, filled for NEW hooks; replay hooks get matched=true. */
+static int commitKlass(uint64_t klassAddr,
+                              std::vector<HookData>& hooks,
                               const std::vector<bool>& isNew,
                               std::vector<HookOutcome>* outResults) {
     HANDLE proc = g_target.handle;
 
-    FVM_LOG("MERGED_COMMIT klass=0x%llX hooks=%zu", (unsigned long long)klassAddr, hooks.size());
+    FVM_LOG("CLASS_COMMIT klass=0x%llX hooks=%zu", (unsigned long long)klassAddr, hooks.size());
 
     /* ── Phase A: read TRUE oldCP₀ from IK._constants (plan was just unloaded) ── */
     int64_t ikCOff = structOffset("InstanceKlass", "_constants");
@@ -4158,7 +3997,7 @@ static int commitKlassMerged(uint64_t klassAddr,
     if (origCacheAddr) readRemoteI32(proc, origCacheAddr + (uint64_t)cacheLenOff, &origCacheLen);
 
     /* ── Assign merged layout ── */
-    assignMergedLayout((uint32_t)oldPoolLen, origRKLen, origCacheLen, hooks);
+    assignPoolLayout((uint32_t)oldPoolLen, origRKLen, origCacheLen, hooks);
 
     uint32_t totalNewCPEntries = 0;
     int32_t  totalNewRKEntries = 0;
@@ -4176,7 +4015,7 @@ static int commitKlassMerged(uint64_t klassAddr,
     size_t newPoolByteSize = oldPoolByteSize + totalNewCPEntries * 8;
     uint64_t newPoolAddr = (uint64_t)VirtualAllocEx(proc, NULL, newPoolByteSize,
                                                      MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-    if (!newPoolAddr) { setError("VirtualAllocEx_mergedCP_failed"); return 0; }
+    if (!newPoolAddr) { setError("VirtualAllocEx_newCP_failed"); return 0; }
 
     /* RK */
     int64_t rkLenOff2  = structOffset("Array<Klass*>","_length"); if(rkLenOff2<0)rkLenOff2=0;
@@ -4211,8 +4050,8 @@ static int commitKlassMerged(uint64_t klassAddr,
 
     /* Allocate each hook's newCM */
     for (auto& h : hooks) {
-        if (!buildMergedHookCM(h, newPoolAddr)) {
-            FVM_LOG("MERGED_COMMIT: buildMergedHookCM FAILED for %s%s: %s",
+        if (!buildHookCM(h, newPoolAddr)) {
+            FVM_LOG("CLASS_COMMIT: buildHookCM FAILED for %s%s: %s",
                     h.methodName.c_str(), h.paramDesc.c_str(), g_lastError.c_str());
             /* free already-allocated CMs */
             for (auto& h2 : hooks) if (h2.newCMRemoteAddr) VirtualFreeEx(proc,(LPVOID)h2.newCMRemoteAddr,0,MEM_RELEASE);
@@ -4235,28 +4074,65 @@ static int commitKlassMerged(uint64_t klassAddr,
     }
 
     /* Build merged data buffers */
-    std::vector<uint8_t> newPoolBytes = buildMergedPoolBytes(
+    std::vector<uint8_t> newPoolBytes = buildPoolBytes(
         oldPoolBytes, oldPoolLen, oldPoolByteSize, cpHeaderSize,
         hooks, newPoolLen, newRKAddr, newCacheAddr, newTagsAddr);
 
-    std::vector<uint8_t> newTagsBytes = buildMergedTagsBytes(proc, origTagsAddr, newPoolLen, hooks);
+    std::vector<uint8_t> newTagsBytes = buildPoolTagsBytes(proc, origTagsAddr, newPoolLen, hooks);
 
-    std::vector<uint8_t> newRKBytes = buildMergedRKBytes(proc, origRKAddr, origRKLen, newRKLen);
+    std::vector<uint8_t> newRKBytes = buildPoolRKBytes(proc, origRKAddr, origRKLen, newRKLen);
     /* Fill RK data entries for each hook */
     {
         uint64_t* rkData = (uint64_t*)(newRKBytes.data() + rkDataOff2);
         for (auto& h : hooks) {
             rkData[h.hookClassRKIdx] = h.hookKlassAddr;
             rkData[h.cbClassRKIdx]   = h.cbKlassAddr;
-            if (h.hasArgCapture && !h.targetParams.empty()) rkData[h.objectClassRKIdx] = h.objectKlassAddr;
+            if (h.wantObjectCpEntry()) rkData[h.objectClassRKIdx] = h.objectKlassAddr;
             if (h.needsUnbox) rkData[h.unboxClassRKIdx] = h.unboxKlassAddr;
+            for (auto& ex : h.extraClasses) rkData[ex.rkIdx] = ex.klassAddr;
         }
     }
 
     /* CPCache: sized to newCacheSize, prefix filled post-suspend */
     std::vector<uint8_t> newCacheBytes(newCacheSize, 0);
     /* Pre-fill the tail entries (new hooks) */
-    fillMergedCacheTail(newCacheBytes, cacheHdrSize, cacheEntrySize, hooks);
+    fillPoolCacheTail(newCacheBytes, cacheHdrSize, cacheEntrySize, hooks);
+
+    /* Allocate + write a remote Array<u1> for each rebuilt StackMapTable
+       (HEAD clean-prepend) and repoint ConstMethod::_stackmap_data at it.
+       Layout matches the tags array: { int32 _length; u1 _data[_length] }.
+       Like newCP / newCM, these arrays are intentionally never freed — an
+       in-flight frame may still reference the patched ConstMethod. */
+    {
+        int64_t smOff   = structOffset("ConstMethod", "_stackmap_data");
+        int64_t aLenOff  = structOffset("Array<u1>", "_length"); if (aLenOff  < 0) aLenOff  = 0;
+        int64_t aDataOff = structOffset("Array<u1>", "_data");   if (aDataOff < 0) aDataOff = 4;
+        for (auto& h : hooks) {
+            if (!h.haveNewStackMap) continue;
+            size_t dataLen = h.newStackMapBytes.size();
+            size_t arrSize = ((size_t)aDataOff + dataLen + 7) & ~(size_t)7;
+            std::vector<uint8_t> arr(arrSize, 0);
+            int32_t len32 = (int32_t)dataLen;
+            memcpy(arr.data() + aLenOff, &len32, 4);
+            memcpy(arr.data() + aDataOff, h.newStackMapBytes.data(), dataLen);
+
+            h.newStackMapRemoteAddr = (uint64_t)VirtualAllocEx(
+                proc, NULL, arrSize, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+            if (!h.newStackMapRemoteAddr) {
+                for (auto& h2 : hooks) if (h2.newCMRemoteAddr) VirtualFreeEx(proc,(LPVOID)h2.newCMRemoteAddr,0,MEM_RELEASE);
+                VirtualFreeEx(proc,(LPVOID)newPoolAddr,0,MEM_RELEASE);
+                VirtualFreeEx(proc,(LPVOID)newRKAddr,0,MEM_RELEASE);
+                VirtualFreeEx(proc,(LPVOID)newTagsAddr,0,MEM_RELEASE);
+                VirtualFreeEx(proc,(LPVOID)newCacheAddr,0,MEM_RELEASE);
+                setError("VirtualAllocEx_stackmap_failed"); return 0;
+            }
+            writeRemoteMem(proc, h.newStackMapRemoteAddr, arr.data(), arr.size());
+            memcpy(h.newCMBytes.data() + smOff, &h.newStackMapRemoteAddr, 8);
+            FVM_LOG("CLASS_COMMIT: stackmap_data → 0x%llX (%zuB) for %s%s",
+                    (unsigned long long)h.newStackMapRemoteAddr, dataLen,
+                    h.methodName.c_str(), h.paramDesc.c_str());
+        }
+    }
 
     /* Write non-cache data to remote (safe before suspend) */
     writeRemoteMem(proc, newPoolAddr,  newPoolBytes.data(),  newPoolBytes.size());
@@ -4284,7 +4160,7 @@ static int commitKlassMerged(uint64_t klassAddr,
     /* ── Phase C: single suspend → snapshot cache prefix → write cache → swap → resume ── */
     std::vector<DWORD> threadIds;
     suspendTargetThreads(g_target.pid, threadIds);
-    FVM_LOG("MERGED_COMMIT: suspended %zu threads", threadIds.size());
+    FVM_LOG("CLASS_COMMIT: suspended %zu threads", threadIds.size());
 
     /* Post-suspend: snapshot origCache prefix (race-free) */
     if (origCacheAddr) {
@@ -4297,7 +4173,7 @@ static int commitKlassMerged(uint64_t klassAddr,
         memcpy(newCacheBytes.data() + cacheLenOff, &newCacheLen, 4);
         if (cacheCPOff >= 0) memcpy(newCacheBytes.data() + cacheCPOff, &newPoolAddr, 8);
         /* Re-fill tail (prefix copy may have stomped them if origCacheSize > cacheHdrSize) */
-        fillMergedCacheTail(newCacheBytes, cacheHdrSize, cacheEntrySize, hooks);
+        fillPoolCacheTail(newCacheBytes, cacheHdrSize, cacheEntrySize, hooks);
     } else {
         memcpy(newCacheBytes.data() + cacheLenOff, &newCacheLen, 4);
         if (cacheCPOff >= 0) memcpy(newCacheBytes.data() + cacheCPOff, &newPoolAddr, 8);
@@ -4345,7 +4221,7 @@ static int commitKlassMerged(uint64_t klassAddr,
     for (auto& h : hooks) {
         writeRemoteMem(proc, h.methodAddr+(uint64_t)constMethodOff2, &h.newCMRemoteAddr, 8);
         if (codeOff2>=0) { uint64_t z=0; writeRemoteMem(proc, h.methodAddr+(uint64_t)codeOff2, &z, 8); }
-        clearMethodProfilingState(h.methodAddr, /*setDontInline=*/true, "MERGED_COMMIT");
+        clearMethodProfilingState(h.methodAddr, /*setDontInline=*/true, "CLASS_COMMIT");
     }
 
     /* Step 7c: commit barrier — IK._constants → newPoolAddr */
@@ -4365,7 +4241,7 @@ static int commitKlassMerged(uint64_t klassAddr,
     }
 
     resumeTargetThreads(threadIds);
-    FVM_LOG("MERGED_COMMIT: resumed %zu threads, newCP=0x%llX hooks=%zu",
+    FVM_LOG("CLASS_COMMIT: resumed %zu threads, newCP=0x%llX hooks=%zu",
             threadIds.size(), (unsigned long long)newPoolAddr, hooks.size());
     return 1;
 }
@@ -4395,7 +4271,7 @@ int commitClassPlan(const char* targetClassName,
 
     if (outResults) outResults->resize(additionalHooks.size());
 
-    /* Helper: commit one klass with merged CP using Stage 3.1 path */
+    /* Commit one klass: resolve hooks, build new CP, swap. */
     auto commitOneKlass = [&](uint64_t kAddr, const std::vector<HookSpecExtended>& newSpecs,
                                std::vector<HookOutcome>* results) -> bool {
         /* Stash existing plan (if any) and unload it → back to oldCP₀ */
@@ -4411,7 +4287,7 @@ int commitClassPlan(const char* targetClassName,
         }
 
         /* Phase A: resolve all hooks (existing replays + new) */
-        std::vector<MergeHookData> hooks;
+        std::vector<HookData> hooks;
         std::vector<bool>          isNew;
 
         /* 1. Replay existing hooks */
@@ -4427,8 +4303,8 @@ int commitClassPlan(const char* targetClassName,
             ext.hookDesc=pmi.hook.hookDesc;   ext.injectAt=pmi.hook.injectAt;
             ext.candidates.push_back({mName, mSig});
 
-            MergeHookData hd;
-            if (resolveMergeHookData(kAddr, mName, mSig, ext, hd)) {
+            HookData hd;
+            if (resolveHookData(kAddr, mName, mSig, ext, hd)) {
                 hooks.push_back(std::move(hd));
                 isNew.push_back(false);
             } else {
@@ -4445,8 +4321,8 @@ int commitClassPlan(const char* targetClassName,
             out.reason = spec.candidates.empty() ? "no_candidates" : "method_not_found";
             bool matched = false;
             for (auto& cand : spec.candidates) {
-                MergeHookData hd;
-                if (resolveMergeHookData(kAddr, cand.methodName, cand.paramDesc, spec, hd)) {
+                HookData hd;
+                if (resolveHookData(kAddr, cand.methodName, cand.paramDesc, spec, hd)) {
                     out.matched    = true;
                     out.methodName = cand.methodName;
                     out.paramDesc  = cand.paramDesc;
@@ -4468,7 +4344,7 @@ int commitClassPlan(const char* targetClassName,
         if (hooks.empty()) { setError("no_hooks_resolved"); return false; }
 
         /* Phase B+C: merged alloc + single suspend/write/swap */
-        return commitKlassMerged(kAddr, hooks, isNew, nullptr) == 1;
+        return commitKlass(kAddr, hooks, isNew, nullptr) == 1;
     };
 
     /* Suspend target threads for the whole batch (Phase A includes no I/O that needs them
