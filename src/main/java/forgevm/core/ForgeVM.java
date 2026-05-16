@@ -3,6 +3,7 @@ package forgevm.core;
 import forgevm.jvm.AgentFilter;
 import forgevm.jvm.JvmControl;
 import forgevm.jvm.NativeFilter;
+import forgevm.jvm.ProcessFilter;
 import forgevm.jvm.RelaunchException;
 import forgevm.memory.MemoryUtil;
 import forgevm.forge.ForgeManager;
@@ -207,29 +208,62 @@ public final class ForgeVM {
         return sendFilterCommand("unban_native_load", null, null);
     }
 
+    // -- process create guard (loader-level, hooks ntdll!NtCreateUserProcess) --
+
+    /** Block all child process creation. */
+    public static boolean banProcessCreate() {
+        return sendFilterCommand("ban_process_create", null, null);
+    }
+
+    /** Block child process creation matching the filter. */
+    public static boolean banProcessCreate(ProcessFilter filter) {
+        return sendFilterCommand("ban_process_create",
+                filter == null ? null : filter.mode().name(),
+                filter == null ? null : filter.patterns());
+    }
+
+    public static boolean unbanProcessCreate() {
+        return sendFilterCommand("unban_process_create", null, null);
+    }
+
     // -- relaunch (kill + restart JVM with filtered command line) --
 
     /** Relaunch the JVM, keeping all existing -javaagent/-agentpath args. Never returns on success. */
     public static void relaunch() throws RelaunchException {
-        relaunchInternal(null, null);
+        relaunchInternal(null, null, null);
     }
 
     /** Relaunch the JVM, applying agentFilter to -javaagent: args on the new command line. Never returns on success. */
     public static void relaunch(AgentFilter agentFilter) throws RelaunchException {
-        relaunchInternal(agentFilter, null);
+        relaunchInternal(agentFilter, null, null);
     }
 
     /** Relaunch the JVM, applying nativeFilter to -agentpath: args on the new command line. Never returns on success. */
     public static void relaunch(NativeFilter nativeFilter) throws RelaunchException {
-        relaunchInternal(null, nativeFilter);
+        relaunchInternal(null, nativeFilter, null);
     }
 
     /** Relaunch the JVM, applying both filters to the new command line. Never returns on success. */
     public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter) throws RelaunchException {
-        relaunchInternal(agentFilter, nativeFilter);
+        relaunchInternal(agentFilter, nativeFilter, null);
     }
 
-    private static void relaunchInternal(AgentFilter agentFilter, NativeFilter nativeFilter) throws RelaunchException {
+    /**
+     * Relaunch the JVM with a process creation filter pre-installed on the new JVM.
+     * The filter is active from the new JVM's first instruction — no window exists
+     * in which a spawned child process could escape the filter.
+     * Never returns on success.
+     */
+    public static void relaunch(ProcessFilter processFilter) throws RelaunchException {
+        relaunchInternal(null, null, processFilter);
+    }
+
+    /** Relaunch the JVM, applying all three filters. Never returns on success. */
+    public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter, ProcessFilter processFilter) throws RelaunchException {
+        relaunchInternal(agentFilter, nativeFilter, processFilter);
+    }
+
+    private static void relaunchInternal(AgentFilter agentFilter, NativeFilter nativeFilter, ProcessFilter processFilter) throws RelaunchException {
         if (System.getProperty("forgevm.relaunched") != null) {
             throw new RelaunchException("already_relaunched");
         }
@@ -238,7 +272,7 @@ public final class ForgeVM {
             throw new RelaunchException("agent_not_active");
         }
         try {
-            String command = buildRelaunchCommand(agentFilter, nativeFilter);
+            String command = buildRelaunchCommand(agentFilter, nativeFilter, processFilter);
             String response = sendCommand(session, command);
             if (!isOkResponse(response)) {
                 String reason = "relaunch_rejected";
@@ -262,7 +296,7 @@ public final class ForgeVM {
         }
     }
 
-    private static String buildRelaunchCommand(AgentFilter agentFilter, NativeFilter nativeFilter) {
+    private static String buildRelaunchCommand(AgentFilter agentFilter, NativeFilter nativeFilter, ProcessFilter processFilter) {
         StringBuilder sb = new StringBuilder();
         sb.append("{\"cmd\":\"relaunch\"");
         sb.append(",\"pid\":").append(ProcessHandle.current().pid());
@@ -285,6 +319,17 @@ public final class ForgeVM {
             for (int i = 0; i < np.size(); i++) {
                 if (i > 0) sb.append(',');
                 sb.append('"').append(escapeJson(np.get(i))).append('"');
+            }
+            sb.append(']');
+        }
+        sb.append(",\"hasProcessFilter\":").append(processFilter != null);
+        if (processFilter != null) {
+            sb.append(",\"processMode\":\"").append(escapeJson(processFilter.mode().name().toLowerCase())).append("\"");
+            sb.append(",\"processPatterns\":[");
+            List<String> pp = processFilter.patterns();
+            for (int i = 0; i < pp.size(); i++) {
+                if (i > 0) sb.append(',');
+                sb.append('"').append(escapeJson(pp.get(i))).append('"');
             }
             sb.append(']');
         }

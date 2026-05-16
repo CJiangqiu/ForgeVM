@@ -643,6 +643,7 @@ namespace {
     };
     extern PatchState g_javaAgentPatch;
     extern PatchState g_nativeLoadPatch;
+    extern PatchState g_processCreatePatch;
 }
 
 /* Minimal attach: opens process handle and sets g_target.{handle,pid}.
@@ -664,8 +665,9 @@ extern "C" __declspec(dllexport) int forgevm_attach_target_minimal(unsigned long
      * which is gone (or about to be). Reset so future install calls don't
      * bail with "already_patched". */
     if (oldPid != newPid) {
-        g_javaAgentPatch  = PatchState{};
-        g_nativeLoadPatch = PatchState{};
+        g_javaAgentPatch     = PatchState{};
+        g_nativeLoadPatch    = PatchState{};
+        g_processCreatePatch = PatchState{};
         FVM_LOG("attach_target_minimal: target pid changed %lu -> %lu, patch state cleared",
                 (unsigned long)oldPid, (unsigned long)newPid);
     }
@@ -705,8 +707,9 @@ extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long
     }
     /* See attach_target_minimal for rationale — patch state is per-target. */
     if (oldPid != newPid) {
-        g_javaAgentPatch  = PatchState{};
-        g_nativeLoadPatch = PatchState{};
+        g_javaAgentPatch     = PatchState{};
+        g_nativeLoadPatch    = PatchState{};
+        g_processCreatePatch = PatchState{};
         FVM_LOG("bootstrap_target: target pid changed %lu -> %lu, patch state cleared",
                 (unsigned long)oldPid, (unsigned long)newPid);
     }
@@ -868,6 +871,7 @@ namespace {
     /* Definitions for the forward-declared globals above. */
     PatchState g_javaAgentPatch;
     PatchState g_nativeLoadPatch;
+    PatchState g_processCreatePatch;
 }
 
 // Write to remote code section (handles VirtualProtectEx for .text pages)
@@ -1813,4 +1817,439 @@ extern "C" __declspec(dllexport) int forgevm_ban_native_load(const char* pipeNam
 
 extern "C" __declspec(dllexport) int forgevm_unban_native_load() {
     return uninstallFilterTrampoline(g_nativeLoadPatch, "unban_native_load");
+}
+
+// ============================================================
+// ntdll!NtCreateUserProcess hook — process creation filter
+//
+// NtCreateUserProcess is the single kernel-mode entry point for all
+// user-mode process creation: CreateProcessW, ProcessBuilder,
+// and any native code calling CreateProcess* directly all funnel here.
+//
+// NtCreateUserProcess x64 signature (11 parameters):
+//   NTSTATUS NTAPI NtCreateUserProcess(
+//       PHANDLE  ProcessHandle,               // rcx
+//       PHANDLE  ThreadHandle,                // rdx
+//       ACCESS_MASK ProcessDesiredAccess,     // r8
+//       ACCESS_MASK ThreadDesiredAccess,      // r9
+//       POBJECT_ATTRIBUTES ProcessObjAttrs,  // [rsp+0x28]  ← image path here
+//       POBJECT_ATTRIBUTES ThreadObjAttrs,   // [rsp+0x30]
+//       ULONG    ProcessFlags,               // [rsp+0x38]
+//       ULONG    ThreadFlags,                // [rsp+0x40]
+//       PRTL_USER_PROCESS_PARAMETERS Params, // [rsp+0x48]
+//       PPS_CREATE_INFO CreateInfo,          // [rsp+0x50]
+//       PPS_ATTRIBUTE_LIST AttrList);        // [rsp+0x58]
+//
+// Image path: ProcessObjAttrs->ObjectName (UNICODE_STRING* at OA+0x10).
+// The NT path may carry a \??\ prefix; glob matching on the full path
+// (including prefix) still works with patterns like *processproxy*.
+// Block return: STATUS_ACCESS_DENIED (0xC0000005).
+//
+// Data layout (identical slot offsets to LdrLoadDll trampoline):
+//   +0x300  fn_CreateFileA
+//   +0x308  fn_WriteFile
+//   +0x310  fn_ReadFile
+//   +0x318  fn_CloseHandle
+//   +0x320  abs_orig_plus_5
+//   +0x328  fn_WideCharToMultiByte
+//   +0x330  kind_byte ('P')
+//   +0x340  pipe_name
+//
+// Stack frame after `sub rsp, 0x4A8`:
+//   +0x20..0x3F   shadow space for API calls
+//   +0x40         kind byte
+//   +0x41..0x3F0  UTF-8 path buffer (800 bytes)
+//   +0x440        saved pipe HANDLE
+//   +0x448        WriteFile bytes-written (DWORD)
+//   +0x44C        ReadFile bytes-read (DWORD)
+//   +0x450        reply byte
+//   +0x458        saved rcx
+//   +0x460        saved rdx
+//   +0x468        saved r8
+//   +0x470        saved r9
+//   +0x4D0        original arg5 (ProcessObjAttrs) — [caller_rsp+0x28]
+// ============================================================
+static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
+    const uint8_t* savedPrologue,
+    uint64_t origPlus5,
+    uint64_t fnCreateFileA,
+    uint64_t fnWriteFile,
+    uint64_t fnReadFile,
+    uint64_t fnCloseHandle,
+    uint64_t fnWideCharToMultiByte,
+    const char* pipeName)
+{
+    const size_t kPageSize = 0x400;
+    std::vector<uint8_t> buf(kPageSize, 0xCC);
+
+    std::vector<uint8_t> code;
+    code.reserve(0x200);
+
+    /* === Prologue: allocate frame, save register args === */
+    /* 0x000: sub rsp, 0x4A8 */
+    emitBytes(code, {0x48, 0x81, 0xEC, 0xA8, 0x04, 0x00, 0x00});
+    /* 0x007: mov [rsp+0x458], rcx */
+    emitBytes(code, {0x48, 0x89, 0x8C, 0x24, 0x58, 0x04, 0x00, 0x00});
+    /* 0x00F: mov [rsp+0x460], rdx */
+    emitBytes(code, {0x48, 0x89, 0x94, 0x24, 0x60, 0x04, 0x00, 0x00});
+    /* 0x017: mov [rsp+0x468], r8 */
+    emitBytes(code, {0x4C, 0x89, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});
+    /* 0x01F: mov [rsp+0x470], r9 */
+    emitBytes(code, {0x4C, 0x89, 0x8C, 0x24, 0x70, 0x04, 0x00, 0x00});
+
+    /* === Load ProcessObjectAttributes (arg5 = [rsp+0x4D0] after frame alloc) === */
+    /* 0x027: mov r10, [rsp+0x4D0] */
+    emitBytes(code, {0x4C, 0x8B, 0x94, 0x24, 0xD0, 0x04, 0x00, 0x00});
+    /* 0x02F: test r10, r10 */
+    emitBytes(code, {0x4D, 0x85, 0xD2});
+    /* 0x032: je _allow_direct  (disp32 = 0x1B2 - 0x038 = 0x17A) */
+    emitBytes(code, {0x0F, 0x84, 0x7A, 0x01, 0x00, 0x00});
+
+    /* === Load OBJECT_ATTRIBUTES.ObjectName (at OA+0x10) === */
+    /* 0x038: mov r10, [r10+0x10] */
+    emitBytes(code, {0x4D, 0x8B, 0x52, 0x10});
+    /* 0x03C: test r10, r10 */
+    emitBytes(code, {0x4D, 0x85, 0xD2});
+    /* 0x03F: je _allow_direct  (disp32 = 0x1B2 - 0x045 = 0x16D) */
+    emitBytes(code, {0x0F, 0x84, 0x6D, 0x01, 0x00, 0x00});
+
+    /* === Load UNICODE_STRING.Length (r11d) and .Buffer (r10) === */
+    /* 0x045: movzx r11d, word [r10]  — UNICODE_STRING.Length (bytes) */
+    emitBytes(code, {0x45, 0x0F, 0xB7, 0x1A});
+    /* 0x049: test r11d, r11d */
+    emitBytes(code, {0x45, 0x85, 0xDB});
+    /* 0x04C: je _allow_direct  (disp32 = 0x1B2 - 0x052 = 0x160) */
+    emitBytes(code, {0x0F, 0x84, 0x60, 0x01, 0x00, 0x00});
+    /* 0x052: mov r10, [r10+0x08]  — UNICODE_STRING.Buffer */
+    emitBytes(code, {0x4D, 0x8B, 0x52, 0x08});
+    /* 0x056: test r10, r10 */
+    emitBytes(code, {0x4D, 0x85, 0xD2});
+    /* 0x059: je _allow_direct  (disp32 = 0x1B2 - 0x05F = 0x153) */
+    emitBytes(code, {0x0F, 0x84, 0x53, 0x01, 0x00, 0x00});
+
+    /* === Clamp wchar count === */
+    /* 0x05F: shr r11d, 1  — Length(bytes) → wchar count */
+    emitBytes(code, {0x41, 0xD1, 0xEB});
+    /* 0x062: cmp r11d, 400 */
+    emitBytes(code, {0x41, 0x81, 0xFB, 0x90, 0x01, 0x00, 0x00});
+    /* 0x069: jbe _len_ok  (rel8: target=0x071, disp=0x071-0x06B=0x06) */
+    emitBytes(code, {0x76, 0x06});
+    /* 0x06B: mov r11d, 400 */
+    emitBytes(code, {0x41, 0xBB, 0x90, 0x01, 0x00, 0x00});
+
+    /* _len_ok at 0x071 */
+    /* 0x071: movzx ecx, byte [rip+kind_byte]  (kind_byte@0x330, disp=0x330-0x078=0x2B8) */
+    emitBytes(code, {0x0F, 0xB6, 0x0D, 0xB8, 0x02, 0x00, 0x00});
+    /* 0x078: mov [rsp+0x40], cl */
+    emitBytes(code, {0x88, 0x4C, 0x24, 0x40});
+
+    /* === WideCharToMultiByte(CP_UTF8, 0, Buffer, cchWide, outBuf, 800, NULL, NULL) === */
+    /* 0x07C: mov ecx, 65001 */
+    emitBytes(code, {0xB9, 0xE9, 0xFD, 0x00, 0x00});
+    /* 0x081: xor edx, edx */
+    emitBytes(code, {0x33, 0xD2});
+    /* 0x083: mov r8, r10  (Buffer) */
+    emitBytes(code, {0x4D, 0x8B, 0xC2});
+    /* 0x086: mov r9d, r11d  (wchar count) */
+    emitBytes(code, {0x45, 0x8B, 0xCB});
+    /* 0x089: lea rax, [rsp+0x41]  (outBuf) */
+    emitBytes(code, {0x48, 0x8D, 0x44, 0x24, 0x41});
+    /* 0x08E: mov [rsp+0x20], rax */
+    emitBytes(code, {0x48, 0x89, 0x44, 0x24, 0x20});
+    /* 0x093: mov dword [rsp+0x28], 800 */
+    emitBytes(code, {0xC7, 0x44, 0x24, 0x28, 0x20, 0x03, 0x00, 0x00});
+    /* 0x09B: mov qword [rsp+0x30], 0  (lpDefaultChar) */
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00});
+    /* 0x0A4: mov qword [rsp+0x38], 0  (lpUsedDefaultChar) */
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x38, 0x00, 0x00, 0x00, 0x00});
+    /* 0x0AD: mov rax, [rip+fn_WideCharToMultiByte]  (slot@0x328, disp=0x328-0x0B4=0x274) */
+    emitBytes(code, {0x48, 0x8B, 0x05, 0x74, 0x02, 0x00, 0x00});
+    /* 0x0B4: call rax */
+    emitBytes(code, {0xFF, 0xD0});
+
+    /* 0x0B6: test eax, eax */
+    emitBytes(code, {0x85, 0xC0});
+    /* 0x0B8: je _allow_direct  (conversion failed → fail-open; disp=0x1B2-0x0BE=0xF4) */
+    emitBytes(code, {0x0F, 0x84, 0xF4, 0x00, 0x00, 0x00});
+
+    /* 0x0BE: mov r11d, eax  (UTF-8 byte count) */
+    emitBytes(code, {0x41, 0x89, 0xC3});
+    /* 0x0C1: mov byte [rsp+r11+0x41], 0x0A  (newline terminator) */
+    emitBytes(code, {0x42, 0xC6, 0x84, 0x1C, 0x41, 0x00, 0x00, 0x00, 0x0A});
+
+    /* === CreateFileA(pipe, GENERIC_READ|WRITE, 0, NULL, OPEN_EXISTING, 0, NULL) === */
+    /* 0x0CA: lea rcx, [rip+pipe_name]  (pipe_name@0x340, disp=0x340-0x0D1=0x26F) */
+    emitBytes(code, {0x48, 0x8D, 0x0D, 0x6F, 0x02, 0x00, 0x00});
+    /* 0x0D1: mov edx, 0xC0000000 */
+    emitBytes(code, {0xBA, 0x00, 0x00, 0x00, 0xC0});
+    /* 0x0D6: xor r8d, r8d */
+    emitBytes(code, {0x45, 0x33, 0xC0});
+    /* 0x0D9: xor r9d, r9d */
+    emitBytes(code, {0x45, 0x33, 0xC9});
+    /* 0x0DC: mov dword [rsp+0x20], 3  (OPEN_EXISTING) */
+    emitBytes(code, {0xC7, 0x44, 0x24, 0x20, 0x03, 0x00, 0x00, 0x00});
+    /* 0x0E4: mov dword [rsp+0x28], 0 */
+    emitBytes(code, {0xC7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00});
+    /* 0x0EC: mov qword [rsp+0x30], 0 */
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00});
+    /* 0x0F5: mov rax, [rip+fn_CreateFileA]  (slot@0x300, disp=0x300-0x0FC=0x204) */
+    emitBytes(code, {0x48, 0x8B, 0x05, 0x04, 0x02, 0x00, 0x00});
+    /* 0x0FC: call rax */
+    emitBytes(code, {0xFF, 0xD0});
+
+    /* 0x0FE: cmp rax, -1  (INVALID_HANDLE_VALUE) */
+    emitBytes(code, {0x48, 0x83, 0xF8, 0xFF});
+    /* 0x102: je _allow_direct  (disp=0x1B2-0x108=0xAA) */
+    emitBytes(code, {0x0F, 0x84, 0xAA, 0x00, 0x00, 0x00});
+    /* 0x108: mov [rsp+0x440], rax  (save pipe handle) */
+    emitBytes(code, {0x48, 0x89, 0x84, 0x24, 0x40, 0x04, 0x00, 0x00});
+
+    /* === WriteFile(handle, &buf[0x40], r11+2, &wrote, NULL) === */
+    /* 0x110: mov rcx, [rsp+0x440] */
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x40, 0x04, 0x00, 0x00});
+    /* 0x118: lea rdx, [rsp+0x40] */
+    emitBytes(code, {0x48, 0x8D, 0x54, 0x24, 0x40});
+    /* 0x11D: lea r8, [r11+2]  (kind byte + path bytes + '\n') */
+    emitBytes(code, {0x4D, 0x8D, 0x43, 0x02});
+    /* 0x121: lea r9, [rsp+0x448] */
+    emitBytes(code, {0x4C, 0x8D, 0x8C, 0x24, 0x48, 0x04, 0x00, 0x00});
+    /* 0x129: mov qword [rsp+0x20], 0 */
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00});
+    /* 0x132: mov rax, [rip+fn_WriteFile]  (slot@0x308, disp=0x308-0x139=0x1CF) */
+    emitBytes(code, {0x48, 0x8B, 0x05, 0xCF, 0x01, 0x00, 0x00});
+    /* 0x139: call rax */
+    emitBytes(code, {0xFF, 0xD0});
+
+    /* 0x13B: test eax, eax */
+    emitBytes(code, {0x85, 0xC0});
+    /* 0x13D: je _close_and_allow  (disp=0x1A1-0x143=0x5E) */
+    emitBytes(code, {0x0F, 0x84, 0x5E, 0x00, 0x00, 0x00});
+
+    /* === ReadFile(handle, &reply, 1, &got, NULL) === */
+    /* 0x143: mov rcx, [rsp+0x440] */
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x40, 0x04, 0x00, 0x00});
+    /* 0x14B: lea rdx, [rsp+0x450] */
+    emitBytes(code, {0x48, 0x8D, 0x94, 0x24, 0x50, 0x04, 0x00, 0x00});
+    /* 0x153: mov r8d, 1 */
+    emitBytes(code, {0x41, 0xB8, 0x01, 0x00, 0x00, 0x00});
+    /* 0x159: lea r9, [rsp+0x44C] */
+    emitBytes(code, {0x4C, 0x8D, 0x8C, 0x24, 0x4C, 0x04, 0x00, 0x00});
+    /* 0x161: mov qword [rsp+0x20], 0 */
+    emitBytes(code, {0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00});
+    /* 0x16A: mov rax, [rip+fn_ReadFile]  (slot@0x310, disp=0x310-0x171=0x19F) */
+    emitBytes(code, {0x48, 0x8B, 0x05, 0x9F, 0x01, 0x00, 0x00});
+    /* 0x171: call rax */
+    emitBytes(code, {0xFF, 0xD0});
+
+    /* 0x173: test eax, eax */
+    emitBytes(code, {0x85, 0xC0});
+    /* 0x175: je _close_and_allow  (disp=0x1A1-0x17B=0x26) */
+    emitBytes(code, {0x0F, 0x84, 0x26, 0x00, 0x00, 0x00});
+
+    /* === CloseHandle + check reply === */
+    /* 0x17B: mov rcx, [rsp+0x440] */
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x40, 0x04, 0x00, 0x00});
+    /* 0x183: mov rax, [rip+fn_CloseHandle]  (slot@0x318, disp=0x318-0x18A=0x18E) */
+    emitBytes(code, {0x48, 0x8B, 0x05, 0x8E, 0x01, 0x00, 0x00});
+    /* 0x18A: call rax */
+    emitBytes(code, {0xFF, 0xD0});
+
+    /* 0x18C: movzx eax, byte [rsp+0x450] */
+    emitBytes(code, {0x0F, 0xB6, 0x84, 0x24, 0x50, 0x04, 0x00, 0x00});
+    /* 0x194: cmp al, '0' */
+    emitBytes(code, {0x3C, 0x30});
+    /* 0x196: je _block  (disp=0x1E4-0x19C=0x48) */
+    emitBytes(code, {0x0F, 0x84, 0x48, 0x00, 0x00, 0x00});
+    /* 0x19C: jmp _allow_direct  (disp=0x1B2-0x1A1=0x11) */
+    emitBytes(code, {0xE9, 0x11, 0x00, 0x00, 0x00});
+
+    /* === _close_and_allow at 0x1A1 === */
+    /* 0x1A1: mov rcx, [rsp+0x440] */
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x40, 0x04, 0x00, 0x00});
+    /* 0x1A9: mov rax, [rip+fn_CloseHandle]  (slot@0x318, disp=0x318-0x1B0=0x168) */
+    emitBytes(code, {0x48, 0x8B, 0x05, 0x68, 0x01, 0x00, 0x00});
+    /* 0x1B0: call rax */
+    emitBytes(code, {0xFF, 0xD0});
+
+    /* === _allow_direct at 0x1B2 === */
+    /* 0x1B2: mov rcx, [rsp+0x458] */
+    emitBytes(code, {0x48, 0x8B, 0x8C, 0x24, 0x58, 0x04, 0x00, 0x00});
+    /* 0x1BA: mov rdx, [rsp+0x460] */
+    emitBytes(code, {0x48, 0x8B, 0x94, 0x24, 0x60, 0x04, 0x00, 0x00});
+    /* 0x1C2: mov r8, [rsp+0x468] */
+    emitBytes(code, {0x4C, 0x8B, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});
+    /* 0x1CA: mov r9, [rsp+0x470] */
+    emitBytes(code, {0x4C, 0x8B, 0x8C, 0x24, 0x70, 0x04, 0x00, 0x00});
+    /* 0x1D2: add rsp, 0x4A8 */
+    emitBytes(code, {0x48, 0x81, 0xC4, 0xA8, 0x04, 0x00, 0x00});
+    /* 0x1D9: <5 saved prologue bytes> */
+    for (int i = 0; i < 5; i++) code.push_back(savedPrologue[i]);
+    /* 0x1DE: jmp qword [rip+abs_orig_plus_5]  (slot@0x320, disp=0x320-0x1E4=0x13C) */
+    emitBytes(code, {0xFF, 0x25, 0x3C, 0x01, 0x00, 0x00});
+
+    /* === _block at 0x1E4 === */
+    /* 0x1E4: add rsp, 0x4A8 */
+    emitBytes(code, {0x48, 0x81, 0xC4, 0xA8, 0x04, 0x00, 0x00});
+    /* 0x1EB: mov eax, 0xC0000005  (STATUS_ACCESS_DENIED) */
+    emitBytes(code, {0xB8, 0x05, 0x00, 0x00, 0xC0});
+    /* 0x1F0: ret */
+    emitBytes(code, {0xC3});
+
+    if (code.size() > 0x300) {
+        FVM_LOG("buildNtCreateUserProcessTrampoline: code too large (%zu bytes)", code.size());
+        return {};
+    }
+    for (size_t i = 0; i < code.size(); i++) buf[i] = code[i];
+
+    writeU64(buf, 0x300, fnCreateFileA);
+    writeU64(buf, 0x308, fnWriteFile);
+    writeU64(buf, 0x310, fnReadFile);
+    writeU64(buf, 0x318, fnCloseHandle);
+    writeU64(buf, 0x320, origPlus5);
+    writeU64(buf, 0x328, fnWideCharToMultiByte);
+    buf[0x330] = static_cast<uint8_t>('P');
+
+    size_t pn = 0;
+    if (pipeName != nullptr) {
+        while (pipeName[pn] != '\0' && pn < 127) {
+            buf[0x340 + pn] = static_cast<uint8_t>(pipeName[pn]);
+            pn++;
+        }
+    }
+    buf[0x340 + pn] = 0;
+
+    return buf;
+}
+
+static int installNtCreateUserProcessFilter(PatchState& state, const char* pipeName) {
+    if (g_target.handle == NULL) {
+        setError("no_target_handle");
+        return 0;
+    }
+    if (state.patched) {
+        setError("already_patched");
+        return 0;
+    }
+    if (pipeName == nullptr || pipeName[0] == '\0') {
+        setError("missing_pipe_name");
+        return 0;
+    }
+
+    HANDLE proc = g_target.handle;
+    uint64_t addr = resolveNtdllExport(proc, "NtCreateUserProcess");
+    if (addr == 0) {
+        setError("export_not_found");
+        return 0;
+    }
+    FVM_LOG("ban_process_create: ntdll!NtCreateUserProcess @ 0x%llX", (unsigned long long)addr);
+
+    uint8_t saved5[5] = {};
+    if (!readRemoteMem(proc, addr, saved5, 5)) {
+        setError("read_original_failed");
+        return 0;
+    }
+    FVM_LOG("ban_process_create: original prologue: %02X %02X %02X %02X %02X",
+            saved5[0], saved5[1], saved5[2], saved5[3], saved5[4]);
+
+    uint8_t b0 = saved5[0];
+    bool dangerous = (b0 == 0xE8) || (b0 == 0xE9) || (b0 == 0xEB) ||
+                     (b0 >= 0x70 && b0 <= 0x7F) || (b0 == 0xFF);
+    if (dangerous) {
+        setError("unsafe_prologue");
+        return 0;
+    }
+
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (!k32) {
+        setError("kernel32_not_loaded");
+        return 0;
+    }
+    uint64_t fnCreate = reinterpret_cast<uint64_t>(GetProcAddress(k32, "CreateFileA"));
+    uint64_t fnWrite  = reinterpret_cast<uint64_t>(GetProcAddress(k32, "WriteFile"));
+    uint64_t fnRead   = reinterpret_cast<uint64_t>(GetProcAddress(k32, "ReadFile"));
+    uint64_t fnClose  = reinterpret_cast<uint64_t>(GetProcAddress(k32, "CloseHandle"));
+    uint64_t fnWcm    = reinterpret_cast<uint64_t>(GetProcAddress(k32, "WideCharToMultiByte"));
+    if (!fnCreate || !fnWrite || !fnRead || !fnClose || !fnWcm) {
+        setError("kernel32_resolve_failed");
+        return 0;
+    }
+
+    const size_t kPage = 0x400;
+    uint64_t allocHint = findFreeRegionNear(proc, addr, kPage);
+    if (allocHint == 0) {
+        setError("no_nearby_free_region");
+        return 0;
+    }
+    void* allocated = VirtualAllocEx(proc, reinterpret_cast<LPVOID>(allocHint), kPage,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!allocated) {
+        setError("virtual_alloc_failed");
+        return 0;
+    }
+    uint64_t trampAddr = reinterpret_cast<uint64_t>(allocated);
+
+    int64_t delta = static_cast<int64_t>(trampAddr) - static_cast<int64_t>(addr + 5);
+    if (delta < static_cast<int64_t>(INT32_MIN) || delta > static_cast<int64_t>(INT32_MAX)) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("tramp_out_of_rel32_range");
+        return 0;
+    }
+    FVM_LOG("ban_process_create: trampoline @ 0x%llX (delta=%lld)",
+            (unsigned long long)trampAddr, (long long)delta);
+
+    std::vector<uint8_t> image = buildNtCreateUserProcessTrampoline(
+        saved5, addr + 5, fnCreate, fnWrite, fnRead, fnClose, fnWcm, pipeName);
+    if (image.empty()) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("trampoline_build_failed");
+        return 0;
+    }
+    if (!writeRemoteMem(proc, trampAddr, image.data(), image.size())) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("trampoline_write_failed");
+        return 0;
+    }
+    FlushInstructionCache(proc, reinterpret_cast<LPCVOID>(trampAddr), image.size());
+
+    uint8_t patch[5];
+    patch[0] = 0xE9;
+    int32_t rel = static_cast<int32_t>(delta);
+    patch[1] = static_cast<uint8_t>(rel);
+    patch[2] = static_cast<uint8_t>(rel >> 8);
+    patch[3] = static_cast<uint8_t>(rel >> 16);
+    patch[4] = static_cast<uint8_t>(rel >> 24);
+
+    if (!writeRemoteCode(proc, addr, patch, sizeof(patch))) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("write_patch_failed");
+        return 0;
+    }
+
+    uint8_t verify[5] = {};
+    readRemoteMem(proc, addr, verify, sizeof(verify));
+    if (memcmp(verify, patch, sizeof(patch)) != 0) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("verify_failed");
+        return 0;
+    }
+
+    state.targetAddr = addr;
+    state.patchSize = 5;
+    memcpy(state.original, saved5, 5);
+    state.patched = true;
+    state.trampolineAddr = trampAddr;
+    state.trampolineSize = kPage;
+    state.trampolineInstalled = true;
+
+    FVM_LOG("ban_process_create: installed NtCreateUserProcess trampoline + E9 patch (verified)");
+    setError("ok");
+    return 1;
+}
+
+extern "C" __declspec(dllexport) int forgevm_ban_process_create(const char* pipeName) {
+    return installNtCreateUserProcessFilter(g_processCreatePatch, pipeName);
+}
+
+extern "C" __declspec(dllexport) int forgevm_unban_process_create() {
+    return uninstallFilterTrampoline(g_processCreatePatch, "unban_process_create");
 }

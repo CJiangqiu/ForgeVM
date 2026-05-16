@@ -83,6 +83,8 @@ typedef int(__cdecl* BanJavaAgentFn)(const char*);
 typedef int(__cdecl* UnbanJavaAgentFn)();
 typedef int(__cdecl* BanNativeLoadFn)(const char*);
 typedef int(__cdecl* UnbanNativeLoadFn)();
+typedef int(__cdecl* BanProcessCreateFn)(const char*);
+typedef int(__cdecl* UnbanProcessCreateFn)();
 typedef int(__cdecl* ForgeClassPlanFn)(const char*, const char*, int, int, char*, int);
 typedef int(__cdecl* ForgeClassUnloadFn)(const char*, int);
 
@@ -112,6 +114,8 @@ struct NativeApi {
     UnbanJavaAgentFn unbanJavaAgent = NULL;
     BanNativeLoadFn banNativeLoad = NULL;
     UnbanNativeLoadFn unbanNativeLoad = NULL;
+    BanProcessCreateFn banProcessCreate = NULL;
+    UnbanProcessCreateFn unbanProcessCreate = NULL;
     ForgeClassPlanFn forgeClassPlan = NULL;
     ForgeClassUnloadFn forgeClassUnload = NULL;
 };
@@ -562,6 +566,8 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->unbanJavaAgent  = reinterpret_cast<UnbanJavaAgentFn>(GetProcAddress(module, "forgevm_unban_java_agent"));
     api->banNativeLoad   = reinterpret_cast<BanNativeLoadFn>(GetProcAddress(module, "forgevm_ban_native_load"));
     api->unbanNativeLoad = reinterpret_cast<UnbanNativeLoadFn>(GetProcAddress(module, "forgevm_unban_native_load"));
+    api->banProcessCreate   = reinterpret_cast<BanProcessCreateFn>(GetProcAddress(module, "forgevm_ban_process_create"));
+    api->unbanProcessCreate = reinterpret_cast<UnbanProcessCreateFn>(GetProcAddress(module, "forgevm_unban_process_create"));
     api->forgeClassPlan   = reinterpret_cast<ForgeClassPlanFn>(GetProcAddress(module, "forgevm_forge_class_plan"));
     api->forgeClassUnload = reinterpret_cast<ForgeClassUnloadFn>(GetProcAddress(module, "forgevm_forge_class_unload"));
 
@@ -1178,6 +1184,7 @@ struct LoadFilter {
 
 LoadFilter g_javaAgentFilter;
 LoadFilter g_nativeLoadFilter;
+LoadFilter g_processCreateFilter;
 std::mutex g_filterMutex;
 std::atomic<bool> g_filterPipeStarted{false};
 
@@ -1308,10 +1315,11 @@ bool filterAllows(const LoadFilter& f, const std::string& path) {
 // to ask "is this path allowed?" before calling the real JVM entry.
 //
 // Protocol (one request per connection, blocking):
-//   request : <kind:1 byte 'A'|'N'> <path:UTF-8 bytes> <0x0A>
+//   request : <kind:1 byte 'A'|'N'|'P'> <path:UTF-8 bytes> <0x0A>
 //   reply   : <decision:1 byte '1'=allow | '0'=block>
 //
-// 'A' queries g_javaAgentFilter, 'N' queries g_nativeLoadFilter.
+// 'A' queries g_javaAgentFilter, 'N' queries g_nativeLoadFilter,
+// 'P' queries g_processCreateFilter.
 // Pipe name: \\.\pipe\forgevm_<jvm_pid>_filter
 // ============================================================
 
@@ -1350,6 +1358,8 @@ DWORD WINAPI filterPipeHandlerThread(LPVOID param) {
                 allow = filterAllows(g_javaAgentFilter, path);
             } else if (kind == 'N') {
                 allow = filterAllows(g_nativeLoadFilter, path);
+            } else if (kind == 'P') {
+                allow = filterAllows(g_processCreateFilter, path);
             }
         }
         decision = allow ? '1' : '0';
@@ -1667,6 +1677,57 @@ void handleUnbanNativeLoad(const NativeApi& api, const std::string& dllPath) {
                 api.lastError ? api.lastError() : "unknown");
 }
 
+void handleBanProcessCreate(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    bool wasActive;
+    {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        wasActive = g_processCreateFilter.active;
+        applyFilterFromJson(&g_processCreateFilter, line);
+        AGENT_LOG("ban_process_create: mode=%s patterns=%zu%s",
+                  filterModeName(g_processCreateFilter.mode),
+                  g_processCreateFilter.patterns.size(),
+                  wasActive ? " (updated)" : "");
+    }
+    std::string pipeName = ensureFilterPipeStarted();
+    if (pipeName.empty()) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "filter_pipe_start_failed");
+        return;
+    }
+    if (wasActive) {
+        printResult("ok", "FULL", dllPath, "filter_updated");
+        return;
+    }
+    if (api.banProcessCreate == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "ban_process_create_not_exported");
+        return;
+    }
+    int r = api.banProcessCreate(pipeName.c_str());
+    printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
+                api.lastError ? api.lastError() : "unknown");
+}
+
+void handleUnbanProcessCreate(const NativeApi& api, const std::string& dllPath) {
+    bool wasActive;
+    {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        wasActive = g_processCreateFilter.active;
+        g_processCreateFilter = LoadFilter{};
+    }
+    AGENT_LOG("unban_process_create: filter cleared (wasActive=%d)", (int)wasActive);
+
+    if (!wasActive) {
+        printResult("ok", "FULL", dllPath, "already_unbanned");
+        return;
+    }
+    if (api.unbanProcessCreate == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "unban_process_create_not_exported");
+        return;
+    }
+    int r = api.unbanProcessCreate();
+    printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
+                api.lastError ? api.lastError() : "unknown");
+}
+
 // ============================================================
 // relaunch: WMI cmdline query → filter → TerminateProcess + CreateProcessW
 // ============================================================
@@ -1787,10 +1848,11 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         return;
     }
 
-    bool hasAgentFilter  = getJsonBoolField(line, "hasAgentFilter",  false);
-    bool hasNativeFilter = getJsonBoolField(line, "hasNativeFilter", false);
+    bool hasAgentFilter   = getJsonBoolField(line, "hasAgentFilter",   false);
+    bool hasNativeFilter  = getJsonBoolField(line, "hasNativeFilter",  false);
+    bool hasProcessFilter = getJsonBoolField(line, "hasProcessFilter", false);
 
-    LoadFilter agentFlt, nativeFlt;
+    LoadFilter agentFlt, nativeFlt, processFlt;
 
     auto buildFilter = [&](LoadFilter& f, const char* modeKey, const char* patsKey) {
         std::string mode = getJsonStringField(line, modeKey);
@@ -1808,27 +1870,29 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         f.active = true;
     };
 
-    if (hasAgentFilter)  buildFilter(agentFlt,  "agentMode",  "agentPatterns");
-    if (hasNativeFilter) buildFilter(nativeFlt, "nativeMode", "nativePatterns");
+    if (hasAgentFilter)   buildFilter(agentFlt,   "agentMode",   "agentPatterns");
+    if (hasNativeFilter)  buildFilter(nativeFlt,  "nativeMode",  "nativePatterns");
+    if (hasProcessFilter) buildFilter(processFlt, "processMode", "processPatterns");
 
     /* Snapshot pre-relaunch ban state. Trampolines in the old JVM die with it,
      * so the new JVM needs fresh installs whenever a ban was active OR the
      * caller passed a new filter. Without this, relaunch() with no filter
-     * args silently drops banJavaAgent/banNativeLoad protection that was
-     * active before the call — the trampolines die with the old JVM and
-     * nothing reinstalls them on the new one. */
-    bool wasAgentBanActive, wasNativeBanActive;
+     * args silently drops active protection that was installed before the call. */
+    bool wasAgentBanActive, wasNativeBanActive, wasProcessBanActive;
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
-        wasAgentBanActive  = g_javaAgentFilter.active;
-        wasNativeBanActive = g_nativeLoadFilter.active;
+        wasAgentBanActive   = g_javaAgentFilter.active;
+        wasNativeBanActive  = g_nativeLoadFilter.active;
+        wasProcessBanActive = g_processCreateFilter.active;
     }
-    bool installNativeBan = hasNativeFilter || wasNativeBanActive;
-    bool installAgentBan  = hasAgentFilter  || wasAgentBanActive;
+    bool installNativeBan  = hasNativeFilter  || wasNativeBanActive;
+    bool installAgentBan   = hasAgentFilter   || wasAgentBanActive;
+    bool installProcessBan = hasProcessFilter || wasProcessBanActive;
 
-    AGENT_LOG("relaunch: pid=%llu hasAgentFilter=%d hasNativeFilter=%d wasAgentActive=%d wasNativeActive=%d",
-              pid, (int)hasAgentFilter, (int)hasNativeFilter,
-              (int)wasAgentBanActive, (int)wasNativeBanActive);
+    AGENT_LOG("relaunch: pid=%llu hasAgentFilter=%d hasNativeFilter=%d hasProcessFilter=%d "
+              "wasAgentActive=%d wasNativeActive=%d wasProcessActive=%d",
+              pid, (int)hasAgentFilter, (int)hasNativeFilter, (int)hasProcessFilter,
+              (int)wasAgentBanActive, (int)wasNativeBanActive, (int)wasProcessBanActive);
 
     std::wstring cmdLine = queryProcessCommandLine(static_cast<DWORD>(pid));
     if (cmdLine.empty()) {
@@ -1930,6 +1994,22 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
             } else if (installNativeBan) {
                 AGENT_LOG("relaunch: filter pipe unavailable, native hook skipped");
             }
+
+            if (!filterPipeName.empty() && installProcessBan && api.banProcessCreate != NULL) {
+                if (hasProcessFilter) {
+                    std::lock_guard<std::mutex> g(g_filterMutex);
+                    g_processCreateFilter = processFlt;
+                }
+                if (api.banProcessCreate(filterPipeName.c_str()) == 1) {
+                    AGENT_LOG("relaunch: ntdll!NtCreateUserProcess hook installed on suspended new JVM (filter_source=%s)",
+                              hasProcessFilter ? "new" : "carried_over");
+                } else {
+                    AGENT_LOG("relaunch: banProcessCreate on suspended new JVM failed: %s",
+                              api.lastError ? api.lastError() : "unknown");
+                }
+            } else if (installProcessBan) {
+                AGENT_LOG("relaunch: filter pipe unavailable, process hook skipped");
+            }
         } else {
             AGENT_LOG("relaunch: attachTargetMinimal failed: %s",
                       api.lastError ? api.lastError() : "unknown");
@@ -1938,13 +2018,18 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         AGENT_LOG("relaunch: attachTargetMinimal export not loaded — DLL out of date?");
     }
 
-    /* Stash the agent filter for the post-resume watcher to install once jvm.dll
-     * is mapped. Only overwrite when the caller passed a new filter — otherwise
-     * keep the pre-relaunch g_javaAgentFilter so a carried-over ban retains its
-     * patterns. */
+    /* Stash filters for post-resume use. Only overwrite when the caller passed a
+     * new filter — otherwise keep the pre-relaunch state so carried-over bans
+     * retain their patterns. agentFilter is consumed by the jvm.dll watcher;
+     * nativeFilter and processFilter were already applied above in the suspended
+     * window, but we update the global so the filter pipe serves the right rules. */
     if (hasAgentFilter) {
         std::lock_guard<std::mutex> g(g_filterMutex);
         g_javaAgentFilter = agentFlt;
+    }
+    if (hasProcessFilter) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_processCreateFilter = processFlt;
     }
 
     /* Resume new JVM. From this instant the ntdll hook (if installed) is live. */
@@ -2176,6 +2261,10 @@ re_enter_command_loop:
             handleBanNativeLoad(api, line, dllPath);
         } else if (cmd == "unban_native_load") {
             handleUnbanNativeLoad(api, dllPath);
+        } else if (cmd == "ban_process_create") {
+            handleBanProcessCreate(api, line, dllPath);
+        } else if (cmd == "unban_process_create") {
+            handleUnbanProcessCreate(api, dllPath);
         } else if (cmd == "relaunch") {
             handleRelaunch(api, line, dllPath);
         } else if (cmd == "shutdown") {
