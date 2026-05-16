@@ -31,7 +31,7 @@ repositories {
 
 // build.gradle
 dependencies {
-    implementation 'com.github.CJiangqiu:ForgeVM:v0.6.1'
+    implementation 'com.github.CJiangqiu:ForgeVM:v0.6.5'
 }
 ```
 
@@ -306,7 +306,7 @@ repositories {
 
 // build.gradle
 dependencies {
-    implementation 'com.github.CJiangqiu:ForgeVM:v0.6.1'
+    implementation 'com.github.CJiangqiu:ForgeVM:v0.6.5'
 }
 ```
 
