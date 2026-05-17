@@ -2,12 +2,31 @@
 
 #include <tlhelp32.h>
 #include <algorithm>
+#include <mutex>
 
 // ============================================================
 // Global transform state
 // ============================================================
 
 std::unordered_map<uint64_t, ClassTransformPlan> g_plans;
+
+// ── Deferred-transform state ─────────────────────────────────────────────────
+// A class that is loaded but not yet linked has no ConstantPoolCache: HotSpot
+// runs its rewriter (which allocates the cache and rewrites every method's
+// bytecode) only at link time. Committing a transform on such a class is
+// unsafe — HotSpot's link pipeline must run on a real, fully-formed metaspace
+// ConstantPool, not on the synthetic newCP we hand-build. So an unlinked target
+// is parked here and re-committed by the retry thread once the game links it
+// naturally (detected via oldCP._cache becoming non-NULL).
+struct PendingTransform {
+    uint64_t                      klassAddr;
+    std::vector<HookSpecExtended> specs;
+};
+static std::vector<PendingTransform> g_pendingTransforms;
+// Serializes ALL transform activity: commitClassPlan, unloadClassPlan, and the
+// retry thread. Held for the whole duration of each so they never interleave.
+static std::mutex                    g_transformLock;
+static bool                          g_retryThreadStarted = false;
 
 // ============================================================
 // Klass / Method address cache
@@ -1455,6 +1474,12 @@ struct HookData {
     std::string methodName, paramDesc;
     std::string injectAt, hookClass, hookMethod, hookDesc;
 
+    /* Internal name ("a/b/C") of the class that declares the patched method —
+       the class actually being committed (a subclass when reached via
+       includeSubclasses). Used as the verification type of local 0 (`this`) in
+       the rebuilt trampoline StackMapTable. */
+    std::string targetClassInternalName;
+
     /* Method addresses */
     uint64_t methodAddr           = 0;
     uint64_t origConstMethodAddr  = 0;
@@ -1552,9 +1577,11 @@ struct HookData {
     }
 };
 
-/* Forward declaration — implementation appears after helper zone. */
+/* Forward declarations — implementations appear after helper zone. */
 static bool preResolveInjectionTargets(HookData& h, const std::string& kind,
                                         const std::string& targetSpec);
+static int  registerExtraClass(HookData& h, const std::string& internalName);
+static bool registerMethodEntryExtraClasses(HookData& h);
 
 /* Phase A: resolve all klass/method/symbol addresses for one hook.
    Returns false on any lookup failure (sets g_lastError). */
@@ -1575,6 +1602,7 @@ static bool resolveHookData(uint64_t klassAddr,
     /* 1. Find the target Method* */
     std::string dotName;
     { std::string iname; if (!readKlassName(proc, klassAddr, &iname)) { setError("readKlassName_failed"); return false; }
+      out.targetClassInternalName = iname;
       dotName = iname; for (char& c : dotName) if (c == '/') c = '.'; }
 
     if (!findJavaMethod(dotName.c_str(), methodName.c_str(), paramDesc.c_str(), &out.methodAddr)) return false;
@@ -1730,6 +1758,15 @@ static bool resolveHookData(uint64_t klassAddr,
             if (!preResolveInjectionTargets(out, kind, targetSpec)) return false;
         }
     }
+
+    /* Register CP Class entries for the method-entry verification types
+       (declaring class + reference parameter / return types). The rebuilt
+       trampoline StackMapTable must type local 0 and reference parameters with
+       their exact declared classes, not java/lang/Object: the goto_w that
+       enters the tail carries the real method-entry frame, and the verifier
+       requires that frame assignable to the tail frame. Must run before
+       assignPoolLayout so CP entry counts are correct. */
+    if (!registerMethodEntryExtraClasses(out)) return false;
 
     return true;
 }
@@ -2150,6 +2187,135 @@ static bool smParseFrame(const std::vector<uint8_t>& src, size_t pos, SmFrameInf
     return false;  /* reserved/invalid tag range 128..246 */
 }
 
+/* Inject a `same_frame` entry into origSM for every bci immediately following
+   a goto_w trampoline jumpsite. JVMS §4.7.4 / §4.10.1.4 require an explicit
+   StackMapTable entry at the instruction following any unconditional branch
+   (goto, goto_w, *return, athrow, tableswitch, lookupswitch). The trampoline
+   layout `goto_w (5B) + nop pad` leaves bci X+5 with no original frame; the
+   verifier rejects the class with "Expected stackmap frame at this location".
+
+   For each postGotoBci that does not coincide with an original frame's
+   absolute bci, this helper emits a `same_frame` at that position. same_frame
+   inherits the previous frame's type state — safe for nop padding (which
+   neither pops nor pushes), and the inserted entry only needs to mark a
+   valid basic-block start for the verifier's linear scan.
+
+   The first non-coinciding original frame whose preceding anchor changes has
+   its offset_delta re-encoded; tag form is preserved when possible
+   (same_frame ↔ same_frame_extended, same_locals_1_stack_item ↔ _extended).
+
+   `reservedBcis` lists bcis where the trampoline rebuild will itself emit a
+   frame (tail full_frame / pop frame). A postGotoBci coinciding with one is
+   skipped: injecting there would produce two frames at the same bci, and the
+   second's offset_delta would underflow to 0xFFFF. This happens when the
+   original method is exactly 5 bytes — the goto_w target (tailBCI) then
+   equals the post-goto bci 5, and the tail's own full_frame already covers
+   it. */
+static bool injectPostGotoStackMapFrames(std::vector<uint8_t>& origSM,
+                                          std::vector<uint32_t> postGotoBcis,
+                                          const std::vector<uint32_t>& reservedBcis) {
+    if (postGotoBcis.empty()) return true;
+
+    std::vector<SmFrameInfo> frames;
+    if (origSM.size() >= 2) {
+        uint16_t origCount = smReadU2BE(&origSM[0]);
+        size_t pos = 2;
+        for (uint16_t i = 0; i < origCount; i++) {
+            SmFrameInfo fi;
+            if (!smParseFrame(origSM, pos, fi)) { setError("smt_parse_failed"); return false; }
+            frames.push_back(fi);
+            pos += fi.totalLen;
+        }
+    }
+
+    std::vector<uint32_t> origAbs(frames.size());
+    {
+        uint32_t a = 0;
+        for (size_t i = 0; i < frames.size(); i++) {
+            a = (i == 0) ? frames[i].offsetDelta : (a + (uint32_t)frames[i].offsetDelta + 1);
+            origAbs[i] = a;
+        }
+    }
+
+    std::sort(postGotoBcis.begin(), postGotoBcis.end());
+    postGotoBcis.erase(std::unique(postGotoBcis.begin(), postGotoBcis.end()),
+                       postGotoBcis.end());
+
+    std::vector<uint32_t> toInsert;
+    toInsert.reserve(postGotoBcis.size());
+    for (uint32_t b : postGotoBcis) {
+        bool dup = false;
+        for (uint32_t a : origAbs)     if (a == b) { dup = true; break; }
+        if (!dup)
+            for (uint32_t r : reservedBcis) if (r == b) { dup = true; break; }
+        if (!dup) toInsert.push_back(b);
+    }
+    if (toInsert.empty()) return true;
+
+    struct Item { uint32_t absBci; int kind; size_t origIdx; };
+    std::vector<Item> items;
+    items.reserve(frames.size() + toInsert.size());
+    for (size_t i = 0; i < frames.size(); i++) items.push_back({ origAbs[i], 0, i });
+    for (uint32_t b : toInsert)                items.push_back({ b, 1, (size_t)0 });
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+        if (a.absBci != b.absBci) return a.absBci < b.absBci;
+        return a.kind < b.kind;
+    });
+
+    std::vector<uint8_t> newSM;
+    smPushU2BE(newSM, (uint16_t)items.size());
+    uint32_t prevBci = 0;
+    bool havePrev = false;
+    for (const Item& it : items) {
+        uint32_t delta = havePrev ? (it.absBci - prevBci - 1) : it.absBci;
+        if (it.kind == 1) {
+            if (delta < 64) {
+                newSM.push_back((uint8_t)delta);
+            } else {
+                newSM.push_back(251);
+                smPushU2BE(newSM, (uint16_t)delta);
+            }
+        } else {
+            const SmFrameInfo& fi = frames[it.origIdx];
+            uint8_t tag = (uint8_t)fi.tag;
+            if (tag <= 63) {
+                if (delta < 64) {
+                    newSM.push_back((uint8_t)delta);
+                } else {
+                    newSM.push_back(251);
+                    smPushU2BE(newSM, (uint16_t)delta);
+                }
+            } else if (tag >= 64 && tag <= 127) {
+                if (delta < 64) {
+                    newSM.push_back((uint8_t)(64 + delta));
+                    newSM.insert(newSM.end(),
+                                 origSM.begin() + (ptrdiff_t)fi.vtiStart,
+                                 origSM.begin() + (ptrdiff_t)fi.vtiEnd);
+                } else {
+                    newSM.push_back(247);
+                    smPushU2BE(newSM, (uint16_t)delta);
+                    newSM.insert(newSM.end(),
+                                 origSM.begin() + (ptrdiff_t)fi.vtiStart,
+                                 origSM.begin() + (ptrdiff_t)fi.vtiEnd);
+                }
+            } else {
+                /* Tags 247..255 already use u2 offset_delta; preserve tag form
+                   and append the verbatim post-delta payload. */
+                newSM.push_back(tag);
+                smPushU2BE(newSM, (uint16_t)delta);
+                newSM.insert(newSM.end(),
+                             origSM.begin() + (ptrdiff_t)fi.vtiStart,
+                             origSM.begin() + (ptrdiff_t)fi.vtiEnd);
+            }
+        }
+        prevBci = it.absBci;
+        havePrev = true;
+    }
+
+    origSM = std::move(newSM);
+    return true;
+}
+
 /* ============================================================
  * Route-2 helper zone: CP readers, extra-class registry, abstract
  * interpretation, match helpers, stack-prefix VTI builders, and
@@ -2223,6 +2389,81 @@ static int registerExtraClass(HookData& h, const std::string& internalName) {
     if (e.symbolAddr == 0) return -1;
     h.extraClasses.push_back(e);
     return (int)(h.extraClasses.size() - 1);
+}
+
+/* Register a CP Class entry for every reference type that appears in the
+   patched method's signature — the declaring class (local 0 `this`), each
+   reference-class parameter, and a reference-class return type. The rebuilt
+   trampoline StackMapTable uses these as exact verification types so a class
+   verified after patching (not-yet-linked) passes the branch-target frame
+   check at the trampoline tail.
+
+   Array-typed and otherwise non-InstanceKlass parameters cannot be registered
+   (registerExtraClass resolves only InstanceKlasses); those slots fall back to
+   java/lang/Object at StackMapTable build time — correct for the branch check
+   (every reference type, arrays included, is assignable to Object) though it
+   would under-type the slot if the rescued prologue performed array-specific
+   operations on it. This is logged, not fatal. */
+static bool registerMethodEntryExtraClasses(HookData& h) {
+    const std::string& ia = h.injectAt;
+    bool route2 = (ia == "HEAD" || ia == "RETURN" ||
+                   ia.compare(0, 7,  "INVOKE:")    == 0 ||
+                   ia.compare(0, 10, "FIELD_GET:") == 0 ||
+                   ia.compare(0, 10, "FIELD_PUT:") == 0 ||
+                   ia.compare(0, 4,  "NEW:")       == 0);
+    if (!route2) return true;
+
+    /* local 0 = this */
+    if (!h.targetIsStatic && !h.targetClassInternalName.empty()) {
+        if (registerExtraClass(h, h.targetClassInternalName) < 0) {
+            FVM_LOG("registerMethodEntryExtraClasses: declaring class '%s' "
+                    "unresolved — `this` local will fall back to Object",
+                    h.targetClassInternalName.c_str());
+        }
+    }
+
+    /* reference-class parameters */
+    const std::string& pd = h.paramDesc;
+    if (!pd.empty() && pd[0] == '(') {
+        size_t i = 1;
+        while (i < pd.size() && pd[i] != ')') {
+            char c = pd[i];
+            if (c == 'L') {
+                size_t e = pd.find(';', i);
+                if (e == std::string::npos) break;
+                std::string iname = pd.substr(i + 1, e - i - 1);
+                if (registerExtraClass(h, iname) < 0)
+                    FVM_LOG("registerMethodEntryExtraClasses: param class '%s' "
+                            "unresolved — slot falls back to Object", iname.c_str());
+                i = e + 1;
+            } else if (c == '[') {
+                /* array param — skip the whole descriptor; slot → Object */
+                while (i < pd.size() && pd[i] == '[') i++;
+                if (i < pd.size() && pd[i] == 'L') {
+                    size_t e = pd.find(';', i);
+                    if (e == std::string::npos) break;
+                    i = e + 1;
+                } else if (i < pd.size()) {
+                    i++;
+                }
+            } else {
+                i++;  /* primitive */
+            }
+        }
+    }
+
+    /* reference-class return type (RETURN inject only) */
+    if (ia == "RETURN" && !h.targetReturnDesc.empty() &&
+        h.targetReturnDesc[0] == 'L') {
+        size_t e = h.targetReturnDesc.find(';');
+        if (e != std::string::npos) {
+            std::string iname = h.targetReturnDesc.substr(1, e - 1);
+            if (registerExtraClass(h, iname) < 0)
+                FVM_LOG("registerMethodEntryExtraClasses: return class '%s' "
+                        "unresolved — return slot falls back to Object", iname.c_str());
+        }
+    }
+    return true;
 }
 
 static bool methodHasExceptionTable(uint64_t origConstMethodAddr) {
@@ -2768,7 +3009,7 @@ static void appendStackPrefixVtis(const std::vector<StackTypeSpec>& types,
             case StackTypeSpec::PRIM_FLOAT:  outBytes.push_back(2); break;
             case StackTypeSpec::PRIM_DOUBLE: outBytes.push_back(3); break;
             case StackTypeSpec::REF:
-                outBytes.push_back(7);
+                outBytes.push_back(7);              /* ITEM_Object */
                 smPushU2BE(outBytes, t.refClassCpIdx);
                 break;
         }
@@ -2866,27 +3107,33 @@ static bool parseSingleDescTypeToStackSpec(const std::string& fieldDesc,
  * ============================================================ */
 
 /* Append method-entry locals as a packed verification_type_info[] to `out`,
-   returning the locals_count in `outCount`. Every reference slot is encoded as
-   ITEM_Object(java/lang/Object) — Object is a supertype of every reference
-   type so the implicit method-entry frame (whose ref slots carry the precise
-   declared types) is assignable to it per JVMS §4.10.1.2, while a single CP
-   entry suffices for any number of ref locals. Primitives map to ITEM_Integer
-   / Long / Float / Double; Long and Double take one VTI slot each per JVMS
-   §4.7.4 (the JVM's "two-slot" rule for J/D applies to slot indices, not to
-   the SMT entry count). */
-static bool appendMethodEntryLocalsVtis(bool isStatic,
-                                        const std::string& paramDesc,
-                                        uint16_t objClassCpIdx,
+   returning the locals_count in `outCount`. Each reference slot is encoded as
+   ITEM_Object with the slot's *exact declared class* — local 0 is the
+   declaring class, each reference-class parameter its declared type. The
+   goto_w that enters the trampoline tail carries the real method-entry frame;
+   the verifier requires that frame assignable to the tail frame, so the tail
+   frame must declare the exact types (Object would be too wide — the rescued
+   prologue's `aload_0; invokevirtual <declaringClass>.m` would then fail; Null
+   too narrow — the incoming declaring-class value is not assignable to Null).
+   The exact-class CP entries are registered up front by
+   registerMethodEntryExtraClasses; a slot whose class could not be registered
+   (array type, unresolvable class) falls back to java/lang/Object.
+   Primitives map to ITEM_Integer / Long / Float / Double; Long and Double take
+   one VTI slot each per JVMS §4.7.4 (the JVM's "two-slot" rule for J/D applies
+   to slot indices, not to the SMT entry count). */
+static bool appendMethodEntryLocalsVtis(const HookData& h,
                                         std::vector<uint8_t>& out,
                                         uint16_t& outCount) {
     outCount = 0;
-    auto pushObject = [&]() {
+    auto pushRef = [&](uint16_t classCpIdx) {
         out.push_back(7);                  /* ITEM_Object */
-        smPushU2BE(out, objClassCpIdx);
+        smPushU2BE(out, classCpIdx ? classCpIdx : h.objClassCpIdx);
         outCount++;
     };
-    if (!isStatic) pushObject();           /* locals[0] = this */
+    if (!h.targetIsStatic)                 /* locals[0] = this */
+        pushRef(lookupExtraClassCpIdx(h, h.targetClassInternalName));
 
+    const std::string& paramDesc = h.paramDesc;
     if (paramDesc.empty() || paramDesc[0] != '(') {
         setError("invalid_param_descriptor"); return false;
     }
@@ -2899,11 +3146,15 @@ static bool appendMethodEntryLocalsVtis(bool isStatic,
         else   if (c == 'J') { out.push_back(4); outCount++; i++; }
         else   if (c == 'D') { out.push_back(3); outCount++; i++; }
         else   if (c == 'L') {
-            pushObject();
-            while (i < paramDesc.size() && paramDesc[i] != ';') i++;
-            if (i < paramDesc.size()) i++;
+            size_t e = paramDesc.find(';', i);
+            std::string iname = (e == std::string::npos)
+                              ? std::string()
+                              : paramDesc.substr(i + 1, e - i - 1);
+            pushRef(lookupExtraClassCpIdx(h, iname));
+            i = (e == std::string::npos) ? paramDesc.size() : e + 1;
         } else if (c == '[') {
-            pushObject();
+            /* array-typed param — no InstanceKlass CP entry; Object fallback */
+            pushRef(0);
             while (i < paramDesc.size() && paramDesc[i] == '[') i++;
             if (i < paramDesc.size() && paramDesc[i] == 'L') {
                 while (i < paramDesc.size() && paramDesc[i] != ';') i++;
@@ -2925,9 +3176,9 @@ static bool appendMethodEntryLocalsVtis(bool isStatic,
 static bool rebuildStackMapTrampoline(
     const std::vector<uint8_t>& origSM,
     const std::vector<TrampolineFrameSpec>& tails,
-    bool isStatic, const std::string& paramDesc,
-    uint16_t cbClassCpIdx, uint16_t objClassCpIdx,
+    const HookData& h,
     std::vector<uint8_t>& out) {
+    uint16_t cbClassCpIdx = h.cbClassCpIdx;
     out.clear();
 
     /* Parse original frames once. */
@@ -2946,8 +3197,7 @@ static bool rebuildStackMapTrampoline(
     /* Pre-build method-entry locals VTI bytes (reused by every tail frame). */
     std::vector<uint8_t> localsVtiBytes;
     uint16_t numLocals = 0;
-    if (!appendMethodEntryLocalsVtis(isStatic, paramDesc, objClassCpIdx,
-                                     localsVtiBytes, numLocals)) return false;
+    if (!appendMethodEntryLocalsVtis(h, localsVtiBytes, numLocals)) return false;
 
     smPushU2BE(out, (uint16_t)(frames.size() + 2 * tails.size()));
 
@@ -3040,6 +3290,10 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
     auto coverEnd= [&](size_t x)->size_t {
         size_t k=x; while(k<x+5&&k<h.origBytecode.size()){int l=getLen(k);if(l<=0)l=1;k+=(size_t)l;} return k; };
 
+    /* Invoke operands are CPCache indices (native u2 — little-endian on x86),
+       per HotSpot's post-rewrite convention. The target class is always linked
+       and rewritten by the time it reaches here (commitKlass refuses unlinked
+       classes; they are parked for deferred commit). */
     uint16_t hookCI16   = (uint16_t)h.hookCacheIdx;
     uint16_t initCI16   = (uint16_t)h.initCacheIdx;
     uint16_t cancelCI16 = (uint16_t)h.cancelCacheIdx;
@@ -3249,7 +3503,9 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
         std::vector<uint8_t> rescued(h.origBytecode.begin(),
                                      h.origBytecode.begin() + (ptrdiff_t)J);
         int32_t shift = (int32_t)gwBCI - (int32_t)rescuedBCI;
+        size_t lastInstrOff = 0;
         for (size_t off = 0; off < rescued.size();) {
+            lastInstrOff = off;
             uint8_t op = rescued[off];
             int rl = bcL[op]; if (rl <= 0) rl = 1;
             bool b2 = (op >= 0x99 && op <= 0xA7) || op == 0xC6 || op == 0xC7;
@@ -3277,10 +3533,23 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
             off += (size_t)rl;
         }
         newBytecode.insert(newBytecode.end(), rescued.begin(), rescued.end());
-        if (J < h.origBytecode.size()) {
-            size_t gbBCI = newBytecode.size();
-            size_t gbFi  = emitGW(newBytecode, 0);
-            patchGW(newBytecode, gbFi, gbBCI, J);
+        /* Emit the jumpback goto_w → J only when control can fall through the
+           end of the rescued prologue. If its last instruction is an
+           unconditional terminator (goto / goto_w / *return / athrow), the
+           jumpback is unreachable dead code — and being the instruction right
+           after a terminator it would require its own StackMapTable frame,
+           which the rebuilt table does not provide ("Expecting a stack map
+           frame" at that goto_w). */
+        {
+            uint8_t lastOp = rescued.empty() ? 0 : rescued[lastInstrOff];
+            bool rescuedEndsTerminator =
+                (lastOp == 0xA7 || lastOp == 0xC8 || lastOp == 0xBF ||
+                 (lastOp >= 0xAC && lastOp <= 0xB1));
+            if (J < h.origBytecode.size() && !rescuedEndsTerminator) {
+                size_t gbBCI = newBytecode.size();
+                size_t gbFi  = emitGW(newBytecode, 0);
+                patchGW(newBytecode, gbFi, gbBCI, J);
+            }
         }
 
         if (h.needObjectCp && h.objClassCpIdx == 0) {
@@ -3290,14 +3559,19 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
                     h.methodName.c_str(), h.paramDesc.c_str());
             return false;
         }
+        /* JVMS §4.7.4: bci immediately following the goto_w (= 5) must carry
+           an explicit StackMapTable entry, even though the nop padding is
+           unreachable in practice. Skipped when tailBCI == 5 (5-byte original
+           method) — the tail's own full_frame already sits at bci 5. */
+        if (!injectPostGotoStackMapFrames(origSM, { (uint32_t)5 },
+                                          { (uint32_t)tailBCI, (uint32_t)popBCI }))
+            return false;
         {
             TrampolineFrameSpec spec;
             spec.tailBCI = (uint32_t)tailBCI;
             spec.popBCI  = (uint32_t)popBCI;
             spec.stackPrefixCount = 0;
-            if (!rebuildStackMapTrampoline(origSM, { spec },
-                                           h.targetIsStatic, h.paramDesc,
-                                           h.cbClassCpIdx, h.objClassCpIdx,
+            if (!rebuildStackMapTrampoline(origSM, { spec }, h,
                                            h.newStackMapBytes))
                 return false;
         }
@@ -3395,6 +3669,16 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
                     h.methodName.c_str(), h.paramDesc.c_str());
             return false;
         }
+        /* JVMS §4.7.4: every bci immediately after a trampoline goto_w
+           (replacing a *return) requires an explicit StackMapTable entry. */
+        {
+            std::vector<uint32_t> postGotoBcis;
+            postGotoBcis.reserve(coverZones.size());
+            for (auto& z : coverZones) postGotoBcis.push_back((uint32_t)(z.first + 5));
+            if (!injectPostGotoStackMapFrames(
+                    origSM, postGotoBcis,
+                    { (uint32_t)tailBCI, (uint32_t)popBCI })) return false;
+        }
         {
             TrampolineFrameSpec spec;
             spec.tailBCI = (uint32_t)tailBCI;
@@ -3409,12 +3693,28 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
                 else if (c=='F') st.kind = StackTypeSpec::PRIM_FLOAT;
                 else if (c=='J') st.kind = StackTypeSpec::PRIM_LONG;
                 else if (c=='D') st.kind = StackTypeSpec::PRIM_DOUBLE;
-                else { st.kind = StackTypeSpec::REF; st.refClassCpIdx = h.objClassCpIdx; }
+                else {
+                    /* Reference return: the rescued `areturn` pops this value;
+                       a goto_w replacing the original *return carries the real
+                       return-typed value into the tail frame, and the verifier
+                       requires the incoming type assignable to the declared
+                       stack type. It must be the exact return class — Object
+                       is too wide for the incoming-frame check, Null too
+                       narrow. Registered by registerMethodEntryExtraClasses;
+                       array / unresolvable return types fall back to Object. */
+                    st.kind = StackTypeSpec::REF;
+                    uint16_t retCp = 0;
+                    if (c == 'L') {
+                        size_t e = h.targetReturnDesc.find(';');
+                        if (e != std::string::npos)
+                            retCp = lookupExtraClassCpIdx(
+                                h, h.targetReturnDesc.substr(1, e - 1));
+                    }
+                    st.refClassCpIdx = retCp ? retCp : h.objClassCpIdx;
+                }
                 appendStackPrefixVtis({ st }, spec.stackPrefixVtis, spec.stackPrefixCount);
             }
-            if (!rebuildStackMapTrampoline(origSM, { spec },
-                                           h.targetIsStatic, h.paramDesc,
-                                           h.cbClassCpIdx, h.objClassCpIdx,
+            if (!rebuildStackMapTrampoline(origSM, { spec }, h,
                                            h.newStackMapBytes))
                 return false;
         }
@@ -3643,16 +3943,31 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
             for (size_t b = matches[t].bciX; b < cEnd; b++)
                 newBytecode.push_back(h.origBytecode[b]);
 
-            /* If coverEnd < origSize: goto_w back to coverEnd in main flow. */
-            if (cEnd < h.origBytecode.size()) {
+            /* Last instruction of the rescued span — walk it; an unconditional
+               terminator means control cannot fall through to a jumpback. */
+            uint8_t rescuedLastOp = 0;
+            for (size_t b = matches[t].bciX; b < cEnd;) {
+                rescuedLastOp = h.origBytecode[b];
+                int l = getLen(b); if (l <= 0) l = 1;
+                b += (size_t)l;
+            }
+            bool rescuedEndsTerminator =
+                (rescuedLastOp == 0xA7 || rescuedLastOp == 0xC8 ||
+                 rescuedLastOp == 0xBF ||
+                 (rescuedLastOp >= 0xAC && rescuedLastOp <= 0xB1));
+
+            /* If coverEnd < origSize: goto_w back to coverEnd in main flow —
+               unless the rescued span already ends in an unconditional
+               terminator, in which case the jumpback is unreachable dead code
+               that would itself demand a StackMapTable frame. */
+            if (cEnd < h.origBytecode.size() && !rescuedEndsTerminator) {
                 size_t gbBCI = newBytecode.size();
                 size_t fib = emitGW(newBytecode, 0);
                 patchGW(newBytecode, fib, gbBCI, cEnd);
-            } else {
-                /* coverEnd == origSize: rescued bytes must end in a terminator. */
-                uint8_t lastOp = (cEnd > matches[t].bciX) ? h.origBytecode[cEnd - 1] : 0;
-                bool isTerminator = (lastOp >= 0xAC && lastOp <= 0xB1) || lastOp == 0xBF;
-                if (!isTerminator) {
+            } else if (cEnd >= h.origBytecode.size()) {
+                /* coverEnd == origSize: rescued bytes must end in a terminator,
+                   otherwise control falls off the end of the method. */
+                if (!rescuedEndsTerminator) {
                     setError("rescued_falls_off_end");
                     FVM_LOG("buildHookCM: %s skipped %s%s — rescued code falls off bytecode end at bci %zu",
                             injectType.c_str(), h.methodName.c_str(), h.paramDesc.c_str(), matches[t].bciX);
@@ -3674,10 +3989,24 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
         }
         h.extraMaxStack = (uint16_t)maxPrefixSlots;
 
-        /* ── Step 9: rebuild SMT ── */
-        if (!rebuildStackMapTrampoline(origSM, tailSpecs,
-                                       h.targetIsStatic, h.paramDesc,
-                                       h.cbClassCpIdx, h.objClassCpIdx,
+        /* ── Step 9: rebuild SMT ──
+           JVMS §4.7.4: every bci immediately after a trampoline goto_w
+           (replacing the matched bytecode) requires an explicit
+           StackMapTable entry. */
+        {
+            std::vector<uint32_t> postGotoBcis;
+            postGotoBcis.reserve(matches.size());
+            for (auto& m : matches) postGotoBcis.push_back((uint32_t)(m.bciX + 5));
+            std::vector<uint32_t> reservedBcis;
+            reservedBcis.reserve(tailSpecs.size() * 2);
+            for (auto& s : tailSpecs) {
+                reservedBcis.push_back(s.tailBCI);
+                reservedBcis.push_back(s.popBCI);
+            }
+            if (!injectPostGotoStackMapFrames(origSM, postGotoBcis, reservedBcis))
+                return false;
+        }
+        if (!rebuildStackMapTrampoline(origSM, tailSpecs, h,
                                        h.newStackMapBytes)) {
             return false;
         }
@@ -3843,8 +4172,19 @@ static bool readMethodNameAndSig(uint64_t methodAddr,
 static bool unloadClassPlanForKlass(uint64_t klassAddr) {
     HANDLE proc = g_target.handle;
 
+    /* Drop any not-yet-committed deferred transform for this klass so the retry
+       thread will not resurrect it after an unload. Caller holds g_transformLock. */
+    bool droppedPending = false;
+    for (size_t i = 0; i < g_pendingTransforms.size(); i++) {
+        if (g_pendingTransforms[i].klassAddr == klassAddr) {
+            g_pendingTransforms.erase(g_pendingTransforms.begin() + (ptrdiff_t)i);
+            droppedPending = true;
+            break;
+        }
+    }
+
     auto it = g_plans.find(klassAddr);
-    if (it == g_plans.end()) return false;
+    if (it == g_plans.end()) return droppedPending;
 
     ClassTransformPlan plan = std::move(it->second);   // move out, keep state coherent
     g_plans.erase(it);
@@ -3929,6 +4269,10 @@ int unloadClassPlan(const char* targetClassName, bool includeSubclasses) {
         return 0;
     }
 
+    /* Serialize against commitClassPlan and the retry thread — unloadClass
+       Plan must not race a deferred commit landing on the same klass. */
+    std::lock_guard<std::mutex> _txLock(g_transformLock);
+
     bool any = unloadClassPlanForKlass(klassAddr);
 
     if (includeSubclasses) {
@@ -3982,6 +4326,19 @@ static int commitKlass(uint64_t klassAddr,
     if (rkOff0    >= 0) memcpy(&origRKAddr,    oldPoolBytes.data() + rkOff0,    8);
     if (cacheOff0 >= 0) memcpy(&origCacheAddr,  oldPoolBytes.data() + cacheOff0, 8);
     if (tagsOff0  >= 0) memcpy(&origTagsAddr,   oldPoolBytes.data() + tagsOff0,  8);
+
+    /* Defense in depth: only a linked (rewritten) class — one whose CP already
+       has a ConstantPoolCache — may be transformed. Unlinked classes are meant
+       to be parked in g_pendingTransforms by the caller and re-committed after
+       the game links them; reaching here with origCacheAddr == 0 means that
+       gate was bypassed. Refuse rather than build a transform HotSpot's link
+       pipeline cannot survive. Return 2 = "deferred / not linked". */
+    if (origCacheAddr == 0) {
+        setError("class_not_linked");
+        FVM_LOG("CLASS_COMMIT: klass=0x%llX has no ConstantPoolCache (not linked) "
+                "— refusing transform", (unsigned long long)klassAddr);
+        return 2;
+    }
 
     int32_t origRKLen = 0;
     if (origRKAddr) {
@@ -4037,8 +4394,8 @@ static int commitKlass(uint64_t klassAddr,
         setError("VirtualAllocEx_mergedTags_failed"); return 0;
     }
 
-    /* CPCache (sized, prefix snapshot deferred to post-suspend) */
-    size_t newCacheSize = (size_t)cacheHdrSize + (size_t)newCacheLen * (size_t)cacheEntrySize;
+    /* CPCache (sized, prefix snapshot deferred to post-suspend). */
+    size_t   newCacheSize = (size_t)cacheHdrSize + (size_t)newCacheLen * (size_t)cacheEntrySize;
     uint64_t newCacheAddr = (uint64_t)VirtualAllocEx(proc, NULL, newCacheSize,
                                                       MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
     if (!newCacheAddr) {
@@ -4093,7 +4450,7 @@ static int commitKlass(uint64_t klassAddr,
         }
     }
 
-    /* CPCache: sized to newCacheSize, prefix filled post-suspend */
+    /* CPCache: sized to newCacheSize, prefix filled post-suspend. */
     std::vector<uint8_t> newCacheBytes(newCacheSize, 0);
     /* Pre-fill the tail entries (new hooks) */
     fillPoolCacheTail(newCacheBytes, cacheHdrSize, cacheEntrySize, hooks);
@@ -4162,8 +4519,9 @@ static int commitKlass(uint64_t klassAddr,
     suspendTargetThreads(g_target.pid, threadIds);
     FVM_LOG("CLASS_COMMIT: suspended %zu threads", threadIds.size());
 
-    /* Post-suspend: snapshot origCache prefix (race-free) */
-    if (origCacheAddr) {
+    /* Post-suspend: snapshot origCache prefix (race-free). origCacheAddr is
+       always non-NULL here — the guard at the top refused unlinked classes. */
+    {
         size_t origCacheSize = (size_t)cacheHdrSize + origCacheLen * (size_t)cacheEntrySize;
         std::vector<uint8_t> origCacheSnap(origCacheSize);
         if (readRemoteMem(proc, origCacheAddr, origCacheSnap.data(), origCacheSize)) {
@@ -4174,11 +4532,8 @@ static int commitKlass(uint64_t klassAddr,
         if (cacheCPOff >= 0) memcpy(newCacheBytes.data() + cacheCPOff, &newPoolAddr, 8);
         /* Re-fill tail (prefix copy may have stomped them if origCacheSize > cacheHdrSize) */
         fillPoolCacheTail(newCacheBytes, cacheHdrSize, cacheEntrySize, hooks);
-    } else {
-        memcpy(newCacheBytes.data() + cacheLenOff, &newCacheLen, 4);
-        if (cacheCPOff >= 0) memcpy(newCacheBytes.data() + cacheCPOff, &newPoolAddr, 8);
+        writeRemoteMem(proc, newCacheAddr, newCacheBytes.data(), newCacheBytes.size());
     }
-    writeRemoteMem(proc, newCacheAddr, newCacheBytes.data(), newCacheBytes.size());
 
     /* Capture plan backups (first patch on this klass) */
     {
@@ -4246,6 +4601,212 @@ static int commitKlass(uint64_t klassAddr,
     return 1;
 }
 
+/* True once the class has a ConstantPoolCache — i.e. HotSpot has linked and
+   rewritten it. An unlinked class cannot be transformed yet (commitKlass's
+   own guard refuses it); callers park such classes in g_pendingTransforms. */
+static bool klassIsLinked(uint64_t kAddr) {
+    HANDLE proc = g_target.handle;
+    int64_t ikCOff = structOffset("InstanceKlass", "_constants");
+    if (ikCOff < 0) return true;       /* unknown layout — assume linked */
+    uint64_t cpAddr = 0;
+    if (!readRemotePointer(proc, kAddr + (uint64_t)ikCOff, &cpAddr) || !cpAddr)
+        return true;                   /* cannot tell — let commitKlass decide */
+    int64_t cacheOff = structOffset("ConstantPool", "_cache");
+    if (cacheOff < 0) return true;
+    uint64_t cacheAddr = 0;
+    readRemotePointer(proc, cpAddr + (uint64_t)cacheOff, &cacheAddr);
+    return cacheAddr != 0;
+}
+
+/* Start the deferred-transform retry thread once, lazily. Caller holds
+   g_transformLock. */
+static void maybeStartDeferredRetryThread();
+
+/* Park an unlinked klass's hook specs for the retry thread. Replaces any
+   existing pending entry for the same klass. Caller holds g_transformLock. */
+static void deferKlassTransform(uint64_t kAddr,
+                                 const std::vector<HookSpecExtended>& specs) {
+    for (auto& p : g_pendingTransforms) {
+        if (p.klassAddr == kAddr) { p.specs = specs; return; }
+    }
+    g_pendingTransforms.push_back({ kAddr, specs });
+    FVM_LOG("CLASS_PLAN: klass=0x%llX not linked yet — deferred (%zu spec(s), "
+            "%zu pending total)", (unsigned long long)kAddr, specs.size(),
+            g_pendingTransforms.size());
+    maybeStartDeferredRetryThread();
+}
+
+/* Resolve every hook spec against kAddr and commit them with one merged newCP.
+   Merges with the klass's existing plan (replayed) if one is present.
+   Returns: 1 = committed, 0 = failed, 2 = deferred (class not linked).
+   Caller holds g_transformLock and has suspended target threads. */
+static int resolveAndCommitKlass(uint64_t kAddr,
+                                  const std::vector<HookSpecExtended>& newSpecs,
+                                  std::vector<HookOutcome>* results) {
+    /* Gate: an unlinked class has no ConstantPoolCache. Transforming it would
+       hand HotSpot's link/rewrite pipeline a synthetic CP it cannot survive
+       (see commitKlass guard). Park the specs; the retry thread re-commits
+       once the game links the class. A lightweight method lookup still fills
+       `results` so subclass propagation sees which hooks matched. */
+    if (!klassIsLinked(kAddr)) {
+        if (results) {
+            results->resize(newSpecs.size());
+            for (size_t i = 0; i < newSpecs.size(); i++) {
+                HookOutcome& out = (*results)[i];
+                const HookSpecExtended& spec = newSpecs[i];
+                out.reason = spec.candidates.empty() ? "no_candidates" : "method_not_found";
+                for (auto& cand : spec.candidates) {
+                    uint64_t mAddr = 0;
+                    if (findMethodInKlass(kAddr, cand.methodName.c_str(),
+                                          cand.paramDesc.c_str(), &mAddr)) {
+                        out.matched    = true;
+                        out.methodName = cand.methodName;
+                        out.paramDesc  = cand.paramDesc;
+                        out.methodAddr = mAddr;
+                        break;
+                    }
+                }
+            }
+        }
+        deferKlassTransform(kAddr, newSpecs);
+        setError("ok");
+        return 2;
+    }
+
+    /* Stash existing plan (if any) and unload it → back to oldCP₀ */
+    std::vector<PatchedMethodInfo> existing;
+    {
+        auto it = g_plans.find(kAddr);
+        if (it != g_plans.end()) existing = it->second.patchedMethods;
+    }
+    if (!existing.empty()) {
+        unloadClassPlanForKlass(kAddr);  /* restores IK._constants → oldCP₀ */
+        FVM_LOG("CLASS_PLAN: unloaded existing plan (%zu hooks) for klass=0x%llX",
+                existing.size(), (unsigned long long)kAddr);
+    }
+
+    /* Phase A: resolve all hooks (existing replays + new) */
+    std::vector<HookData> hooks;
+    std::vector<bool>     isNew;
+
+    /* 1. Replay existing hooks */
+    for (auto& pmi : existing) {
+        std::string mName, mSig;
+        if (!readMethodNameAndSig(pmi.methodAddr, &mName, &mSig)) {
+            FVM_LOG("CLASS_PLAN: cannot read name/sig for Method*=0x%llX, skipping",
+                    (unsigned long long)pmi.methodAddr);
+            continue;
+        }
+        HookSpecExtended ext;
+        ext.hookClass=pmi.hook.hookClass; ext.hookMethod=pmi.hook.hookMethod;
+        ext.hookDesc=pmi.hook.hookDesc;   ext.injectAt=pmi.hook.injectAt;
+        ext.candidates.push_back({mName, mSig});
+
+        HookData hd;
+        if (resolveHookData(kAddr, mName, mSig, ext, hd)) {
+            hooks.push_back(std::move(hd));
+            isNew.push_back(false);
+        } else {
+            FVM_LOG("CLASS_PLAN: replay resolve FAILED %s%s: %s",
+                    mName.c_str(), mSig.c_str(), g_lastError.c_str());
+        }
+    }
+
+    /* 2. Resolve new hooks (try candidates) */
+    if (results) results->resize(newSpecs.size());
+    HookOutcome _dummyOutcome;
+    for (size_t i = 0; i < newSpecs.size(); i++) {
+        const HookSpecExtended& spec = newSpecs[i];
+        HookOutcome& out = results ? (*results)[i] : _dummyOutcome;
+        out = HookOutcome{};
+        out.reason = spec.candidates.empty() ? "no_candidates" : "method_not_found";
+        bool matched = false;
+        for (auto& cand : spec.candidates) {
+            HookData hd;
+            if (resolveHookData(kAddr, cand.methodName, cand.paramDesc, spec, hd)) {
+                out.matched    = true;
+                out.methodName = cand.methodName;
+                out.paramDesc  = cand.paramDesc;
+                out.methodAddr = hd.methodAddr;
+                hooks.push_back(std::move(hd));
+                isNew.push_back(true);
+                matched = true;
+                break;
+            }
+            if (!g_lastError.empty()) out.reason = g_lastError;
+        }
+        if (!matched) {
+            FVM_LOG("CLASS_PLAN: new hook[%zu] NO MATCH (%s.%s%s) reason=%s",
+                    i, spec.hookClass.c_str(), spec.hookMethod.c_str(),
+                    spec.hookDesc.c_str(), out.reason.c_str());
+        }
+    }
+
+    if (hooks.empty()) { setError("no_hooks_resolved"); return 0; }
+
+    /* Phase B+C: merged alloc + single suspend/write/swap. commitKlass returns
+       2 if the class lost its cache between the gate check and here (a link
+       race); park it in that case. */
+    int crc = commitKlass(kAddr, hooks, isNew, nullptr);
+    if (crc == 2) {
+        deferKlassTransform(kAddr, newSpecs);
+        setError("ok");
+        return 2;
+    }
+    return crc == 1 ? 1 : 0;
+}
+
+/* Retry-thread body: periodically re-attempt every parked transform whose
+   class has since been linked by the game. */
+static DWORD WINAPI deferredRetryThread(LPVOID) {
+    for (;;) {
+        Sleep(250);
+        if (g_target.handle == NULL) continue;
+
+        std::lock_guard<std::mutex> _txLock(g_transformLock);
+        if (g_pendingTransforms.empty()) continue;
+
+        /* Collect the klasses that are now linked and ready to commit. */
+        std::vector<PendingTransform> ready;
+        for (size_t i = 0; i < g_pendingTransforms.size();) {
+            if (klassIsLinked(g_pendingTransforms[i].klassAddr)) {
+                ready.push_back(std::move(g_pendingTransforms[i]));
+                g_pendingTransforms.erase(g_pendingTransforms.begin() + (ptrdiff_t)i);
+            } else {
+                i++;
+            }
+        }
+        if (ready.empty()) continue;
+
+        std::vector<DWORD> threadIds;
+        suspendTargetThreads(g_target.pid, threadIds);
+        for (auto& pt : ready) {
+            FVM_LOG("DEFERRED_RETRY: klass=0x%llX now linked — committing %zu spec(s)",
+                    (unsigned long long)pt.klassAddr, pt.specs.size());
+            /* resolveAndCommitKlass re-parks the entry if it is somehow still
+               unlinked (link race) — harmless, retried next tick. */
+            resolveAndCommitKlass(pt.klassAddr, pt.specs, nullptr);
+        }
+        resumeTargetThreads(threadIds);
+        forceDeoptimizeAll();
+    }
+    return 0;
+}
+
+/* Start the retry thread once, lazily, the first time a transform is deferred.
+   Caller holds g_transformLock. */
+static void maybeStartDeferredRetryThread() {
+    if (g_retryThreadStarted) return;
+    g_retryThreadStarted = true;
+    HANDLE th = CreateThread(NULL, 0, deferredRetryThread, NULL, 0, NULL);
+    if (th) {
+        CloseHandle(th);
+        FVM_LOG("CLASS_PLAN: deferred-transform retry thread started");
+    } else {
+        FVM_LOG("CLASS_PLAN: WARN failed to start deferred-transform retry thread");
+    }
+}
+
 int commitClassPlan(const char* targetClassName,
                     const std::vector<HookSpecExtended>& additionalHooks,
                     bool includeSubclasses,
@@ -4271,81 +4832,7 @@ int commitClassPlan(const char* targetClassName,
 
     if (outResults) outResults->resize(additionalHooks.size());
 
-    /* Commit one klass: resolve hooks, build new CP, swap. */
-    auto commitOneKlass = [&](uint64_t kAddr, const std::vector<HookSpecExtended>& newSpecs,
-                               std::vector<HookOutcome>* results) -> bool {
-        /* Stash existing plan (if any) and unload it → back to oldCP₀ */
-        std::vector<PatchedMethodInfo> existing;
-        {
-            auto it = g_plans.find(kAddr);
-            if (it != g_plans.end()) existing = it->second.patchedMethods;
-        }
-        if (!existing.empty()) {
-            unloadClassPlanForKlass(kAddr);  /* restores IK._constants → oldCP₀ */
-            FVM_LOG("CLASS_PLAN: unloaded existing plan (%zu hooks) for klass=0x%llX",
-                    existing.size(), (unsigned long long)kAddr);
-        }
-
-        /* Phase A: resolve all hooks (existing replays + new) */
-        std::vector<HookData> hooks;
-        std::vector<bool>          isNew;
-
-        /* 1. Replay existing hooks */
-        for (auto& pmi : existing) {
-            std::string mName, mSig;
-            if (!readMethodNameAndSig(pmi.methodAddr, &mName, &mSig)) {
-                FVM_LOG("CLASS_PLAN: cannot read name/sig for Method*=0x%llX, skipping",
-                        (unsigned long long)pmi.methodAddr);
-                continue;
-            }
-            HookSpecExtended ext;
-            ext.hookClass=pmi.hook.hookClass; ext.hookMethod=pmi.hook.hookMethod;
-            ext.hookDesc=pmi.hook.hookDesc;   ext.injectAt=pmi.hook.injectAt;
-            ext.candidates.push_back({mName, mSig});
-
-            HookData hd;
-            if (resolveHookData(kAddr, mName, mSig, ext, hd)) {
-                hooks.push_back(std::move(hd));
-                isNew.push_back(false);
-            } else {
-                FVM_LOG("CLASS_PLAN: replay resolve FAILED %s%s: %s", mName.c_str(), mSig.c_str(), g_lastError.c_str());
-            }
-        }
-
-        /* 2. Resolve new hooks (try candidates) */
-        if (results) results->resize(newSpecs.size());
-        HookOutcome _dummyOutcome;
-        for (size_t i = 0; i < newSpecs.size(); i++) {
-            const HookSpecExtended& spec = newSpecs[i];
-            HookOutcome& out = results ? (*results)[i] : _dummyOutcome;
-            out.reason = spec.candidates.empty() ? "no_candidates" : "method_not_found";
-            bool matched = false;
-            for (auto& cand : spec.candidates) {
-                HookData hd;
-                if (resolveHookData(kAddr, cand.methodName, cand.paramDesc, spec, hd)) {
-                    out.matched    = true;
-                    out.methodName = cand.methodName;
-                    out.paramDesc  = cand.paramDesc;
-                    out.methodAddr = hd.methodAddr;
-                    hooks.push_back(std::move(hd));
-                    isNew.push_back(true);
-                    matched = true;
-                    break;
-                }
-                if (!g_lastError.empty()) out.reason = g_lastError;
-            }
-            if (!matched) {
-                FVM_LOG("CLASS_PLAN: new hook[%zu] NO MATCH (%s.%s%s) reason=%s",
-                        i, spec.hookClass.c_str(), spec.hookMethod.c_str(),
-                        spec.hookDesc.c_str(), out.reason.c_str());
-            }
-        }
-
-        if (hooks.empty()) { setError("no_hooks_resolved"); return false; }
-
-        /* Phase B+C: merged alloc + single suspend/write/swap */
-        return commitKlass(kAddr, hooks, isNew, nullptr) == 1;
-    };
+    std::lock_guard<std::mutex> _txLock(g_transformLock);
 
     /* Suspend target threads for the whole batch (Phase A includes no I/O that needs them
        but Phase B/C does; outer suspend keeps threads frozen across all klass commits) */
@@ -4353,9 +4840,13 @@ int commitClassPlan(const char* targetClassName,
     suspendTargetThreads(g_target.pid, outerThreadIds);
     FVM_LOG("CLASS_PLAN: outer suspended %zu threads", outerThreadIds.size());
 
-    bool ok = commitOneKlass(klassAddr, additionalHooks, outResults);
+    /* rc: 1 = committed, 0 = failed, 2 = deferred (class not linked yet). */
+    int rc = resolveAndCommitKlass(klassAddr, additionalHooks, outResults);
 
-    if (includeSubclasses && ok) {
+    /* A deferred top-level class still counts as accepted — outResults already
+       carries the per-hook match info (resolveAndCommitKlass fills it before
+       deferring), and subclass propagation below needs it. */
+    if (includeSubclasses && (rc == 1 || rc == 2)) {
         std::vector<uint64_t> subs = findAllSubclasses(klassAddr);
         for (uint64_t s : subs) {
             /* For subclasses: propagate matching hooks (those matched on parent) */
@@ -4373,7 +4864,7 @@ int commitClassPlan(const char* targetClassName,
                 uint64_t subMethodCheck = 0;
                 if (findMethodInKlass(s, subHooks[0].candidates[0].methodName.c_str(),
                                        subHooks[0].candidates[0].paramDesc.c_str(), &subMethodCheck)) {
-                    commitOneKlass(s, subHooks, nullptr);
+                    resolveAndCommitKlass(s, subHooks, nullptr);
                 }
             }
         }
@@ -4387,9 +4878,14 @@ int commitClassPlan(const char* targetClassName,
         forceDeoptimizeAll();
     }
 
-    FVM_LOG("=== CLASS_PLAN END: %s ok=%d ===", internal.c_str(), (int)ok);
-    if (ok) setError("ok");
-    return ok ? 1 : 0;
+    /* rc == 2: the class is not linked yet; its hooks are parked and the retry
+       thread will commit them once the game links it. Report success — the
+       hooks are accepted, outResults already carries per-hook match info. */
+    bool accepted = (rc == 1 || rc == 2);
+    FVM_LOG("=== CLASS_PLAN END: %s rc=%d accepted=%d ===",
+            internal.c_str(), rc, (int)accepted);
+    if (accepted) setError("ok");
+    return accepted ? 1 : 0;
 }
 
 // ============================================================
