@@ -179,7 +179,11 @@ try {
     ForgeVM.relaunch();                                      // restart, keep all args
     ForgeVM.relaunch(AgentFilter.Blacklist("evil.jar"));     // strip matching -javaagent: args
     ForgeVM.relaunch(NativeFilter.Blacklist("*cheat*"));     // strip matching -agentpath: args
-    ForgeVM.relaunch(agentFilter, nativeFilter);             // both filters at once
+    ForgeVM.relaunch(ProcessFilter.Blacklist("*.exe"));      // pre-install a process-creation filter
+    ForgeVM.relaunch(agentFilter, nativeFilter);             // any pair of filters
+    ForgeVM.relaunch(agentFilter, processFilter);
+    ForgeVM.relaunch(nativeFilter, processFilter);
+    ForgeVM.relaunch(agentFilter, nativeFilter, processFilter); // all three at once
 } catch (RelaunchException e) {
     // e.getMessage(): "already_relaunched" | "agent_not_active" | "open_process_failed" | ...
 }
@@ -453,7 +457,11 @@ try {
     ForgeVM.relaunch();                                      // 保留所有参数重启
     ForgeVM.relaunch(AgentFilter.Blacklist("evil.jar"));     // 过滤掉匹配的 -javaagent: 参数
     ForgeVM.relaunch(NativeFilter.Blacklist("*cheat*"));     // 过滤掉匹配的 -agentpath: 参数
-    ForgeVM.relaunch(agentFilter, nativeFilter);             // 同时应用两种过滤
+    ForgeVM.relaunch(ProcessFilter.Blacklist("*.exe"));      // 预装进程创建过滤器
+    ForgeVM.relaunch(agentFilter, nativeFilter);             // 任意两种过滤组合
+    ForgeVM.relaunch(agentFilter, processFilter);
+    ForgeVM.relaunch(nativeFilter, processFilter);
+    ForgeVM.relaunch(agentFilter, nativeFilter, processFilter); // 三种全应用
 } catch (RelaunchException e) {
     // e.getMessage(): "already_relaunched" | "agent_not_active" | "open_process_failed" | ...
 }

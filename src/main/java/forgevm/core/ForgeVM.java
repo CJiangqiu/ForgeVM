@@ -258,6 +258,16 @@ public final class ForgeVM {
         relaunchInternal(null, null, processFilter);
     }
 
+    /** Relaunch the JVM, applying agentFilter to -javaagent: args and pre-installing processFilter. Never returns on success. */
+    public static void relaunch(AgentFilter agentFilter, ProcessFilter processFilter) throws RelaunchException {
+        relaunchInternal(agentFilter, null, processFilter);
+    }
+
+    /** Relaunch the JVM, applying nativeFilter to -agentpath: args and pre-installing processFilter. Never returns on success. */
+    public static void relaunch(NativeFilter nativeFilter, ProcessFilter processFilter) throws RelaunchException {
+        relaunchInternal(null, nativeFilter, processFilter);
+    }
+
     /** Relaunch the JVM, applying all three filters. Never returns on success. */
     public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter, ProcessFilter processFilter) throws RelaunchException {
         relaunchInternal(agentFilter, nativeFilter, processFilter);
