@@ -32,9 +32,9 @@ public final class InjectPoint {
      *
      * <p>Target string forms (most to least specific):
      * <ul>
-     *   <li>{@code "setHealth"} — match by method name only; all overloads injected</li>
-     *   <li>{@code "setHealth(F)"} — match by name + parameter descriptor</li>
-     *   <li>{@code "setHealth(F)V"} — match by name + parameters + return type</li>
+     *   <li>{@code "setHealth"} - match by method name only; all overloads injected</li>
+     *   <li>{@code "setHealth(F)"} - match by name + parameter descriptor</li>
+     *   <li>{@code "setHealth(F)V"} - match by name + parameters + return type</li>
      * </ul>
      *
      * <pre>{@code
@@ -55,8 +55,8 @@ public final class InjectPoint {
      *
      * <p>Target string forms:
      * <ul>
-     *   <li>{@code "health"} — match by field name only</li>
-     *   <li>{@code "health:F"} — match by name + descriptor</li>
+     *   <li>{@code "health"} - match by field name only</li>
+     *   <li>{@code "health:F"} - match by name + descriptor</li>
      * </ul>
      *
      * <pre>{@code
@@ -77,8 +77,8 @@ public final class InjectPoint {
      *
      * <p>Target string forms:
      * <ul>
-     *   <li>{@code "health"} — match by field name only</li>
-     *   <li>{@code "health:F"} — match by name + descriptor</li>
+     *   <li>{@code "health"} - match by field name only</li>
+     *   <li>{@code "health:F"} - match by name + descriptor</li>
      * </ul>
      *
      * <pre>{@code

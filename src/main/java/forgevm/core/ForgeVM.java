@@ -35,7 +35,7 @@ public final class ForgeVM {
     private static final String ENV_AGENT_EXE_PATH = "FORGEVM_AGENT_EXE_PATH";
     private static final String PROP_AGENT_EXE_PATH = "forgevm.agent.exe.path";
     /** Set by the persistent agent on the new JVM's command line after relaunch.
-     *  Value is the agent's own PID — used to construct the handoff named pipe
+     *  Value is the agent's own PID - used to construct the handoff named pipe
      *  path. When this property is present, launch() reuses the existing agent
      *  instead of spawning a new one. */
     private static final String PROP_AGENT_HANDOFF_PID = "forgevm.agent.pid";
@@ -45,8 +45,8 @@ public final class ForgeVM {
     private static final String AGENT_EXE_FILE = "forgevm_agent.exe";
     private static final String DLL_FILE = "forgevm_native" + chars('.', 'd', 'l', 'l');
     private static final String FORGEVM_RUNTIME_DIR = "ForgeVM";
-    private static final String RESOURCE_AGENT_PATH = "/native/win-x64/forgevm_agent.exe";
-    private static final String RESOURCE_DLL_PATH = "/native/win-x64/" + DLL_FILE;
+    private static final String RESOURCE_AGENT_PATH = "/forgevm/native/win-x64/forgevm_agent.exe";
+    private static final String RESOURCE_DLL_PATH = "/forgevm/native/win-x64/" + DLL_FILE;
     private static final long AGENT_IO_TIMEOUT_SECONDS = 120L;
 
     private static volatile LaunchResult state;
@@ -168,7 +168,7 @@ public final class ForgeVM {
      * Filtered Java agent ban: purges already-loaded agents whose source jar
      * matches {@code filter}, and blocks future attach attempts whose jar path
      * matches the same filter. Agents whose jar identity cannot be resolved
-     * (boot loader, dynamically-generated classes) are NOT purged — call
+     * (boot loader, dynamically-generated classes) are NOT purged - call
      * {@link #banJavaAgent()} with no filter for unconditional purge.
      *
      * <p>The purge arm is irreversible; the future-attach block is reversible
@@ -250,7 +250,7 @@ public final class ForgeVM {
 
     /**
      * Relaunch the JVM with a process creation filter pre-installed on the new JVM.
-     * The filter is active from the new JVM's first instruction — no window exists
+     * The filter is active from the new JVM's first instruction - no window exists
      * in which a spawned child process could escape the filter.
      * Never returns on success.
      */
@@ -388,14 +388,14 @@ public final class ForgeVM {
     private static LaunchResult launchInternal() {
         /* Handoff: a persistent agent that survived a relaunch put its PID on
          * our command line. Connect to its named pipe instead of spawning a
-         * fresh agent — this is what makes the new JVM's lifecycle fully
+         * fresh agent - this is what makes the new JVM's lifecycle fully
          * protected (the same agent that pre-patched ntdll!LdrLoadDll into
          * this JVM while it was still SUSPENDED). */
         String handoffPid = System.getProperty(PROP_AGENT_HANDOFF_PID);
         if (handoffPid != null && !handoffPid.isBlank()) {
             LaunchResult r = launchViaHandoff(handoffPid.trim());
             if (r != null) return r;
-            /* Handoff failed — fall through to normal spawn as a degraded path.
+            /* Handoff failed - fall through to normal spawn as a degraded path.
              * Logged inside launchViaHandoff. */
         }
 
@@ -466,7 +466,7 @@ public final class ForgeVM {
     private static LaunchResult launchViaHandoff(String agentPid) {
         String pipePath = "\\\\.\\pipe\\forgevm_cmd_" + agentPid;
         try {
-            /* On Windows, named pipes can be opened with regular file I/O —
+            /* On Windows, named pipes can be opened with regular file I/O -
              * the kernel handles the pipe protocol transparently. We use
              * RandomAccessFile because it supports full-duplex on a single
              * handle (FileInputStream + FileOutputStream would open two
@@ -478,7 +478,7 @@ public final class ForgeVM {
             BufferedWriter writer = new BufferedWriter(
                     new OutputStreamWriter(Channels.newOutputStream(ch), StandardCharsets.UTF_8));
 
-            /* process=null marks this as a handoff session — isAlive() returns
+            /* process=null marks this as a handoff session - isAlive() returns
              * true until an IPC error, and closeAgentSession skips waitFor. */
             AgentSession session = new AgentSession(null, reader, writer);
 
@@ -505,7 +505,7 @@ public final class ForgeVM {
             return result;
         } catch (Throwable ex) {
             FvmLog.warn("handoff failed (" + ex.getClass().getSimpleName() + "): " + ex.getMessage()
-                    + " — falling back to fresh agent spawn");
+                    + " - falling back to fresh agent spawn");
             return null;
         }
     }
