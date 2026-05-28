@@ -1896,8 +1896,12 @@ static std::wstring quoteIfNeeded(const std::wstring& token) {
  * agent. */
 static bool isForgevmRelaunchInjectedToken(const std::wstring& tok) {
     static const wchar_t* const kPrefixes[] = {
-        L"-Dforgevm.relaunched=",
         L"-Dforgevm.agent.pid=",
+        L"-Dforgevm.relaunch.gen=",
+        /* Legacy props from earlier agent revisions — strip on the way through
+         * so chained relaunches against an older-built source JVM don't carry
+         * forward stale or unrecognised state. */
+        L"-Dforgevm.relaunched=",
         L"-Dforgevm.relaunch.remaining=",
     };
     for (const wchar_t* p : kPrefixes) {
@@ -2001,7 +2005,6 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
 
     std::vector<std::wstring> newTokens;
     newTokens.push_back(tokens[0]);
-    newTokens.push_back(L"-Dforgevm.relaunched=true");
     {
         /* Inject handoff token so the new JVM's ForgeVM.launch() connects to
          * the persistent agent via named pipe instead of spawning a new agent. */
@@ -2011,12 +2014,14 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         newTokens.push_back(buf);
     }
     {
-        /* Carry the remaining relaunch budget forward to the new generation. */
-        unsigned long long nextRemaining = getJsonUnsignedField(line, "nextRemaining", 0ULL);
-        wchar_t rbuf[64];
-        swprintf_s(rbuf, ARRAYSIZE(rbuf), L"-Dforgevm.relaunch.remaining=%llu", nextRemaining);
-        newTokens.push_back(rbuf);
-        AGENT_LOG("relaunch: next-gen relaunch budget remaining=%llu", nextRemaining);
+        /* Carry the monotonic relaunch-generation counter forward; Java side
+         * exposes this via ForgeVM.relaunchGeneration() so callers can decide
+         * for themselves when to stop relaunching. */
+        unsigned long long nextGen = getJsonUnsignedField(line, "nextGen", 1ULL);
+        wchar_t gbuf[64];
+        swprintf_s(gbuf, ARRAYSIZE(gbuf), L"-Dforgevm.relaunch.gen=%llu", nextGen);
+        newTokens.push_back(gbuf);
+        AGENT_LOG("relaunch: next-gen relaunch generation=%llu", nextGen);
     }
     for (size_t i = 1; i < tokens.size(); i++) {
         if (isForgevmRelaunchInjectedToken(tokens[i])) {

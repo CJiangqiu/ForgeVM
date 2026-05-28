@@ -39,11 +39,12 @@ public final class ForgeVM {
      *  path. When this property is present, launch() reuses the existing agent
      *  instead of spawning a new one. */
     private static final String PROP_AGENT_HANDOFF_PID = "forgevm.agent.pid";
-    /** Set by the agent on each relaunched JVM's command line: the number of
-     *  relaunches still permitted in this chain after the one that produced it.
-     *  Locks in the caller-supplied budget on the first relaunch and decrements
-     *  per generation; absence means no chain in progress. */
-    private static final String PROP_RELAUNCH_REMAINING = "forgevm.relaunch.remaining";
+    /** Set by the agent on each relaunched JVM's command line: a monotonically
+     *  increasing counter, incremented once per relaunch. Absence (or "0") means
+     *  the current JVM has never been relaunched. Exposed via
+     *  {@link #relaunchGeneration()} so callers can implement their own stop
+     *  condition (a soft cap, a "clean once" guard, an adaptive halt). */
+    private static final String PROP_RELAUNCH_GEN = "forgevm.relaunch.gen";
     private static final String ENV_NATIVE_DLL_PATH = "FORGEVM_NATIVE_DLL_PATH";
     private static final String PROP_NATIVE_DLL_PATH = "forgevm.native." + chars('d', 'l', 'l') + ".path";
 
@@ -235,22 +236,22 @@ public final class ForgeVM {
 
     /** Relaunch the JVM, keeping all existing -javaagent/-agentpath args. Never returns on success. */
     public static void relaunch() throws RelaunchException {
-        relaunchInternal(null, null, null, 1);
+        relaunchInternal(null, null, null);
     }
 
     /** Relaunch the JVM, applying agentFilter to -javaagent: args on the new command line. Never returns on success. */
     public static void relaunch(AgentFilter agentFilter) throws RelaunchException {
-        relaunchInternal(agentFilter, null, null, 1);
+        relaunchInternal(agentFilter, null, null);
     }
 
     /** Relaunch the JVM, applying nativeFilter to -agentpath: args on the new command line. Never returns on success. */
     public static void relaunch(NativeFilter nativeFilter) throws RelaunchException {
-        relaunchInternal(null, nativeFilter, null, 1);
+        relaunchInternal(null, nativeFilter, null);
     }
 
     /** Relaunch the JVM, applying both filters to the new command line. Never returns on success. */
     public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter) throws RelaunchException {
-        relaunchInternal(agentFilter, nativeFilter, null, 1);
+        relaunchInternal(agentFilter, nativeFilter, null);
     }
 
     /**
@@ -260,102 +261,55 @@ public final class ForgeVM {
      * Never returns on success.
      */
     public static void relaunch(ProcessFilter processFilter) throws RelaunchException {
-        relaunchInternal(null, null, processFilter, 1);
+        relaunchInternal(null, null, processFilter);
     }
 
     /** Relaunch the JVM, applying agentFilter to -javaagent: args and pre-installing processFilter. Never returns on success. */
     public static void relaunch(AgentFilter agentFilter, ProcessFilter processFilter) throws RelaunchException {
-        relaunchInternal(agentFilter, null, processFilter, 1);
+        relaunchInternal(agentFilter, null, processFilter);
     }
 
     /** Relaunch the JVM, applying nativeFilter to -agentpath: args and pre-installing processFilter. Never returns on success. */
     public static void relaunch(NativeFilter nativeFilter, ProcessFilter processFilter) throws RelaunchException {
-        relaunchInternal(null, nativeFilter, processFilter, 1);
+        relaunchInternal(null, nativeFilter, processFilter);
     }
 
     /** Relaunch the JVM, applying all three filters. Never returns on success. */
     public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter, ProcessFilter processFilter) throws RelaunchException {
-        relaunchInternal(agentFilter, nativeFilter, processFilter, 1);
+        relaunchInternal(agentFilter, nativeFilter, processFilter);
     }
 
-    /*
-     * Budget-bearing overloads. {@code maxRelaunches} is the total number of
-     * relaunches permitted in this chain counting the current call, so
-     * {@code relaunch(filter, 5)} allows this relaunch plus up to 4 more across
-     * the resulting JVM generations. The budget is locked in on the first call
-     * of a chain and carried forward automatically; supplying it again inside an
-     * already-relaunched JVM has no effect. Throws
-     * {@code RelaunchException("relaunch_budget_exhausted")} once spent.
-     * Never return on success.
-     */
-
-    public static void relaunch(int maxRelaunches) throws RelaunchException {
-        relaunchInternal(null, null, null, maxRelaunches);
-    }
-
-    public static void relaunch(AgentFilter agentFilter, int maxRelaunches) throws RelaunchException {
-        relaunchInternal(agentFilter, null, null, maxRelaunches);
-    }
-
-    public static void relaunch(NativeFilter nativeFilter, int maxRelaunches) throws RelaunchException {
-        relaunchInternal(null, nativeFilter, null, maxRelaunches);
-    }
-
-    public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter, int maxRelaunches) throws RelaunchException {
-        relaunchInternal(agentFilter, nativeFilter, null, maxRelaunches);
-    }
-
-    public static void relaunch(ProcessFilter processFilter, int maxRelaunches) throws RelaunchException {
-        relaunchInternal(null, null, processFilter, maxRelaunches);
-    }
-
-    public static void relaunch(AgentFilter agentFilter, ProcessFilter processFilter, int maxRelaunches) throws RelaunchException {
-        relaunchInternal(agentFilter, null, processFilter, maxRelaunches);
-    }
-
-    public static void relaunch(NativeFilter nativeFilter, ProcessFilter processFilter, int maxRelaunches) throws RelaunchException {
-        relaunchInternal(null, nativeFilter, processFilter, maxRelaunches);
-    }
-
-    public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter, ProcessFilter processFilter, int maxRelaunches) throws RelaunchException {
-        relaunchInternal(agentFilter, nativeFilter, processFilter, maxRelaunches);
-    }
-
-    /** Parse the carried relaunch-remaining count; any malformed value is treated
-     *  as an exhausted budget so a corrupt property can never grant relaunches. */
-    private static int parseRelaunchRemaining(String value) {
+    /** Generation of the current JVM in a relaunch chain. Returns 0 for the
+     *  original JVM (never relaunched), 1 for the JVM produced by the first
+     *  relaunch, 2 for the next, and so on. Read from the property the agent
+     *  injects on every relaunched JVM's command line; absent/malformed values
+     *  are treated as 0 so a missing property never wedges callers.
+     *
+     *  ForgeVM does not enforce a relaunch cap of its own — callers express
+     *  their stop condition in terms of this value, e.g.
+     *  {@code if (ForgeVM.relaunchGeneration() < 3) ForgeVM.relaunch(...);}
+     *  for a soft cap, or condition on whatever business state actually
+     *  determines whether another relaunch is still useful. */
+    public static int relaunchGeneration() {
+        String v = System.getProperty(PROP_RELAUNCH_GEN);
+        if (v == null) return 0;
         try {
-            return Integer.parseInt(value.trim());
+            int n = Integer.parseInt(v.trim());
+            return Math.max(n, 0);
         } catch (NumberFormatException ignored) {
             return 0;
         }
     }
 
     private static void relaunchInternal(AgentFilter agentFilter, NativeFilter nativeFilter,
-                                         ProcessFilter processFilter, int maxRelaunches) throws RelaunchException {
-        /* The relaunch budget is locked in on the first call of a chain and
-         * carried forward in forgevm.relaunch.remaining, decremented once per
-         * generation. maxRelaunches (total relaunches allowed, counting this
-         * one) applies only when no chain is yet in progress; inside a
-         * relaunched JVM the carried remaining count wins. */
-        String remainingProp = System.getProperty(PROP_RELAUNCH_REMAINING);
-        int remaining = (remainingProp != null) ? parseRelaunchRemaining(remainingProp) : maxRelaunches;
-        if (remaining <= 0) {
-            /* Budget spent is the designed terminal state of a relaunch chain,
-             * not an error: log and return so an unconditional relaunch() call
-             * at startup simply becomes a no-op once the chain is complete,
-             * rather than throwing a checked exception the caller could let
-             * propagate into a hard crash. */
-            FvmLog.info("relaunch: budget exhausted (remaining=" + remaining
-                    + ") — no further relaunch, continuing in current JVM");
-            return;
-        }
+                                         ProcessFilter processFilter) throws RelaunchException {
         AgentSession session = agentSession;
         if (session == null || !session.isAlive()) {
             throw new RelaunchException("agent_not_active");
         }
         try {
-            String command = buildRelaunchCommand(agentFilter, nativeFilter, processFilter, remaining - 1);
+            int nextGen = relaunchGeneration() + 1;
+            String command = buildRelaunchCommand(agentFilter, nativeFilter, processFilter, nextGen);
             String response = sendCommand(session, command);
             if (!isOkResponse(response)) {
                 String reason = "relaunch_rejected";
@@ -379,11 +333,11 @@ public final class ForgeVM {
         }
     }
 
-    private static String buildRelaunchCommand(AgentFilter agentFilter, NativeFilter nativeFilter, ProcessFilter processFilter, int nextRemaining) {
+    private static String buildRelaunchCommand(AgentFilter agentFilter, NativeFilter nativeFilter, ProcessFilter processFilter, int nextGen) {
         StringBuilder sb = new StringBuilder();
         sb.append("{\"cmd\":\"relaunch\"");
         sb.append(",\"pid\":").append(ProcessHandle.current().pid());
-        sb.append(",\"nextRemaining\":").append(nextRemaining);
+        sb.append(",\"nextGen\":").append(nextGen);
         sb.append(",\"hasAgentFilter\":").append(agentFilter != null);
         if (agentFilter != null) {
             sb.append(",\"agentMode\":\"").append(escapeJson(agentFilter.mode().name().toLowerCase())).append("\"");
