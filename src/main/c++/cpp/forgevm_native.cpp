@@ -646,57 +646,6 @@ namespace {
     extern PatchState g_processCreatePatch;
 }
 
-/* Minimal attach: opens process handle and sets g_target.{handle,pid}.
- * Does NOT find jvm.dll or read VMStructs — those require jvm.dll to be loaded
- * in the target. Used during relaunch to install ntdll!LdrLoadDll hooks on a
- * CREATE_SUSPENDED new JVM before jvm.dll has been mapped. After the new JVM
- * resumes and loads jvm.dll, callers must call forgevm_bootstrap_target() for
- * the full VMStructs setup. */
-extern "C" __declspec(dllexport) int forgevm_attach_target_minimal(unsigned long long targetPid) {
-    FVM_LOG("forgevm_attach_target_minimal(pid=%llu)", targetPid);
-    DWORD oldPid = g_target.pid;
-    DWORD newPid = static_cast<DWORD>(targetPid);
-    if (g_target.handle != NULL) {
-        CloseHandle(g_target.handle);
-        g_target = TargetProcess{};
-    }
-    /* When the target PID changes, any patch state from the previous target
-     * is stale — its trampolines live in the old process's address space,
-     * which is gone (or about to be). Reset so future install calls don't
-     * bail with "already_patched". */
-    if (oldPid != newPid) {
-        g_javaAgentPatch     = PatchState{};
-        g_nativeLoadPatch    = PatchState{};
-        g_processCreatePatch = PatchState{};
-        FVM_LOG("attach_target_minimal: target pid changed %lu -> %lu, patch state cleared",
-                (unsigned long)oldPid, (unsigned long)newPid);
-    }
-    g_structMap.clear();
-    g_typeMap.clear();
-    g_intConstants.clear();
-    g_longConstants.clear();
-    g_fieldInfoCache.clear();
-
-    if (targetPid == 0ULL) {
-        setError("target_pid_zero");
-        return 0;
-    }
-
-    HANDLE proc = OpenProcess(
-        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
-        FALSE, static_cast<DWORD>(targetPid));
-    if (proc == NULL) {
-        setError("open_target_process_failed");
-        return 0;
-    }
-    g_target.handle = proc;
-    g_target.pid = static_cast<DWORD>(targetPid);
-    /* jvmDllBase / structMapReady deliberately left zero/false — caller must
-     * follow up with forgevm_bootstrap_target() once jvm.dll has loaded. */
-    setError("ok");
-    return 1;
-}
-
 extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long targetPid) {
     FVM_LOG("forgevm_bootstrap_target(pid=%llu)", targetPid);
     DWORD oldPid = g_target.pid;
@@ -705,7 +654,9 @@ extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long
         CloseHandle(g_target.handle);
         g_target = TargetProcess{};
     }
-    /* See attach_target_minimal for rationale — patch state is per-target. */
+    /* Patch state is per-target: when the target PID changes, the previous
+     * target's trampolines live in an address space that's gone, so reset to
+     * avoid future install calls bailing with "already_patched". */
     if (oldPid != newPid) {
         g_javaAgentPatch     = PatchState{};
         g_nativeLoadPatch    = PatchState{};
@@ -1392,7 +1343,17 @@ static int uninstallFilterTrampoline(PatchState& state, const char* logTag) {
 static uint64_t resolveNtdllExport(HANDLE proc, const char* exportName) {
     uint64_t base = 0, size = 0;
     if (!findModuleBase(proc, L"ntdll.dll", &base, &size) || base == 0) {
-        return 0;
+        /* A CREATE_SUSPENDED process has not run LdrInitializeThunk yet, so its
+         * PEB loader module list is empty and EnumProcessModulesEx returns
+         * nothing. ntdll.dll is nonetheless already mapped by the kernel, and
+         * its load base is shared by every process in the same boot session,
+         * so this process's own ntdll base is a valid stand-in for the remote
+         * one. The export table is then read out of the remote mapping at that
+         * base, which is present and readable even while suspended. */
+        base = reinterpret_cast<uint64_t>(GetModuleHandleW(L"ntdll.dll"));
+        if (base == 0) {
+            return 0;
+        }
     }
     uint64_t addr = 0;
     if (parsePEExport(proc, base, exportName, &addr) && addr != 0) {

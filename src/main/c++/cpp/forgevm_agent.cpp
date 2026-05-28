@@ -70,7 +70,6 @@ typedef int(__cdecl* InitFn)();
 typedef const char* (__cdecl* LastErrorFn)();
 typedef int(__cdecl* ExitByPidFn)(unsigned long long, int);
 typedef int(__cdecl* BootstrapTargetFn)(unsigned long long);
-typedef int(__cdecl* AttachTargetMinimalFn)(unsigned long long);
 typedef unsigned long long(__cdecl* StructMapCountFn)();
 typedef int(__cdecl* PutFieldFn)(unsigned long long, const char*, const char*, const unsigned char*, unsigned long long);
 typedef int(__cdecl* PutFieldBatchFn)(const unsigned long long*, unsigned long long, const char*, const char*, const unsigned char*, unsigned long long);
@@ -96,7 +95,6 @@ struct NativeApi {
     LastErrorFn lastError = NULL;
     ExitByPidFn exitByPid = NULL;
     BootstrapTargetFn bootstrapTarget = NULL;
-    AttachTargetMinimalFn attachTargetMinimal = NULL;
     StructMapCountFn structMapCount = NULL;
     StructMapCountFn typeMapCount = NULL;
     LastErrorFn compressionInfo = NULL;
@@ -185,6 +183,18 @@ static std::atomic<DWORD> g_parentPid{0};
  * agent must persist to keep serving the filter pipe so the ntdll hook in the new
  * JVM continues to receive allow/block decisions. */
 static std::atomic<bool> g_persistAfterEOF{false};
+
+/* SYNCHRONIZE handle to the relaunched JVM, published by handleRelaunch.
+ * Lets the post-relaunch handoff wait give up the instant the new JVM exits
+ * instead of blocking forever on a client that will never connect — without
+ * this the agent leaks one zombie per relaunch whose JVM dies pre-handoff. */
+static std::atomic<HANDLE> g_relaunchNewJvm{NULL};
+
+/* Manual-reset event the post-relaunch watcher sets when it concludes the new
+ * JVM will never hand off (jvm.dll never loaded, or bootstrap failed). The
+ * handoff wait also watches it, so a new JVM that hangs alive — never dying,
+ * never connecting — still releases the agent instead of pinning it forever. */
+static std::atomic<HANDLE> g_relaunchAbortEvent{NULL};
 
 DWORD WINAPI parentWatchdogThread(LPVOID) {
     /* Short-timeout polling instead of INFINITE wait. The agent's parent pid
@@ -548,7 +558,6 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->lastError       = reinterpret_cast<LastErrorFn>(GetProcAddress(module, "forgevm_last_error"));
     api->exitByPid       = reinterpret_cast<ExitByPidFn>(GetProcAddress(module, "forgevm_exit_process"));
     api->bootstrapTarget     = reinterpret_cast<BootstrapTargetFn>(GetProcAddress(module, "forgevm_bootstrap_target"));
-    api->attachTargetMinimal = reinterpret_cast<AttachTargetMinimalFn>(GetProcAddress(module, "forgevm_attach_target_minimal"));
     api->structMapCount  = reinterpret_cast<StructMapCountFn>(GetProcAddress(module, "forgevm_structmap_count"));
     api->typeMapCount    = reinterpret_cast<StructMapCountFn>(GetProcAddress(module, "forgevm_typemap_count"));
     api->compressionInfo = reinterpret_cast<LastErrorFn>(GetProcAddress(module, "forgevm_compression_info"));
@@ -1467,25 +1476,88 @@ static bool ensureCommandPipeCreated() {
     return true;
 }
 
-/* Block until a client connects to the command pipe. Returns the connected
- * pipe handle (caller takes ownership; the server pipe instance is consumed
- * for this client and must be recreated for further clients). */
-static HANDLE acceptCommandPipeClient() {
+/* Block until a client connects to the command pipe, OR the given liveness
+ * handle signals (the relaunched JVM exited before connecting). Returns the
+ * connected pipe handle on success (caller takes ownership; the server pipe
+ * instance is consumed for this client and must be recreated for further
+ * clients), or NULL on JVM death / connect failure.
+ *
+ * The blocking ConnectNamedPipe is offloaded to a worker thread so the caller
+ * can wait on both its completion and the JVM handle; if the JVM dies first
+ * the worker's pending synchronous I/O is cancelled. The pipe stays in
+ * synchronous mode throughout so the post-handoff stdio redirection keeps
+ * working. hJvmLiveness may be NULL, degrading to an unbounded client wait. */
+static HANDLE acceptCommandPipeClient(HANDLE hJvmLiveness) {
     if (!ensureCommandPipeCreated()) return NULL;
     HANDLE pipe = g_commandPipeServer;
-    BOOL connected = ConnectNamedPipe(pipe, NULL)
-                         ? TRUE
-                         : (GetLastError() == ERROR_PIPE_CONNECTED);
-    if (!connected) {
-        AGENT_LOG("acceptCommandPipeClient: ConnectNamedPipe failed: %lu", GetLastError());
+
+    struct ConnCtx {
+        HANDLE pipe;
+        HANDLE done;
+        BOOL   ok;
+    } ctx{ pipe, CreateEventA(NULL, TRUE, FALSE, NULL), FALSE };
+
+    if (ctx.done == NULL) {
+        /* No event to coordinate on — fall back to a plain blocking connect. */
+        BOOL connected = ConnectNamedPipe(pipe, NULL)
+                             ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+        if (!connected) {
+            CloseHandle(pipe);
+            g_commandPipeServer = INVALID_HANDLE_VALUE;
+            return NULL;
+        }
+        g_commandPipeServer = INVALID_HANDLE_VALUE;
+        return pipe;
+    }
+
+    HANDLE worker = CreateThread(NULL, 0, [](LPVOID p) -> DWORD {
+        auto* c = static_cast<ConnCtx*>(p);
+        c->ok = ConnectNamedPipe(c->pipe, NULL)
+                    ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+        SetEvent(c->done);
+        return 0;
+    }, &ctx, 0, NULL);
+
+    if (worker == NULL) {
+        CloseHandle(ctx.done);
         CloseHandle(pipe);
         g_commandPipeServer = INVALID_HANDLE_VALUE;
         return NULL;
     }
-    /* Server handle is now bound to this client. Future clients require a
-     * fresh CreateNamedPipe call. */
+
+    /* Wake on any of: client connected, new JVM exited, watcher gave up. */
+    HANDLE abortEvent = g_relaunchAbortEvent.load();
+    HANDLE waits[3];
+    DWORD  count = 0;
+    waits[count++] = ctx.done;
+    if (hJvmLiveness != NULL) waits[count++] = hJvmLiveness;
+    if (abortEvent != NULL)   waits[count++] = abortEvent;
+    DWORD w         = WaitForMultipleObjects(count, waits, FALSE, INFINITE);
+    bool  connected = (w == WAIT_OBJECT_0);
+
+    if (connected) {
+        WaitForSingleObject(worker, INFINITE);
+    } else {
+        AGENT_LOG("acceptCommandPipeClient: new JVM exited or watcher signalled failure before handoff — aborting");
+        /* CancelSynchronousIo races the worker entering its blocking call: if
+         * fired too early it's a no-op and the worker would then block forever.
+         * Retry until the worker actually unblocks and exits. */
+        while (WaitForSingleObject(worker, 50) == WAIT_TIMEOUT) {
+            CancelSynchronousIo(worker);
+        }
+    }
+    /* Worker has exited and no longer references the pipe. */
+    CloseHandle(worker);
+    CloseHandle(ctx.done);
+
+    HANDLE result = NULL;
+    if (connected && ctx.ok) {
+        result = pipe;
+    } else {
+        CloseHandle(pipe);
+    }
     g_commandPipeServer = INVALID_HANDLE_VALUE;
-    return pipe;
+    return result;
 }
 
 /* Replace the process's stdin/stdout file descriptors with the given pipe
@@ -1816,6 +1888,25 @@ static std::wstring quoteIfNeeded(const std::wstring& token) {
     return L"\"" + token + L"\"";
 }
 
+/* True for the -D properties this agent injects into a relaunched JVM. On a
+ * chained relaunch the source command line already carries last generation's
+ * copies; they must be stripped before fresh ones are prepended, otherwise the
+ * stale (later-positioned, hence overriding) tokens would win — e.g. the new
+ * JVM would inherit the previous generation's agent.pid and hand off to a dead
+ * agent. */
+static bool isForgevmRelaunchInjectedToken(const std::wstring& tok) {
+    static const wchar_t* const kPrefixes[] = {
+        L"-Dforgevm.relaunched=",
+        L"-Dforgevm.agent.pid=",
+        L"-Dforgevm.relaunch.remaining=",
+    };
+    for (const wchar_t* p : kPrefixes) {
+        size_t len = wcslen(p);
+        if (tok.size() >= len && tok.compare(0, len, p) == 0) return true;
+    }
+    return false;
+}
+
 static bool relaunchShouldKeepToken(const std::wstring& token,
                                      bool hasAgentFilter, const LoadFilter& agentFlt,
                                      bool hasNativeFilter, const LoadFilter& nativeFlt) {
@@ -1919,7 +2010,19 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
                    (unsigned long)GetCurrentProcessId());
         newTokens.push_back(buf);
     }
+    {
+        /* Carry the remaining relaunch budget forward to the new generation. */
+        unsigned long long nextRemaining = getJsonUnsignedField(line, "nextRemaining", 0ULL);
+        wchar_t rbuf[64];
+        swprintf_s(rbuf, ARRAYSIZE(rbuf), L"-Dforgevm.relaunch.remaining=%llu", nextRemaining);
+        newTokens.push_back(rbuf);
+        AGENT_LOG("relaunch: next-gen relaunch budget remaining=%llu", nextRemaining);
+    }
     for (size_t i = 1; i < tokens.size(); i++) {
+        if (isForgevmRelaunchInjectedToken(tokens[i])) {
+            /* Drop last generation's self-injected props; fresh ones above win. */
+            continue;
+        }
         if (relaunchShouldKeepToken(tokens[i], hasAgentFilter, agentFlt, hasNativeFilter, nativeFlt)) {
             newTokens.push_back(tokens[i]);
         } else {
@@ -1972,90 +2075,83 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
      * corresponds to the new JVM identity. */
     g_parentPid.store(pi.dwProcessId);
 
-    /* Switch DLL's g_target to the new (suspended) JVM. attach_target_minimal
-     * opens a handle and sets g_target.{handle,pid} without requiring jvm.dll. */
-    bool nativeHookInstalled = false;
-    if (api.attachTargetMinimal != NULL) {
-        if (api.attachTargetMinimal(static_cast<unsigned long long>(pi.dwProcessId)) == 1) {
-            std::string filterPipeName = ensureFilterPipeStarted();
-            if (!filterPipeName.empty() && installNativeBan && api.banNativeLoad != NULL) {
-                if (hasNativeFilter) {
-                    std::lock_guard<std::mutex> g(g_filterMutex);
-                    g_nativeLoadFilter = nativeFlt;
-                }
-                if (api.banNativeLoad(filterPipeName.c_str()) == 1) {
-                    nativeHookInstalled = true;
-                    AGENT_LOG("relaunch: ntdll!LdrLoadDll hook installed on suspended new JVM (filter_source=%s)",
-                              hasNativeFilter ? "new" : "carried_over");
-                } else {
-                    AGENT_LOG("relaunch: banNativeLoad on suspended new JVM failed: %s",
-                              api.lastError ? api.lastError() : "unknown");
-                }
-            } else if (installNativeBan) {
-                AGENT_LOG("relaunch: filter pipe unavailable, native hook skipped");
-            }
-
-            if (!filterPipeName.empty() && installProcessBan && api.banProcessCreate != NULL) {
-                if (hasProcessFilter) {
-                    std::lock_guard<std::mutex> g(g_filterMutex);
-                    g_processCreateFilter = processFlt;
-                }
-                if (api.banProcessCreate(filterPipeName.c_str()) == 1) {
-                    AGENT_LOG("relaunch: ntdll!NtCreateUserProcess hook installed on suspended new JVM (filter_source=%s)",
-                              hasProcessFilter ? "new" : "carried_over");
-                } else {
-                    AGENT_LOG("relaunch: banProcessCreate on suspended new JVM failed: %s",
-                              api.lastError ? api.lastError() : "unknown");
-                }
-            } else if (installProcessBan) {
-                AGENT_LOG("relaunch: filter pipe unavailable, process hook skipped");
-            }
-        } else {
-            AGENT_LOG("relaunch: attachTargetMinimal failed: %s",
-                      api.lastError ? api.lastError() : "unknown");
+    /* Publish a private liveness handle for the handoff wait. The watcher owns
+     * and closes pi.hProcess independently, so duplicate rather than share. */
+    {
+        HANDLE dup = NULL;
+        if (DuplicateHandle(GetCurrentProcess(), pi.hProcess, GetCurrentProcess(),
+                            &dup, SYNCHRONIZE, FALSE, 0)) {
+            HANDLE prev = g_relaunchNewJvm.exchange(dup);
+            if (prev != NULL) CloseHandle(prev);
         }
-    } else {
-        AGENT_LOG("relaunch: attachTargetMinimal export not loaded — DLL out of date?");
     }
 
-    /* Stash filters for post-resume use. Only overwrite when the caller passed a
-     * new filter — otherwise keep the pre-relaunch state so carried-over bans
-     * retain their patterns. agentFilter is consumed by the jvm.dll watcher;
-     * nativeFilter and processFilter were already applied above in the suspended
-     * window, but we update the global so the filter pipe serves the right rules. */
-    if (hasAgentFilter) {
+    /* Stash filters so the trampolines serve the right rules once installed.
+     * Only overwrite when the caller passed a new filter — otherwise keep the
+     * pre-relaunch state so carried-over bans retain their patterns.
+     *
+     * The ntdll hooks (LdrLoadDll / NtCreateUserProcess) are deliberately NOT
+     * installed on the suspended new JVM. Installing them here makes them fire
+     * during the new JVM's own loader bootstrap — under the loader lock, before
+     * the core system DLLs are ready — where the trampoline's synchronous filter
+     * round-trip hangs or kills the JVM before jvm.dll ever loads. Instead the
+     * post-resume watcher installs all three hooks the instant jvm.dll appears:
+     * by then the loader is fully functional and only post-bootstrap loads (the
+     * actual threat surface) are filtered. The bootstrap window carries no
+     * adversary code, so nothing protectable is lost. */
+    if (hasNativeFilter) {
         std::lock_guard<std::mutex> g(g_filterMutex);
-        g_javaAgentFilter = agentFlt;
+        g_nativeLoadFilter = nativeFlt;
     }
     if (hasProcessFilter) {
         std::lock_guard<std::mutex> g(g_filterMutex);
         g_processCreateFilter = processFlt;
     }
+    if (hasAgentFilter) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_javaAgentFilter = agentFlt;
+    }
 
-    /* Resume new JVM. From this instant the ntdll hook (if installed) is live. */
+    /* Resume new JVM. ntdll hooks are installed later by the watcher once the
+     * loader bootstrap is past (jvm.dll loaded), not here — see the stash note. */
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
-    AGENT_LOG("relaunch: new JVM resumed pid=%lu (ntdll_hooked=%d)",
-              pi.dwProcessId, (int)nativeHookInstalled);
+    AGENT_LOG("relaunch: new JVM resumed pid=%lu (ntdll hooks deferred to post-resume watcher)",
+              pi.dwProcessId);
 
     /* Spawn watcher thread: polls EnumProcessModules until jvm.dll appears in
-     * the new JVM, then full-bootstraps and installs banJavaAgent. */
+     * the new JVM, then full-bootstraps and installs all requested hooks. */
+    /* (Re)arm the watcher-failure abort event for this handoff. */
+    HANDLE abortEvent = g_relaunchAbortEvent.load();
+    if (abortEvent == NULL) {
+        abortEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+        g_relaunchAbortEvent.store(abortEvent);
+    } else {
+        ResetEvent(abortEvent);
+    }
+
     struct RelaunchPostResumeCtx {
         HANDLE hNewJvm;
         DWORD newPid;
         bool installAgentBan;
+        bool installNativeBan;
+        bool installProcessBan;
         const NativeApi* api;
         std::string dllPath;
+        HANDLE abortEvent;
     };
     auto* ctx = new RelaunchPostResumeCtx{
-        pi.hProcess, pi.dwProcessId, installAgentBan, &api, dllPath
+        pi.hProcess, pi.dwProcessId, installAgentBan, installNativeBan, installProcessBan, &api, dllPath, abortEvent
     };
     HANDLE watcher = CreateThread(NULL, 0, [](LPVOID p) -> DWORD {
         auto* c = static_cast<RelaunchPostResumeCtx*>(p);
         HANDLE h = c->hNewJvm;
         DWORD newPid = c->newPid;
         bool installAgentBan = c->installAgentBan;
+        bool installNativeBan = c->installNativeBan;
+        bool installProcessBan = c->installProcessBan;
         const NativeApi* api = c->api;
+        HANDLE abortEvent = c->abortEvent;
         delete c;
 
         /* Poll for jvm.dll. Cap at 30s — JVM startup completes well within. */
@@ -2082,6 +2178,7 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
 
         if (!found) {
             AGENT_LOG("post-relaunch watcher: jvm.dll never appeared in new JVM pid=%lu", newPid);
+            if (abortEvent != NULL) SetEvent(abortEvent);
             CloseHandle(h);
             return 0;
         }
@@ -2090,11 +2187,28 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         if (api->bootstrapTarget != NULL) {
             if (api->bootstrapTarget(static_cast<unsigned long long>(newPid)) == 1) {
                 AGENT_LOG("post-relaunch watcher: bootstrap_target(%lu) ok", newPid);
-                if (installAgentBan && api->banJavaAgent != NULL) {
-                    std::string filterPipeName = ensureFilterPipeStarted();
-                    if (!filterPipeName.empty()) {
+                std::string filterPipeName;
+                if (installAgentBan || installNativeBan || installProcessBan) {
+                    filterPipeName = ensureFilterPipeStarted();
+                    if (filterPipeName.empty()) {
+                        AGENT_LOG("post-relaunch watcher: filter pipe unavailable, hooks skipped");
+                    }
+                }
+                if (!filterPipeName.empty()) {
+                    if (installAgentBan && api->banJavaAgent != NULL) {
                         int r = api->banJavaAgent(filterPipeName.c_str());
-                        AGENT_LOG("post-relaunch watcher: banJavaAgent r=%d", r);
+                        AGENT_LOG("post-relaunch watcher: banJavaAgent r=%d reason=%s",
+                                  r, api->lastError ? api->lastError() : "");
+                    }
+                    if (installNativeBan && api->banNativeLoad != NULL) {
+                        int r = api->banNativeLoad(filterPipeName.c_str());
+                        AGENT_LOG("post-relaunch watcher: banNativeLoad r=%d reason=%s",
+                                  r, api->lastError ? api->lastError() : "");
+                    }
+                    if (installProcessBan && api->banProcessCreate != NULL) {
+                        int r = api->banProcessCreate(filterPipeName.c_str());
+                        AGENT_LOG("post-relaunch watcher: banProcessCreate r=%d reason=%s",
+                                  r, api->lastError ? api->lastError() : "");
                     }
                 }
             } else {
@@ -2289,7 +2403,9 @@ re_enter_command_loop:
     if (g_persistAfterEOF.load()) {
         AGENT_LOG("main: stdin EOF after relaunch — awaiting handoff on %s",
                   g_commandPipeName.c_str());
-        HANDLE pipe = acceptCommandPipeClient();
+        HANDLE hJvm = g_relaunchNewJvm.exchange(NULL);
+        HANDLE pipe = acceptCommandPipeClient(hJvm);
+        if (hJvm != NULL) CloseHandle(hJvm);
         if (pipe != NULL && pipe != INVALID_HANDLE_VALUE) {
             AGENT_LOG("main: handoff client connected, redirecting stdio");
             if (redirectStdioToPipe(pipe)) {

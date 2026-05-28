@@ -67,9 +67,8 @@ public final class FvmLog {
                         Files.newBufferedWriter(logFile, StandardCharsets.UTF_8,
                                 StandardOpenOption.CREATE,
                                 StandardOpenOption.WRITE,
-                                StandardOpenOption.APPEND),
+                                StandardOpenOption.TRUNCATE_EXISTING),
                         true /* autoFlush */);
-                pw.println();
                 pw.println("===== ForgeVM Java log session " + FMT.format(LocalDateTime.now()) + " =====");
                 fileSink = pw;
             } catch (IOException ignored) {

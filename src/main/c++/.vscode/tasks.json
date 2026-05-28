@@ -7,7 +7,7 @@
       "command": "cmd",
       "args": [
         "/c",
-        "if not exist \"..\\resources\\native\\win-x64\" mkdir \"..\\resources\\native\\win-x64\" & del /q \"..\\resources\\native\\win-x64\\*.dll\" 2>nul & del /q \"..\\resources\\native\\win-x64\\*.exe\" 2>nul & del /q \"..\\resources\\native\\win-x64\\*.lib\" 2>nul & del /q \"..\\resources\\native\\win-x64\\*.exp\" 2>nul"
+        "if not exist \"..\\resources\\forgevm\\native\\win-x64\" mkdir \"..\\resources\\forgevm\\native\\win-x64\" & del /q \"..\\resources\\forgevm\\native\\win-x64\\*.dll\" 2>nul & del /q \"..\\resources\\forgevm\\native\\win-x64\\*.exe\" 2>nul & del /q \"..\\resources\\forgevm\\native\\win-x64\\*.lib\" 2>nul & del /q \"..\\resources\\forgevm\\native\\win-x64\\*.exp\" 2>nul"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
@@ -20,7 +20,7 @@
       "command": "cmd",
       "args": [
         "/c",
-        "cl /nologo /LD /EHsc /utf-8 /O2 /MT /Fe:..\\resources\\native\\win-x64\\forgevm_native.dll cpp\\forgevm_native.cpp cpp\\forgevm_memory.cpp cpp\\forgevm_transform.cpp /link /NOIMPLIB Advapi32.lib Shell32.lib && del /q \"..\\resources\\native\\win-x64\\forgevm_native.exp\" 2>nul & del /q \"..\\resources\\native\\win-x64\\forgevm_native.lib\" 2>nul & del /q *.obj *.pdb 2>nul & del /q cpp\\*.obj cpp\\*.pdb 2>nul"
+        "cl /nologo /LD /EHsc /utf-8 /O2 /MT /Fe:..\\resources\\forgevm\\native\\win-x64\\forgevm_native.dll cpp\\forgevm_native.cpp cpp\\forgevm_memory.cpp cpp\\forgevm_transform.cpp /link /NOIMPLIB Advapi32.lib Shell32.lib && del /q \"..\\resources\\forgevm\\native\\win-x64\\forgevm_native.exp\" 2>nul & del /q \"..\\resources\\forgevm\\native\\win-x64\\forgevm_native.lib\" 2>nul & del /q *.obj *.pdb 2>nul & del /q cpp\\*.obj cpp\\*.pdb 2>nul"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
@@ -39,7 +39,7 @@
       "command": "cmd",
       "args": [
         "/c",
-        "cl /nologo /EHsc /utf-8 /O2 /MT /Fe:..\\resources\\native\\win-x64\\forgevm_agent.exe cpp\\forgevm_agent.cpp Advapi32.lib Shell32.lib ole32.lib oleaut32.lib wbemuuid.lib Psapi.lib & del /q *.obj *.pdb 2>nul & del /q cpp\\*.obj cpp\\*.pdb 2>nul"
+        "cl /nologo /EHsc /utf-8 /O2 /MT /Fe:..\\resources\\forgevm\\native\\win-x64\\forgevm_agent.exe cpp\\forgevm_agent.cpp Advapi32.lib Shell32.lib ole32.lib oleaut32.lib wbemuuid.lib Psapi.lib & del /q *.obj *.pdb 2>nul & del /q cpp\\*.obj cpp\\*.pdb 2>nul"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
