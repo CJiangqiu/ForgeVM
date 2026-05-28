@@ -6,7 +6,7 @@ build/
 # IDE
 *.iml
 .idea/
-
+.vscode/
 # Claude
 .claude/
 CLAUDE.md
