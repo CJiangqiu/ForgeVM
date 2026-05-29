@@ -78,11 +78,11 @@ typedef int(__cdecl* ForceDeoptNowFn)();
 typedef int(__cdecl* PurgeAgentsMatchingFn)(int, const char* const*, int);
 typedef int(__cdecl* PutFieldPathFn)(const char*, const char*, const unsigned char*, unsigned long long);
 typedef int(__cdecl* PutObjectFieldPathFn)(const char*, const char*, const char*, const char*);
-typedef int(__cdecl* BanJavaAgentFn)(const char*);
+typedef int(__cdecl* BanJavaAgentFn)(int, const char*);
 typedef int(__cdecl* UnbanJavaAgentFn)();
-typedef int(__cdecl* BanNativeLoadFn)(const char*);
+typedef int(__cdecl* BanNativeLoadFn)(int, const char*);
 typedef int(__cdecl* UnbanNativeLoadFn)();
-typedef int(__cdecl* BanProcessCreateFn)(const char*);
+typedef int(__cdecl* BanProcessCreateFn)(int, const char*);
 typedef int(__cdecl* UnbanProcessCreateFn)();
 typedef int(__cdecl* ForgeClassPlanFn)(const char*, const char*, int, int, char*, int);
 typedef int(__cdecl* ForgeClassUnloadFn)(const char*, int);
@@ -1206,6 +1206,17 @@ const char* filterModeName(FilterMode m) {
     return "unknown";
 }
 
+/* Pack a filter's patterns for the in-process-matching DLL exports: mode int
+ * (matches FilterMode's underlying 0/1/2) + patterns joined by '\n'. */
+std::string joinPatternsLF(const LoadFilter& f) {
+    std::string s;
+    for (size_t i = 0; i < f.patterns.size(); i++) {
+        if (i) s.push_back('\n');
+        s += f.patterns[i];
+    }
+    return s;
+}
+
 std::vector<std::string> parseJsonStringArray(const std::string& line, const std::string& key) {
     std::vector<std::string> result;
     std::string header = "\"" + key + "\":[";
@@ -1646,32 +1657,26 @@ std::string ensureFilterPipeStarted() {
 }
 
 void handleBanJavaAgent(const NativeApi& api, const std::string& line, const std::string& dllPath) {
-    bool wasActive;
+    int mode;
+    std::string joined;
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
-        wasActive = g_javaAgentFilter.active;
+        bool wasActive = g_javaAgentFilter.active;
         applyFilterFromJson(&g_javaAgentFilter, line);
         AGENT_LOG("ban_java_agent: mode=%s patterns=%zu%s",
                   filterModeName(g_javaAgentFilter.mode),
                   g_javaAgentFilter.patterns.size(),
                   wasActive ? " (updated)" : "");
-    }
-    std::string pipeName = ensureFilterPipeStarted();
-    if (pipeName.empty()) {
-        printResult("fallback", "UNAVAILABLE", dllPath, "filter_pipe_start_failed");
-        return;
-    }
-    // Trampoline already installed; new filter takes effect on next attach
-    // via the pipe — no need to re-patch jvm.dll.
-    if (wasActive) {
-        printResult("ok", "FULL", dllPath, "filter_updated");
-        return;
+        mode = static_cast<int>(g_javaAgentFilter.mode);
+        joined = joinPatternsLF(g_javaAgentFilter);
     }
     if (api.banJavaAgent == NULL) {
         printResult("fallback", "UNAVAILABLE", dllPath, "ban_java_agent_not_exported");
         return;
     }
-    int r = api.banJavaAgent(pipeName.c_str());
+    /* In-process match: DLL installs the hook on first call, refreshes the
+     * resident pattern blob in place on later calls — no filter pipe. */
+    int r = api.banJavaAgent(mode, joined.c_str());
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
                 api.lastError ? api.lastError() : "unknown");
 }
@@ -1699,30 +1704,27 @@ void handleUnbanJavaAgent(const NativeApi& api, const std::string& dllPath) {
 }
 
 void handleBanNativeLoad(const NativeApi& api, const std::string& line, const std::string& dllPath) {
-    bool wasActive;
+    int mode;
+    std::string joined;
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
-        wasActive = g_nativeLoadFilter.active;
+        bool wasActive = g_nativeLoadFilter.active;
         applyFilterFromJson(&g_nativeLoadFilter, line);
         AGENT_LOG("ban_native_load: mode=%s patterns=%zu%s",
                   filterModeName(g_nativeLoadFilter.mode),
                   g_nativeLoadFilter.patterns.size(),
                   wasActive ? " (updated)" : "");
-    }
-    std::string pipeName = ensureFilterPipeStarted();
-    if (pipeName.empty()) {
-        printResult("fallback", "UNAVAILABLE", dllPath, "filter_pipe_start_failed");
-        return;
-    }
-    if (wasActive) {
-        printResult("ok", "FULL", dllPath, "filter_updated");
-        return;
+        mode = static_cast<int>(g_nativeLoadFilter.mode);
+        joined = joinPatternsLF(g_nativeLoadFilter);
     }
     if (api.banNativeLoad == NULL) {
         printResult("fallback", "UNAVAILABLE", dllPath, "ban_native_load_not_exported");
         return;
     }
-    int r = api.banNativeLoad(pipeName.c_str());
+    /* The DLL installs the trampoline on first call and refreshes the resident
+     * pattern blob in place on subsequent calls — both decided in-process, so
+     * no filter pipe is involved. */
+    int r = api.banNativeLoad(mode, joined.c_str());
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
                 api.lastError ? api.lastError() : "unknown");
 }
@@ -1750,30 +1752,24 @@ void handleUnbanNativeLoad(const NativeApi& api, const std::string& dllPath) {
 }
 
 void handleBanProcessCreate(const NativeApi& api, const std::string& line, const std::string& dllPath) {
-    bool wasActive;
+    int mode;
+    std::string joined;
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
-        wasActive = g_processCreateFilter.active;
+        bool wasActive = g_processCreateFilter.active;
         applyFilterFromJson(&g_processCreateFilter, line);
         AGENT_LOG("ban_process_create: mode=%s patterns=%zu%s",
                   filterModeName(g_processCreateFilter.mode),
                   g_processCreateFilter.patterns.size(),
                   wasActive ? " (updated)" : "");
-    }
-    std::string pipeName = ensureFilterPipeStarted();
-    if (pipeName.empty()) {
-        printResult("fallback", "UNAVAILABLE", dllPath, "filter_pipe_start_failed");
-        return;
-    }
-    if (wasActive) {
-        printResult("ok", "FULL", dllPath, "filter_updated");
-        return;
+        mode = static_cast<int>(g_processCreateFilter.mode);
+        joined = joinPatternsLF(g_processCreateFilter);
     }
     if (api.banProcessCreate == NULL) {
         printResult("fallback", "UNAVAILABLE", dllPath, "ban_process_create_not_exported");
         return;
     }
-    int r = api.banProcessCreate(pipeName.c_str());
+    int r = api.banProcessCreate(mode, joined.c_str());
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
                 api.lastError ? api.lastError() : "unknown");
 }
@@ -2192,29 +2188,35 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         if (api->bootstrapTarget != NULL) {
             if (api->bootstrapTarget(static_cast<unsigned long long>(newPid)) == 1) {
                 AGENT_LOG("post-relaunch watcher: bootstrap_target(%lu) ok", newPid);
-                std::string filterPipeName;
-                if (installAgentBan || installNativeBan || installProcessBan) {
-                    filterPipeName = ensureFilterPipeStarted();
-                    if (filterPipeName.empty()) {
-                        AGENT_LOG("post-relaunch watcher: filter pipe unavailable, hooks skipped");
-                    }
+                /* All three bans now match in-process against a resident pattern
+                 * blob — no filter pipe. Snapshot each filter's mode + patterns
+                 * and hand them to the DLL exports. */
+                if (installNativeBan && api->banNativeLoad != NULL) {
+                    int m; std::string j;
+                    { std::lock_guard<std::mutex> g(g_filterMutex);
+                      m = static_cast<int>(g_nativeLoadFilter.mode);
+                      j = joinPatternsLF(g_nativeLoadFilter); }
+                    int r = api->banNativeLoad(m, j.c_str());
+                    AGENT_LOG("post-relaunch watcher: banNativeLoad r=%d reason=%s",
+                              r, api->lastError ? api->lastError() : "");
                 }
-                if (!filterPipeName.empty()) {
-                    if (installAgentBan && api->banJavaAgent != NULL) {
-                        int r = api->banJavaAgent(filterPipeName.c_str());
-                        AGENT_LOG("post-relaunch watcher: banJavaAgent r=%d reason=%s",
-                                  r, api->lastError ? api->lastError() : "");
-                    }
-                    if (installNativeBan && api->banNativeLoad != NULL) {
-                        int r = api->banNativeLoad(filterPipeName.c_str());
-                        AGENT_LOG("post-relaunch watcher: banNativeLoad r=%d reason=%s",
-                                  r, api->lastError ? api->lastError() : "");
-                    }
-                    if (installProcessBan && api->banProcessCreate != NULL) {
-                        int r = api->banProcessCreate(filterPipeName.c_str());
-                        AGENT_LOG("post-relaunch watcher: banProcessCreate r=%d reason=%s",
-                                  r, api->lastError ? api->lastError() : "");
-                    }
+                if (installAgentBan && api->banJavaAgent != NULL) {
+                    int m; std::string j;
+                    { std::lock_guard<std::mutex> g(g_filterMutex);
+                      m = static_cast<int>(g_javaAgentFilter.mode);
+                      j = joinPatternsLF(g_javaAgentFilter); }
+                    int r = api->banJavaAgent(m, j.c_str());
+                    AGENT_LOG("post-relaunch watcher: banJavaAgent r=%d reason=%s",
+                              r, api->lastError ? api->lastError() : "");
+                }
+                if (installProcessBan && api->banProcessCreate != NULL) {
+                    int m; std::string j;
+                    { std::lock_guard<std::mutex> g(g_filterMutex);
+                      m = static_cast<int>(g_processCreateFilter.mode);
+                      j = joinPatternsLF(g_processCreateFilter); }
+                    int r = api->banProcessCreate(m, j.c_str());
+                    AGENT_LOG("post-relaunch watcher: banProcessCreate r=%d reason=%s",
+                              r, api->lastError ? api->lastError() : "");
                 }
             } else {
                 AGENT_LOG("post-relaunch watcher: bootstrap_target(%lu) failed: %s",
