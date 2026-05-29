@@ -4,57 +4,56 @@
 #include <algorithm>
 #include <mutex>
 
-// ============================================================
-// Global transform state
-// ============================================================
+/* ============================================================
+ * Global transform state
+ * ============================================================ */
 
 std::unordered_map<uint64_t, ClassTransformPlan> g_plans;
 
-// ── Deferred-transform state ─────────────────────────────────────────────────
-// A class that is loaded but not yet linked has no ConstantPoolCache: HotSpot
-// runs its rewriter (which allocates the cache and rewrites every method's
-// bytecode) only at link time. Committing a transform on such a class is
-// unsafe — HotSpot's link pipeline must run on a real, fully-formed metaspace
-// ConstantPool, not on the synthetic newCP we hand-build. So an unlinked target
-// is parked here and re-committed by the retry thread once the game links it
-// naturally (detected via oldCP._cache becoming non-NULL).
+/* ── Deferred-transform state ─────────────────────────────────────────────────
+ * A class that is loaded but not yet linked has no ConstantPoolCache: HotSpot
+ * runs its rewriter (which allocates the cache and rewrites every method's
+ * bytecode) only at link time. Committing a transform on such a class is
+ * unsafe — HotSpot's link pipeline must run on a real, fully-formed metaspace
+ * ConstantPool, not on the synthetic newCP we hand-build. So an unlinked target
+ * is parked here and re-committed by the retry thread once the target links it
+ * naturally (detected via oldCP._cache becoming non-NULL). */
 struct PendingTransform {
     uint64_t                      klassAddr;
     std::vector<HookSpecExtended> specs;
 };
 static std::vector<PendingTransform> g_pendingTransforms;
-// Serializes ALL transform activity: commitClassPlan, unloadClassPlan, and the
-// retry thread. Held for the whole duration of each so they never interleave.
+/* Serializes ALL transform activity: commitClassPlan, unloadClassPlan, and the
+ * retry thread. Held for the whole duration of each so they never interleave. */
 static std::mutex                    g_transformLock;
 static bool                          g_retryThreadStarted = false;
 
-// ============================================================
-// Klass / Method address cache
-//
-// findInstanceKlassByName traverses the entire ClassLoaderDataGraph (every
-// loaded class, every Symbol read via RPM) on each call. In a batch transform
-// (~169 transforms × 3-4 lookups each = 500+ full scans) this dominates wall
-// time: each scan is O(class count) RPM reads, and the JVM has ~22000 loaded
-// classes by the time mod loading finishes.
-//
-// Cached entries are stable for the lifetime of the target JVM as long as the
-// class isn't unloaded — the classes we cache (FvmCallback, java.lang.* boxes,
-// Object, ingot hook classes, MC target classes) are all strong-referenced and
-// never unloaded.
-//
-// Caches are cleared on Agent restart (process boundary), not within a session.
+/* ============================================================
+ * Klass / Method address cache
+ *
+ * findInstanceKlassByName traverses the entire ClassLoaderDataGraph (every
+ * loaded class, every Symbol read via RPM) on each call. In a batch transform
+ * (hundreds of transforms × 3-4 lookups each = many full scans) this dominates
+ * wall time: each scan is O(class count) RPM reads, and a mature JVM may have
+ * tens of thousands of loaded classes.
+ *
+ * Cached entries are stable for the lifetime of the target JVM as long as the
+ * class isn't unloaded — the classes we cache (callback class, boxed primitives,
+ * Object, hook classes, ingot target classes) are typically strong-referenced.
+ *
+ * Caches are cleared on Agent restart (process boundary), not within a session. */
 static std::unordered_map<std::string, uint64_t> g_klassNameCache;
 
-// Method cache key: "klassAddr#methodName#paramDesc". paramDesc may be empty
-// (matches any descriptor — first-overload-wins, same as findMethodInKlass).
+/* Method cache key: "klassAddr#methodName#paramDesc". paramDesc may be empty
+ * (matches any descriptor — first-overload-wins, same as findMethodInKlass). */
 static std::unordered_map<std::string, uint64_t> g_methodCache;
 
-// Set of klass addresses whose entire _methods array has been scanned and
-// fully populated into g_methodCache. Once a klass is here, any cache miss
-// on that klass means the method genuinely doesn't exist (only the methods
-// the klass declares itself live in _methods — inherited methods are not
-// in the array). Avoids redundant rescans when the same subclass is queried
-// for different methods by N ingots in batch.
+/* Set of klass addresses whose entire _methods array has been scanned and
+ * fully populated into g_methodCache. Once a klass is here, any cache miss
+ * on that klass means the method genuinely doesn't exist (only the methods
+ * the klass declares itself live in _methods — inherited methods are not
+ * in the array). Avoids redundant rescans when the same subclass is queried
+ * for different methods by N ingots in batch. */
 static std::unordered_set<uint64_t> g_klassMethodsScanned;
 
 // Hit-rate counters (logged in forgevm_force_deopt_now).
@@ -73,18 +72,18 @@ static std::string makeTransformKey(const char* className, const char* methodNam
     return std::string(className) + "#" + methodName + "#" + paramDesc;
 }
 
-// ============================================================
-// Parameter type parsing for argument capture
-// ============================================================
+/* ============================================================
+ * Parameter type parsing for argument capture
+ * ============================================================ */
 
 struct ParamSlotInfo {
     int slot;    // local variable slot index
     bool isRef;  // true if reference type (L...; or [...), false if primitive
 };
 
-// Parse JVM method signature to extract parameter slot info.
-// fullSig format: "(Ljava/lang/String;I)V"
-// isStatic: if true, params start at slot 0; otherwise slot 0 = this, params start at slot 1.
+/* Parse JVM method signature to extract parameter slot info.
+ * fullSig format: "(Ljava/lang/String;I)V"
+ * isStatic: if true, params start at slot 0; otherwise slot 0 = this, params start at slot 1. */
 static std::vector<ParamSlotInfo> parseParamSlots(const std::string& fullSig, bool isStatic) {
     std::vector<ParamSlotInfo> params;
     if (fullSig.empty() || fullSig[0] != '(') return params;
@@ -128,17 +127,17 @@ static std::vector<ParamSlotInfo> parseParamSlots(const std::string& fullSig, bo
 
 // suspendTargetThreads / resumeTargetThreads — defined in forgevm_memory.cpp, declared in forgevm_internal.h
 
-// ============================================================
-// Locate Java Method* in target process
-//
-// Path: SystemDictionary -> ClassLoaderData -> Klass chain
-//       -> InstanceKlass -> methods array -> Method*
-//
-// All done via ReadProcessMemory, no JVMTI.
-// ============================================================
+/* ============================================================
+ * Locate Java Method* in target process
+ *
+ * Path: SystemDictionary -> ClassLoaderData -> Klass chain
+ *       -> InstanceKlass -> methods array -> Method*
+ *
+ * All done via ReadProcessMemory, no JVMTI.
+ * ============================================================ */
 
-// Read a Symbol body from a HotSpot Symbol* (length at offset 0, body at offset 8 for 64-bit)
-// Already declared in forgevm_internal.h
+/* Read a Symbol body from a HotSpot Symbol* (length at offset 0, body at offset 8 for 64-bit).
+ * Already declared in forgevm_internal.h. */
 
 // Convert "com.example.Foo" or "com/example/Foo" to internal form "com/example/Foo"
 static std::string toInternalName(const char* name) {
@@ -174,9 +173,9 @@ bool findInstanceKlassByName(const std::string& internalName, uint64_t* outKlass
     }
     g_klassCacheMisses++;
 
-    // Get SystemDictionary via gHotSpotVMStructs
-    // SystemDictionary::_loader_data is the head of ClassLoaderData linked list
-    // But the actual path depends on JDK version. Let's try multiple approaches.
+    /* Get SystemDictionary via gHotSpotVMStructs.
+     * SystemDictionary::_loader_data is the head of ClassLoaderData linked list.
+     * The actual path depends on JDK version — try multiple approaches. */
 
     // Approach: scan all loaded classes via ClassLoaderDataGraph::_head
     uint64_t cldgHeadAddr = structStaticAddr("ClassLoaderDataGraph", "_head");
@@ -248,9 +247,9 @@ static bool findMethodInKlass(uint64_t klassAddr, const char* methodName, const 
                                uint64_t* outMethodAddr) {
     HANDLE proc = g_target.handle;
 
-    // Cache hit: skip Method array scan and Symbol reads. The combination of
-    // (klassAddr, methodName, paramDesc) uniquely identifies a Method* until
-    // the class is unloaded — which we don't expect during a transform batch.
+    /* Cache hit: skip Method array scan and Symbol reads. The combination of
+     * (klassAddr, methodName, paramDesc) uniquely identifies a Method* until
+     * the class is unloaded — which we don't expect during a transform batch. */
     std::string mcKey = methodCacheKey(klassAddr, methodName, paramDesc);
     auto mcIt = g_methodCache.find(mcKey);
     if (mcIt != g_methodCache.end()) {
@@ -263,10 +262,10 @@ static bool findMethodInKlass(uint64_t klassAddr, const char* methodName, const 
         *outMethodAddr = mcIt->second;
         return true;
     }
-    // Cache miss but the klass's full _methods array has already been scanned
-    // — the method genuinely is not declared on this klass (might exist on
-    // an ancestor, but findMethodInKlass intentionally only inspects the
-    // klass's own _methods, not inherited ones). Skip the rescan.
+    /* Cache miss but the klass's full _methods array has already been scanned
+     * — the method genuinely is not declared on this klass (might exist on
+     * an ancestor, but findMethodInKlass intentionally only inspects the
+     * klass's own _methods, not inherited ones). Skip the rescan. */
     if (g_klassMethodsScanned.count(klassAddr) > 0) {
         g_methodCacheHits++;
         g_methodCache[mcKey] = 0;  // memoize this exact tuple too
@@ -288,8 +287,8 @@ static bool findMethodInKlass(uint64_t klassAddr, const char* methodName, const 
         return false;
     }
 
-    // Array<Method*> layout: _length (int32 at offset 0, or after metadata pointer)
-    // In HotSpot, Array<T> has: int _length at a known offset, then T _data[]
+    /* Array<Method*> layout: _length (int32 at offset 0, or after metadata pointer).
+     * In HotSpot, Array<T> has: int _length at a known offset, then T _data[]. */
     int64_t arrayLengthOff = structOffset("Array<int>", "_length");
     if (arrayLengthOff < 0) arrayLengthOff = 0; // common for older JDKs
 
@@ -362,9 +361,9 @@ static bool findMethodInKlass(uint64_t klassAddr, const char* methodName, const 
             }
         }
 
-        // Read name and signature via ConstantPool indices (for caching the
-        // signature key — we want every method individually addressable by
-        // (klass, name, paramDesc) for future lookups).
+        /* Read name and signature via ConstantPool indices (for caching the
+         * signature key — we want every method individually addressable by
+         * (klass, name, paramDesc) for future lookups). */
         uint64_t constPoolAddr = 0;
         if (!nameFound && nameIdxOff >= 0) {
             if (!readRemotePointer(proc, constMethodAddr + (uint64_t)cmConstsOff, &constPoolAddr) || constPoolAddr == 0) {
@@ -401,16 +400,16 @@ static bool findMethodInKlass(uint64_t klassAddr, const char* methodName, const 
             }
         }
 
-        // Cache by signature (full match) and by empty desc (any-overload-wins,
-        // first method with this name in the array). Both forms used by
-        // findMethodInKlass / findJavaMethod call sites.
+        /* Cache by signature (full match) and by empty desc (any-overload-wins,
+         * first method with this name in the array). Both forms used by
+         * findMethodInKlass / findJavaMethod call sites. */
         if (!mSig.empty()) {
             std::string sigKey = methodCacheKey(klassAddr, mName.c_str(), mSig.c_str());
             if (g_methodCache.find(sigKey) == g_methodCache.end()) {
                 g_methodCache[sigKey] = methodAddr;
             }
-            // Also cache "params" prefix form (e.g. "(F)") — the paramDesc
-            // arg in our API is typically the parameter list portion, not full sig.
+            /* Also cache "params" prefix form (e.g. "(F)") — the paramDesc
+             * arg in our API is typically the parameter list portion, not full sig. */
             size_t closeParen = mSig.find(')');
             if (closeParen != std::string::npos) {
                 std::string paramsOnly = mSig.substr(0, closeParen + 1);
@@ -440,8 +439,8 @@ static bool findMethodInKlass(uint64_t klassAddr, const char* methodName, const 
         }
     }
 
-    // Mark this klass as fully scanned so any subsequent miss on it can
-    // short-circuit to "not found" without rescanning the methods array.
+    /* Mark this klass as fully scanned so any subsequent miss on it can
+     * short-circuit to "not found" without rescanning the methods array. */
     g_klassMethodsScanned.insert(klassAddr);
 
     if (found) {
@@ -467,19 +466,19 @@ bool findJavaMethod(const char* className, const char* methodName,
     return findMethodInKlass(klassAddr, methodName, paramDesc, outMethodAddr);
 }
 
-// ============================================================
-// Force deoptimization of all compiled methods
-//
-// JIT may inline the target method into callers. Modifying the
-// target Method*'s ConstMethod does NOT affect inlined copies.
-// We must mark all nmethods as "not_entrant" so the JVM
-// deoptimizes them at the next safepoint and re-interprets
-// (picking up our new bytecodes on re-compilation).
-// ============================================================
+/* ============================================================
+ * Force deoptimization of all compiled methods
+ *
+ * JIT may inline the target method into callers. Modifying the
+ * target Method*'s ConstMethod does NOT affect inlined copies.
+ * We must mark all nmethods as "not_entrant" so the JVM
+ * deoptimizes them at the next safepoint and re-interprets
+ * (picking up our new bytecodes on re-compilation).
+ * ============================================================ */
 
-// forceDeoptimizeAll — §17.11: only clear Method::_code, no c2i adapter probing.
-// Callers use the normal interpreted entry after JIT deopt; the JVM re-adapts via
-// the interpreter stub. c2i redirect is not needed for same-user, same-session targets.
+/* forceDeoptimizeAll — §17.11: only clear Method::_code, no c2i adapter probing.
+ * Callers use the normal interpreted entry after JIT deopt; the JVM re-adapts via
+ * the interpreter stub. c2i redirect is not needed for same-user, same-session targets. */
 static void forceDeoptimizeAll() {
     HANDLE proc = g_target.handle;
 
@@ -564,9 +563,9 @@ static void forceDeoptimizeAll() {
     FVM_LOG("deopt sweep: visited %d classes, deopt %d methods", klassCount, deoptCount);
 }
 
-// ============================================================
-// Read ConstMethod bytecode
-// ============================================================
+/* ============================================================
+ * Read ConstMethod bytecode
+ * ============================================================ */
 
 bool readConstMethodBytecode(uint64_t constMethodAddr, std::vector<uint8_t>* bytecodeOut,
                              uint64_t* bytecodeStartAddr, uint32_t* codeSizeOut) {
@@ -605,9 +604,9 @@ bool readConstMethodBytecode(uint64_t constMethodAddr, std::vector<uint8_t>* byt
     return true;
 }
 
-// ============================================================
-// Read ConstantPool
-// ============================================================
+/* ============================================================
+ * Read ConstantPool
+ * ============================================================ */
 
 bool readConstantPool(uint64_t constPoolAddr, std::vector<uint8_t>* poolBytesOut,
                       uint32_t* poolLengthOut, size_t* poolByteSizeOut) {
@@ -646,28 +645,28 @@ bool readConstantPool(uint64_t constPoolAddr, std::vector<uint8_t>* poolBytesOut
     return true;
 }
 
-// ============================================================
-// Build expanded ConstantPool with hook MethodRef
-//
-// We append new entries to the constant pool:
-//   [origLength]     = CONSTANT_Class(hookClass)  -> name_index = origLength+2
-//   [origLength+1]   = CONSTANT_NameAndType(hookMethod, hookDesc) -> name = origLength+3, desc = origLength+4
-//   [origLength+2]   = CONSTANT_Utf8(hookClass internal name)
-//   [origLength+3]   = CONSTANT_Utf8(hookMethod name)
-//   [origLength+4]   = CONSTANT_Utf8(hookDesc)
-//   [origLength+5]   = CONSTANT_Methodref -> class = origLength, nat = origLength+1
-//
-// But HotSpot ConstantPool entries are pointer-sized slots with tag array separate.
-// The "entries" in HotSpot's ConstantPool are NOT the same as classfile cp_info.
-// They are resolved at load time into raw pointers/values.
-//
-// For an unresolved Methodref, HotSpot stores it as indices packed into a single slot.
-// We need to create entries that the interpreter can resolve.
-//
-// CRITICAL: HotSpot resolves methods by comparing Symbol* POINTERS, not string content.
-// We MUST use the JVM's existing interned Symbol* pointers, not freshly allocated ones.
-// Read them from the Klass/Method metadata that already exists in the target process.
-// ============================================================
+/* ============================================================
+ * Build expanded ConstantPool with hook MethodRef
+ *
+ * We append new entries to the constant pool:
+ *   [origLength]     = CONSTANT_Class(hookClass)  -> name_index = origLength+2
+ *   [origLength+1]   = CONSTANT_NameAndType(hookMethod, hookDesc) -> name = origLength+3, desc = origLength+4
+ *   [origLength+2]   = CONSTANT_Utf8(hookClass internal name)
+ *   [origLength+3]   = CONSTANT_Utf8(hookMethod name)
+ *   [origLength+4]   = CONSTANT_Utf8(hookDesc)
+ *   [origLength+5]   = CONSTANT_Methodref -> class = origLength, nat = origLength+1
+ *
+ * HotSpot ConstantPool entries are pointer-sized slots with tag array separate.
+ * The "entries" in HotSpot's ConstantPool are NOT the same as classfile cp_info;
+ * they are resolved at load time into raw pointers/values. For an unresolved
+ * Methodref, HotSpot stores it as indices packed into a single slot. We need
+ * entries that the interpreter can resolve.
+ *
+ * CRITICAL: HotSpot resolves methods by comparing Symbol* POINTERS, not string
+ * content. We MUST use the JVM's existing interned Symbol* pointers, not freshly
+ * allocated ones. Read them from the Klass/Method metadata that already exists
+ * in the target process.
+ * ============================================================ */
 
 // Read the interned name Symbol* pointer from an InstanceKlass
 static uint64_t readKlassNameSymbol(uint64_t klassAddr) {
@@ -741,20 +740,20 @@ static bool readMethodSymbols(uint64_t methodAddr, uint64_t* nameSymOut, uint64_
     return true;
 }
 
-// ============================================================
-// Phase 1 invalidation: clear stale profiling state on Method*
-//
-// After replacing ConstMethod, the existing MDO is keyed against the
-// OLD bytecode's BCIs. If C1/C2 reads it during recompile, ciMethodData
-// hits ShouldNotReachHere(). Counters likewise reflect the old shape.
-//
-//   _method_data     = NULL  -> fresh MDO allocated on next compile
-//   _method_counters = NULL  -> invocation count restarts
-//   _flags |= 0x4 (_dont_inline) -> blocks stale inlines until callers
-//                                   are deopted (Phase 2)
-//
-// _flags is not always in VMStructs; skip silently if absent.
-// ============================================================
+/* ============================================================
+ * Phase 1 invalidation: clear stale profiling state on Method*
+ *
+ * After replacing ConstMethod, the existing MDO is keyed against the
+ * OLD bytecode's BCIs. If C1/C2 reads it during recompile, ciMethodData
+ * hits ShouldNotReachHere(). Counters likewise reflect the old shape.
+ *
+ *   _method_data     = NULL  -> fresh MDO allocated on next compile
+ *   _method_counters = NULL  -> invocation count restarts
+ *   _flags |= 0x4 (_dont_inline) -> blocks stale inlines until callers
+ *                                   are deopted (Phase 2)
+ *
+ * _flags is not always in VMStructs; skip silently if absent.
+ * ============================================================ */
 static void clearMethodProfilingState(uint64_t methodAddr, bool setDontInline,
                                       const char* logPrefix) {
     HANDLE proc = g_target.handle;
@@ -832,9 +831,9 @@ static void clearMethodProfilingState(uint64_t methodAddr, bool setDontInline,
     }
 }
 
-// ============================================================
-// Exported DLL functions
-// ============================================================
+/* ============================================================
+ * Exported DLL functions
+ * ============================================================ */
 
 /* ============================================================
  * Purge Agent — disable a loaded Java agent entirely.
@@ -1405,9 +1404,9 @@ extern "C" __declspec(dllexport) int forgevm_force_deopt_now() {
     return 1;
 }
 
-// ============================================================
-// Subclass traversal helpers (used by commitClassPlan / unloadClassPlan)
-// ============================================================
+/* ============================================================
+ * Subclass traversal helpers (used by commitClassPlan / unloadClassPlan)
+ * ============================================================ */
 
 static bool isSubclassOf(uint64_t klassAddr, uint64_t targetKlassAddr) {
     HANDLE proc = g_target.handle;
@@ -1464,9 +1463,9 @@ static std::vector<uint64_t> findAllSubclasses(uint64_t targetKlassAddr) {
     return result;
 }
 
-// ============================================================
-// Per-class bytecode transform — core implementation
-// ============================================================
+/* ============================================================
+ * Per-class bytecode transform — core implementation
+ * ============================================================ */
 
 /* Per-hook resolved data collected during Phase A (no suspend needed). */
 struct HookData {
@@ -4103,26 +4102,26 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
     return true;
 }
 
-// ============================================================
-// Per-class plan-once-commit-once API
-//
-// commitClassPlan implements the per-class transform (§17.5 Phase A→D):
-//   * unload any existing plan (→ oldCP₀)
-//   * resolve all hooks (replay existing + new candidates)
-//   * single VirtualAllocEx for new CP / RK / Tags / Cache
-//   * one suspend window → snapshot CPCache prefix → leaf-then-root swap → resume
-//   * deopt sweep (unless deferDeopt)
-//
-// Guarantees:
-//   * One CP per class per commit (not layered).
-//   * All methods share the same newCP after commit.
-//   * oldCP never freed (§17.10).
-// ============================================================
+/* ============================================================
+ * Per-class plan-once-commit-once API
+ *
+ * commitClassPlan implements the per-class transform (§17.5 Phase A→D):
+ *   * unload any existing plan (→ oldCP₀)
+ *   * resolve all hooks (replay existing + new candidates)
+ *   * single VirtualAllocEx for new CP / RK / Tags / Cache
+ *   * one suspend window → snapshot CPCache prefix → leaf-then-root swap → resume
+ *   * deopt sweep (unless deferDeopt)
+ *
+ * Guarantees:
+ *   * One CP per class per commit (not layered).
+ *   * All methods share the same newCP after commit.
+ *   * oldCP never freed (§17.10).
+ * ============================================================ */
 
-// Read a Method*'s declared name (e.g. "tick") and full signature (e.g. "(F)V").
-// Used to replay an existing plan's hooks: when commitClassPlan re-commits an
-// existing patched method, we recover the method's identity from its Method*
-// (which is stable until class unload).
+/* Read a Method*'s declared name (e.g. "tick") and full signature (e.g. "(F)V").
+ * Used to replay an existing plan's hooks: when commitClassPlan re-commits an
+ * existing patched method, we recover the method's identity from its Method*
+ * (which is stable until class unload). */
 static bool readMethodNameAndSig(uint64_t methodAddr,
                                  std::string* outName,
                                  std::string* outSig) {
@@ -4164,11 +4163,11 @@ static bool readMethodNameAndSig(uint64_t methodAddr,
     return true;
 }
 
-// Internal class-level rollback (§17.7). Reverts the plan for klassAddr
-// atomically: suspend → write back InstanceKlass._constants → write back each
-// method's _constMethod and CM._constants → resume → forceDeoptimizeAll.
-// Does not touch g_plans for OTHER klasses. Returns true on success, false
-// if no plan exists for this klass.
+/* Internal class-level rollback (§17.7). Reverts the plan for klassAddr
+ * atomically: suspend → write back InstanceKlass._constants → write back each
+ * method's _constMethod and CM._constants → resume → forceDeoptimizeAll.
+ * Does not touch g_plans for OTHER klasses. Returns true on success, false
+ * if no plan exists for this klass. */
 static bool unloadClassPlanForKlass(uint64_t klassAddr) {
     HANDLE proc = g_target.handle;
 
@@ -4252,8 +4251,8 @@ static bool unloadClassPlanForKlass(uint64_t klassAddr) {
     resumeTargetThreads(threadIds);
     FVM_LOG("UNLOAD_CLASS_PLAN: resumed %zu threads", threadIds.size());
 
-    // §17.10: do NOT VirtualFreeEx newCP/newCPCache/newRK/newCM allocations.
-    // Mid-frame execution may still reference them; process exit reclaims.
+    /* §17.10: do NOT VirtualFreeEx newCP/newCPCache/newRK/newCM allocations.
+     * Mid-frame execution may still reference them; process exit reclaims. */
 
     return true;
 }
@@ -4888,15 +4887,15 @@ int commitClassPlan(const char* targetClassName,
     return accepted ? 1 : 0;
 }
 
-// ============================================================
-// Exports for the per-class plan API
-// ============================================================
+/* ============================================================
+ * Exports for the per-class plan API
+ * ============================================================ */
 
 namespace {
 
-// Tiny single-pass JSON helpers used to decode the hooksJson array passed in
-// via the DLL ABI. JSON is well-formed (emitted by the Agent) so we can rely
-// on simple "key":"value" / "key":bool searches without a real parser.
+/* Tiny single-pass JSON helpers used to decode the hooksJson array passed in
+ * via the DLL ABI. JSON is well-formed (emitted by the Agent) so we can rely
+ * on simple "key":"value" / "key":bool searches without a real parser. */
 
 static std::string jsonExtractString(const std::string& obj, const std::string& key) {
     std::string needle = std::string("\"") + key + "\":\"";
@@ -4919,8 +4918,8 @@ static bool jsonExtractBool(const std::string& obj, const std::string& key, bool
     return fallback;
 }
 
-// Find the next outer JSON object [start..end) inside arr, returning its bounds
-// in [outStart, outEnd]. Returns false when no more objects.
+/* Find the next outer JSON object [start..end) inside arr, returning its bounds
+ * in [outStart, outEnd]. Returns false when no more objects. */
 static bool jsonNextObject(const std::string& arr, size_t pos,
                            size_t* outStart, size_t* outEnd) {
     while (pos < arr.size() && arr[pos] != '{') pos++;
@@ -4982,18 +4981,18 @@ static std::string jsonEscape(const std::string& s) {
 
 } // namespace
 
-// Public DLL export: per-class plan-once-commit-once.
-//
-// hooksJson format:
-//   [{"hookClass":"...","hookMethod":"...","hookDesc":"...",
-//     "injectAt":"...",
-//     "candidates":[{"methodName":"...","paramDesc":"..."}, ...]}, ...]
-//
-// resultJsonBuf receives a JSON array (same length / order as input):
-//   [{"matched":true,"methodName":"...","paramDesc":"..."}, ...]
-// or {"matched":false,"reason":"..."} per entry.
-//
-// Returns 1 on commit success, 0 on commit failure (e.g. class not found).
+/* Public DLL export: per-class plan-once-commit-once.
+ *
+ * hooksJson format:
+ *   [{"hookClass":"...","hookMethod":"...","hookDesc":"...",
+ *     "injectAt":"...",
+ *     "candidates":[{"methodName":"...","paramDesc":"..."}, ...]}, ...]
+ *
+ * resultJsonBuf receives a JSON array (same length / order as input):
+ *   [{"matched":true,"methodName":"...","paramDesc":"..."}, ...]
+ * or {"matched":false,"reason":"..."} per entry.
+ *
+ * Returns 1 on commit success, 0 on commit failure (e.g. class not found). */
 extern "C" __declspec(dllexport) int forgevm_forge_class_plan(
     const char* targetClassName,
     const char* hooksJson,

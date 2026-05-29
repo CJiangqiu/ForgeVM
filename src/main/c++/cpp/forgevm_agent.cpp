@@ -22,9 +22,9 @@
 #include <io.h>
 #include <fcntl.h>
 
-// ============================================================
-// Agent-level file logging — unified with DLL into one file
-// ============================================================
+/* ============================================================
+ * Agent-level file logging — unified with DLL into one file
+ * ============================================================ */
 
 static FILE* g_agentLog = nullptr;
 static std::string g_logDir;   // resolved once, passed to DLL for its own log
@@ -125,9 +125,9 @@ struct AgentLockState {
 };
 
 
-// Self-DACL hardening: deny PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD
-// to Everyone on our own process object. Blocks same-user non-admin kills and injection.
-// Admin with TakeOwnership can still override.
+/* Self-DACL hardening: deny PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD
+ * to Everyone on our own process object. Blocks same-user non-admin kills and injection.
+ * Admin with TakeOwnership can still override. */
 static bool hardenSelfProcessDACL() {
     HANDLE hSelf = NULL;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(),
@@ -341,6 +341,22 @@ std::string escapeJson(const std::string& value) {
     return out;
 }
 
+/* When non-null (set per command-pipe connection), a command reply is appended
+ * here instead of written to std::cout; the connection thread then sends the
+ * captured reply back over its own pipe. This is what lets multiple JVM
+ * classloaders each hold an independent command channel to the single agent —
+ * the gen0 (parent-stdio) path leaves it null and replies via std::cout. */
+thread_local std::string* tls_replySink = nullptr;
+
+static void emitReply(const std::string& json) {
+    if (tls_replySink != nullptr) {
+        *tls_replySink += json;
+        tls_replySink->push_back('\n');
+    } else {
+        std::cout << json << std::endl;
+    }
+}
+
 void printResultWithFields(const char* status,
                            const char* capability,
                            const std::string& dllPath,
@@ -356,7 +372,7 @@ void printResultWithFields(const char* status,
             << "\":\"" << escapeJson(fields[i].second) << "\"";
     }
     oss << "}";
-    std::cout << oss.str() << std::endl;
+    emitReply(oss.str());
 }
 
 void printResult(const char* status,
@@ -368,7 +384,7 @@ void printResult(const char* status,
         << "\",\"capability\":\"" << escapeJson(capability)
         << "\",\"dllPath\":\"" << escapeJson(dllPath)
         << "\",\"reason\":\"" << escapeJson(reason) << "\"}";
-    std::cout << oss.str() << std::endl;
+    emitReply(oss.str());
 }
 
 std::string getJsonStringField(const std::string& line, const std::string& key) {
@@ -462,8 +478,8 @@ std::vector<unsigned long long> parseJsonUint64Array(const std::string& line, co
     return result;
 }
 
-// Returns the index of the matching '}' for the '{' at openIdx, or npos.
-// String/escape-aware so quoted braces don't confuse depth counting.
+/* Returns the index of the matching '}' for the '{' at openIdx, or npos.
+ * String/escape-aware so quoted braces don't confuse depth counting. */
 size_t findMatchingBrace(const std::string& s, size_t openIdx) {
     int depth = 0;
     bool inString = false;
@@ -486,8 +502,8 @@ size_t findMatchingBrace(const std::string& s, size_t openIdx) {
     return std::string::npos;
 }
 
-// Extract the contents of "key":[...] (between [ and ], exclusive). Returns
-// empty string if the array is absent or malformed. String/escape-aware.
+/* Extract the contents of "key":[...] (between [ and ], exclusive). Returns
+ * empty string if the array is absent or malformed. String/escape-aware. */
 std::string extractArrayInner(const std::string& s, const std::string& key) {
     std::string pat = "\"" + key + "\":[";
     size_t i = s.find(pat);
@@ -514,9 +530,9 @@ std::string extractArrayInner(const std::string& s, const std::string& key) {
     return std::string();
 }
 
-// Iterate top-level JSON objects in arrayInner, calling cb with each object's
-// substring (including the outer braces). Other characters between objects
-// (commas, whitespace) are skipped.
+/* Iterate top-level JSON objects in arrayInner, calling cb with each object's
+ * substring (including the outer braces). Other characters between objects
+ * (commas, whitespace) are skipped. */
 template<typename F>
 void forEachJsonObject(const std::string& arrayInner, F cb) {
     size_t i = 0;
@@ -836,9 +852,9 @@ void handlePutRefFieldBatch(const NativeApi& api, const std::string& line, const
     }
 }
 
-// ============================================================
-// forge_batch_plan: per-class plan-once-commit-once entry point
-// ============================================================
+/* ============================================================
+ * forge_batch_plan: per-class plan-once-commit-once entry point
+ * ============================================================ */
 
 namespace {
 
@@ -867,8 +883,8 @@ struct PerIngotResult {
 
 } // namespace
 
-// Parse a forgevm_forge_class_plan results JSON ("[{matched:..,...}, ...]")
-// into a vector of PerIngotResult that parallels the input order.
+/* Parse a forgevm_forge_class_plan results JSON ("[{matched:..,...}, ...]")
+ * into a vector of PerIngotResult that parallels the input order. */
 static std::vector<PerIngotResult> parseClassPlanResults(const std::string& json,
                                                         size_t expected) {
     std::vector<PerIngotResult> out;
@@ -927,9 +943,9 @@ void handleForgeBatchPlan(const NativeApi& api, const std::string& line, const s
     std::vector<PerIngotResult> results(ingots.size());
 
     if (api.forgeClassPlan != NULL) {
-        // §17 Stage 3: group ingots by (targetClass, includeSubclasses) and
-        // commit each class as one plan-once-commit-once operation. All
-        // commits defer deopt; we run a single global deopt sweep at the end.
+        /* §17 Stage 3: group ingots by (targetClass, includeSubclasses) and
+         * commit each class as one plan-once-commit-once operation. All
+         * commits defer deopt; we run a single global deopt sweep at the end. */
         struct GroupKey {
             std::string targetClass;
             bool includeSubclasses;
@@ -1045,7 +1061,11 @@ void handleForgeBatchPlan(const NativeApi& api, const std::string& line, const s
         oss << '}';
     }
     oss << "]}";
-    std::cout << oss.str() << std::endl;
+    /* Route through emitReply, not std::cout: after handoff this runs on a
+     * command-pipe connection thread whose reply must go to that pipe (via the
+     * thread-local sink), not the dead inherited stdout. Writing to std::cout
+     * here would leave the client's readLine() at EOF → agent_send_failed. */
+    emitReply(oss.str());
     AGENT_LOG("forge_batch_plan: %d/%zu matched", matchedCount, (size_t)results.size());
 }
 
@@ -1073,7 +1093,7 @@ void handleForgeClassUnload(const NativeApi& api, const std::string& line, const
         << ",\"capability\":\"" << (result == 1 ? "FULL" : "UNAVAILABLE") << "\""
         << ",\"dllPath\":\"" << escapeJson(dllPath) << "\""
         << ",\"reason\":\"" << escapeJson(reason) << "\"}";
-    std::cout << oss.str() << std::endl;
+    emitReply(oss.str());
 }
 
 void handlePutFieldPath(const NativeApi& api, const std::string& line, const std::string& dllPath) {
@@ -1175,13 +1195,13 @@ void handlePutObjectFieldPath(const NativeApi& api, const std::string& line, con
     }
 }
 
-// ============================================================
-// Load-filter state (Java agent attach + native library load)
-//
-// Filter storage is Agent-local — enforcement arrives in later steps:
-//   step 3: JVM_EnqueueOperation trampoline consults g_javaAgentFilter
-//   step 4: ntdll!LdrLoadDll trampoline consults g_nativeLoadFilter
-// ============================================================
+/* ============================================================
+ * Load-filter state (Java agent attach + native library load)
+ *
+ * Filter storage is Agent-local — enforcement arrives in later steps:
+ *   step 3: JVM_EnqueueOperation trampoline consults g_javaAgentFilter
+ *   step 4: ntdll!LdrLoadDll trampoline consults g_nativeLoadFilter
+ * ============================================================ */
 
 enum class FilterMode { None, Blacklist, Whitelist };
 
@@ -1314,12 +1334,12 @@ bool globMatch(const std::string& pattern, const std::string& text) {
     return pi == pattern.size();
 }
 
-// true = allow the load, false = block it.
-// Semantics:
-//   filter inactive           → allow (ForgeVM never installed a filter)
-//   active + mode==None       → block everything (global ban, no patterns)
-//   active + Blacklist+match  → block; otherwise allow
-//   active + Whitelist+match  → allow; otherwise block
+/* true = allow the load, false = block it.
+ * Semantics:
+ *   filter inactive           → allow (ForgeVM never installed a filter)
+ *   active + mode==None       → block everything (global ban, no patterns)
+ *   active + Blacklist+match  → block; otherwise allow
+ *   active + Whitelist+match  → allow; otherwise block */
 bool filterAllows(const LoadFilter& f, const std::string& path) {
     if (!f.active) return true;
     if (f.mode == FilterMode::None) return false;
@@ -1330,18 +1350,18 @@ bool filterAllows(const LoadFilter& f, const std::string& path) {
     return (f.mode == FilterMode::Blacklist) ? !matched : matched;
 }
 
-// ============================================================
-// Named-pipe server: trampolines in the target JVM connect here
-// to ask "is this path allowed?" before calling the real JVM entry.
-//
-// Protocol (one request per connection, blocking):
-//   request : <kind:1 byte 'A'|'N'|'P'> <path:UTF-8 bytes> <0x0A>
-//   reply   : <decision:1 byte '1'=allow | '0'=block>
-//
-// 'A' queries g_javaAgentFilter, 'N' queries g_nativeLoadFilter,
-// 'P' queries g_processCreateFilter.
-// Pipe name: \\.\pipe\forgevm_<jvm_pid>_filter
-// ============================================================
+/* ============================================================
+ * Named-pipe server: trampolines in the target JVM connect here
+ * to ask "is this path allowed?" before calling the real JVM entry.
+ *
+ * Protocol (one request per connection, blocking):
+ *   request : <kind:1 byte 'A'|'N'|'P'> <path:UTF-8 bytes> <0x0A>
+ *   reply   : <decision:1 byte '1'=allow | '0'=block>
+ *
+ * 'A' queries g_javaAgentFilter, 'N' queries g_nativeLoadFilter,
+ * 'P' queries g_processCreateFilter.
+ * Pipe name: \\.\pipe\forgevm_<jvm_pid>_filter
+ * ============================================================ */
 
 DWORD WINAPI filterPipeHandlerThread(LPVOID param) {
     HANDLE pipe = (HANDLE)param;
@@ -1465,8 +1485,9 @@ static std::string buildCommandPipeName() {
 }
 
 /* Idempotent: creates the first instance of the command pipe and stashes it
- * in g_commandPipeServer. Returns true on success. Subsequent calls re-use
- * the existing server pipe handle. */
+ * in g_commandPipeServer. Returns true on success. PIPE_UNLIMITED_INSTANCES so
+ * multiple JVM classloaders can each hold an independent command channel — the
+ * post-handoff server accepts further instances on demand. */
 static bool ensureCommandPipeCreated() {
     if (g_commandPipeServer != INVALID_HANDLE_VALUE) return true;
     g_commandPipeName = buildCommandPipeName();
@@ -1474,7 +1495,7 @@ static bool ensureCommandPipeCreated() {
         g_commandPipeName.c_str(),
         PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        /*maxInstances*/ 1,
+        PIPE_UNLIMITED_INSTANCES,
         /*outBuf*/ 4096, /*inBuf*/ 4096,
         /*defaultTimeout*/ 0,
         /*sa*/ NULL);
@@ -1603,10 +1624,10 @@ static bool redirectStdioToPipe(HANDLE pipe) {
     return true;
 }
 
-// Start the filter pipe server (idempotent). Synchronously creates the
-// first pipe instance before spawning the accept thread so that the
-// trampoline's CreateFileA can never race the server's first listen.
-// Returns the pipe name on success, or an empty string if start failed.
+/* Start the filter pipe server (idempotent). Synchronously creates the
+ * first pipe instance before spawning the accept thread so that the
+ * trampoline's CreateFileA can never race the server's first listen.
+ * Returns the pipe name on success, or an empty string if start failed. */
 std::string ensureFilterPipeStarted() {
     if (g_filterPipeStarted.load()) {
         return g_filterPipeName;
@@ -1796,9 +1817,9 @@ void handleUnbanProcessCreate(const NativeApi& api, const std::string& dllPath) 
                 api.lastError ? api.lastError() : "unknown");
 }
 
-// ============================================================
-// relaunch: WMI cmdline query → filter → TerminateProcess + CreateProcessW
-// ============================================================
+/* ============================================================
+ * relaunch: WMI cmdline query → filter → TerminateProcess + CreateProcessW
+ * ============================================================ */
 
 static std::wstring queryProcessCommandLine(DWORD pid) {
     std::wstring result;
@@ -2249,6 +2270,189 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
               pid, pi.dwProcessId);
 }
 
+/* ============================================================
+ * Command dispatch + multi-client command-pipe server
+ *
+ * All target-process mutation funnels through the single agent. The Java client
+ * side is a thin RPC layer: any classloader's ForgeVM connects to the agent's
+ * command pipe (name derived from the JVM-global forgevm.agent.pid property) and
+ * sends commands. Because the native DLL keeps shared per-target state, every
+ * command executes under g_commandMutex (serialized), but connections are
+ * accepted concurrently so multiple classloaders each get a live channel.
+ * ============================================================ */
+
+std::mutex g_commandMutex;
+AgentLockState g_lockState;          // guarded by g_commandMutex
+const NativeApi* g_api = nullptr;    // set in main() before serving
+std::string g_cmdDllPath;            // set in main() before serving
+
+// Returns true if the command was "shutdown" (caller should stop the channel).
+static bool dispatchCommand(const NativeApi& api, const std::string& dllPath,
+                            AgentLockState& lockState, const std::string& line) {
+    refreshLockIfExpired(&lockState);
+    std::string cmd = getJsonStringField(line, "cmd");
+    AGENT_LOG("cmd=%s", cmd.c_str());
+
+    if (cmd == "bootstrap") {
+        handleBootstrap(api, dllPath, line);
+    } else if (cmd == "exit_jvm") {
+        handleExitJvm(api, line, dllPath);
+    } else if (cmd == "put_field") {
+        handlePutField(api, line, dllPath);
+    } else if (cmd == "put_field_batch") {
+        handlePutFieldBatch(api, line, dllPath);
+    } else if (cmd == "put_ref_field") {
+        handlePutRefField(api, line, dllPath);
+    } else if (cmd == "put_ref_field_batch") {
+        handlePutRefFieldBatch(api, line, dllPath);
+    } else if (cmd == "forge_batch_plan") {
+        handleForgeBatchPlan(api, line, dllPath);
+    } else if (cmd == "force_deopt") {
+        if (api.forceDeoptNow != NULL) {
+            int r = api.forceDeoptNow();
+            std::string reason = copyReason(api, r == 1 ? "ok" : "force_deopt_failed");
+            AGENT_LOG("force_deopt result=%d reason=%s", r, reason.c_str());
+            if (r == 1) {
+                printResult("ok", "FULL", dllPath, reason.c_str());
+            } else {
+                printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
+            }
+        } else {
+            printResult("fallback", "UNAVAILABLE", dllPath, "force_deopt_not_exported");
+        }
+    } else if (cmd == "forge_class_unload") {
+        handleForgeClassUnload(api, line, dllPath);
+    } else if (cmd == "purge_matching_agents") {
+        handlePurgeMatchingAgents(api, line, dllPath);
+    } else if (cmd == "put_field_path") {
+        handlePutFieldPath(api, line, dllPath);
+    } else if (cmd == "put_object_field_path") {
+        handlePutObjectFieldPath(api, line, dllPath);
+    } else if (cmd == "dump_card_structs") {
+        if (api.dumpCardStructs != NULL) {
+            api.dumpCardStructs();
+            printResult("ok", "FULL", dllPath, api.lastError ? api.lastError() : "no_data");
+        } else {
+            printResult("fallback", "UNAVAILABLE", dllPath, "dump_card_structs_not_exported");
+        }
+    } else if (cmd == "ping") {
+        printResult("ok", "RESTRICTED", dllPath, lockState.locked ? "pong_locked" : "pong_unlocked");
+    } else if (cmd == "lock_agent") {
+        handleLockAgent(&lockState, line, dllPath);
+    } else if (cmd == "unlock_agent") {
+        handleUnlockAgent(&lockState, dllPath);
+    } else if (cmd == "rebind_jvm") {
+        handleRebindJvm(&lockState, line, dllPath);
+    } else if (cmd == "ban_java_agent") {
+        handleBanJavaAgent(api, line, dllPath);
+    } else if (cmd == "unban_java_agent") {
+        handleUnbanJavaAgent(api, dllPath);
+    } else if (cmd == "ban_native_load") {
+        handleBanNativeLoad(api, line, dllPath);
+    } else if (cmd == "unban_native_load") {
+        handleUnbanNativeLoad(api, dllPath);
+    } else if (cmd == "ban_process_create") {
+        handleBanProcessCreate(api, line, dllPath);
+    } else if (cmd == "unban_process_create") {
+        handleUnbanProcessCreate(api, dllPath);
+    } else if (cmd == "relaunch") {
+        handleRelaunch(api, line, dllPath);
+    } else if (cmd == "shutdown") {
+        printResult("ok", "RESTRICTED", dllPath, "bye");
+        return true;
+    } else {
+        printResult("fallback", "UNAVAILABLE", dllPath, "unknown_command");
+    }
+    return false;
+}
+
+/* Read one '\n'-terminated request from a byte-mode pipe. Returns false on
+ * EOF/error (client disconnected). */
+static bool readPipeLine(HANDLE pipe, std::string& out) {
+    out.clear();
+    char ch;
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(pipe, &ch, 1, &got, NULL) || got == 0) {
+            return !out.empty();   // partial line at EOF still dispatched
+        }
+        if (ch == '\n') return true;
+        if (ch != '\r') out.push_back(ch);
+        if (out.size() > (1u << 20)) return true;   // 1 MiB sanity cap
+    }
+}
+
+/* Serve one connected command channel until the client disconnects. Each command
+ * runs under g_commandMutex with its reply captured to a per-thread sink, then
+ * written back over this pipe. */
+static DWORD WINAPI commandConnectionThread(LPVOID param) {
+    HANDLE pipe = static_cast<HANDLE>(param);
+    std::string line;
+    while (readPipeLine(pipe, line)) {
+        if (line.empty()) continue;
+        std::string reply;
+        bool shutdownReq;
+        {
+            std::lock_guard<std::mutex> g(g_commandMutex);
+            tls_replySink = &reply;
+            shutdownReq = dispatchCommand(*g_api, g_cmdDllPath, g_lockState, line);
+            tls_replySink = nullptr;
+        }
+        if (!reply.empty()) {
+            DWORD wrote = 0;
+            WriteFile(pipe, reply.data(), static_cast<DWORD>(reply.size()), &wrote, NULL);
+            FlushFileBuffers(pipe);
+        }
+        if (shutdownReq) {
+            AGENT_LOG("command channel: shutdown received — exiting agent");
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+            ExitProcess(0);
+        }
+    }
+    DisconnectNamedPipe(pipe);
+    CloseHandle(pipe);
+    return 0;
+}
+
+/* After the first handoff client connects, keep accepting further clients (other
+ * classloaders' ForgeVM instances) on fresh pipe instances, each on its own
+ * thread. Never returns; the parent watchdog terminates the agent when the JVM
+ * dies. firstPipe is the already-accepted first connection. */
+static void runCommandPipeServer(HANDLE firstPipe) {
+    if (firstPipe != NULL && firstPipe != INVALID_HANDLE_VALUE) {
+        HANDLE th = CreateThread(NULL, 0, commandConnectionThread, firstPipe, 0, NULL);
+        if (th != NULL) CloseHandle(th);
+    }
+    for (;;) {
+        HANDLE pipe = CreateNamedPipeA(
+            g_commandPipeName.c_str(),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            /*outBuf*/ 4096, /*inBuf*/ 4096,
+            /*defaultTimeout*/ 0, /*sa*/ NULL);
+        if (pipe == INVALID_HANDLE_VALUE) {
+            AGENT_LOG("command pipe server: CreateNamedPipe failed: %lu", GetLastError());
+            Sleep(200);
+            continue;
+        }
+        BOOL connected = ConnectNamedPipe(pipe, NULL)
+                             ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+        if (!connected) {
+            CloseHandle(pipe);
+            continue;
+        }
+        HANDLE th = CreateThread(NULL, 0, commandConnectionThread, pipe, 0, NULL);
+        if (th == NULL) {
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+            continue;
+        }
+        CloseHandle(th);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2316,113 +2520,39 @@ int main(int argc, char** argv) {
      * having it ready before relaunch removes any startup race. */
     ensureCommandPipeCreated();
 
-    AgentLockState lockState;
-    std::string line;
-re_enter_command_loop:
-    while (std::getline(std::cin, line)) {
-        refreshLockIfExpired(&lockState);
-        std::string cmd = getJsonStringField(line, "cmd");
-        AGENT_LOG("cmd=%s", cmd.c_str());
+    /* Publish dispatch context for the post-handoff command channels. */
+    g_api = &api;
+    g_cmdDllPath = dllPath;
 
-        if (cmd == "bootstrap") {
-            handleBootstrap(api, dllPath, line);
-        } else if (cmd == "exit_jvm") {
-            handleExitJvm(api, line, dllPath);
-        } else if (cmd == "put_field") {
-            handlePutField(api, line, dllPath);
-        } else if (cmd == "put_field_batch") {
-            handlePutFieldBatch(api, line, dllPath);
-        } else if (cmd == "put_ref_field") {
-            handlePutRefField(api, line, dllPath);
-        } else if (cmd == "put_ref_field_batch") {
-            handlePutRefFieldBatch(api, line, dllPath);
-        } else if (cmd == "forge_batch_plan") {
-            handleForgeBatchPlan(api, line, dllPath);
-        } else if (cmd == "force_deopt") {
-            if (api.forceDeoptNow != NULL) {
-                int r = api.forceDeoptNow();
-                std::string reason = copyReason(api, r == 1 ? "ok" : "force_deopt_failed");
-                AGENT_LOG("force_deopt result=%d reason=%s", r, reason.c_str());
-                if (r == 1) {
-                    printResult("ok", "FULL", dllPath, reason.c_str());
-                } else {
-                    printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
-                }
-            } else {
-                printResult("fallback", "UNAVAILABLE", dllPath, "force_deopt_not_exported");
-            }
-        } else if (cmd == "forge_class_unload") {
-            handleForgeClassUnload(api, line, dllPath);
-        } else if (cmd == "purge_matching_agents") {
-            handlePurgeMatchingAgents(api, line, dllPath);
-        } else if (cmd == "put_field_path") {
-            handlePutFieldPath(api, line, dllPath);
-        } else if (cmd == "put_object_field_path") {
-            handlePutObjectFieldPath(api, line, dllPath);
-        } else if (cmd == "dump_card_structs") {
-            if (api.dumpCardStructs != NULL) {
-                api.dumpCardStructs();
-                printResult("ok", "FULL", dllPath, api.lastError ? api.lastError() : "no_data");
-            } else {
-                printResult("fallback", "UNAVAILABLE", dllPath, "dump_card_structs_not_exported");
-            }
-        } else if (cmd == "ping") {
-            printResult("ok", "RESTRICTED", dllPath, lockState.locked ? "pong_locked" : "pong_unlocked");
-        } else if (cmd == "lock_agent") {
-            handleLockAgent(&lockState, line, dllPath);
-        } else if (cmd == "unlock_agent") {
-            handleUnlockAgent(&lockState, dllPath);
-        } else if (cmd == "rebind_jvm") {
-            handleRebindJvm(&lockState, line, dllPath);
-        } else if (cmd == "ban_java_agent") {
-            handleBanJavaAgent(api, line, dllPath);
-        } else if (cmd == "unban_java_agent") {
-            handleUnbanJavaAgent(api, dllPath);
-        } else if (cmd == "ban_native_load") {
-            handleBanNativeLoad(api, line, dllPath);
-        } else if (cmd == "unban_native_load") {
-            handleUnbanNativeLoad(api, dllPath);
-        } else if (cmd == "ban_process_create") {
-            handleBanProcessCreate(api, line, dllPath);
-        } else if (cmd == "unban_process_create") {
-            handleUnbanProcessCreate(api, dllPath);
-        } else if (cmd == "relaunch") {
-            handleRelaunch(api, line, dllPath);
-        } else if (cmd == "shutdown") {
-            printResult("ok", "RESTRICTED", dllPath, "bye");
-            break;
-        } else {
-            printResult("fallback", "UNAVAILABLE", dllPath, "unknown_command");
-        }
+    /* Gen0 (parent-spawned) phase: commands arrive on inherited stdin, replies
+     * go to stdout (tls_replySink stays null). Serialized via g_commandMutex for
+     * symmetry with the post-handoff channels. */
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        std::lock_guard<std::mutex> g(g_commandMutex);
+        if (dispatchCommand(api, dllPath, g_lockState, line)) break;
     }
 
-    while (lockState.locked && !lockExpired(lockState)) {
+    while (g_lockState.locked && !lockExpired(g_lockState)) {
         Sleep(100);
     }
 
-    /* If a relaunch armed the persistence flag, our stdin (inherited from
-     * old JVM) just EOF'd. Don't exit — wait for the new JVM's ForgeVM.launch()
-     * to connect to the handoff command pipe, then redirect stdin/stdout to
-     * the pipe and re-enter the command loop. The filter pipe (serving the
-     * new JVM's ntdll trampoline) stays alive throughout this transition
-     * because it's owned by the filter pipe accept thread which is independent
-     * of stdio. */
+    /* If a relaunch armed persistence, our inherited stdin (from the old JVM)
+     * just EOF'd. Don't exit — wait for the new JVM's ForgeVM.launch() to
+     * connect to the handoff command pipe. Once the first client connects (or
+     * the new JVM dies / never maps jvm.dll, handled by acceptCommandPipeClient),
+     * serve it AND keep accepting further clients: each JVM classloader's
+     * ForgeVM holds its own independent command channel to this single agent. */
     if (g_persistAfterEOF.load()) {
         AGENT_LOG("main: stdin EOF after relaunch — awaiting handoff on %s",
                   g_commandPipeName.c_str());
         HANDLE hJvm = g_relaunchNewJvm.exchange(NULL);
-        HANDLE pipe = acceptCommandPipeClient(hJvm);
+        HANDLE firstPipe = acceptCommandPipeClient(hJvm);
         if (hJvm != NULL) CloseHandle(hJvm);
-        if (pipe != NULL && pipe != INVALID_HANDLE_VALUE) {
-            AGENT_LOG("main: handoff client connected, redirecting stdio");
-            if (redirectStdioToPipe(pipe)) {
-                /* The persistence flag is one-shot: subsequent stdin EOFs
-                 * (e.g., new JVM disconnects) should terminate the agent
-                 * normally, since at that point no JVM is left to serve. */
-                g_persistAfterEOF.store(false);
-                goto re_enter_command_loop;
-            }
-            CloseHandle(pipe);
+        if (firstPipe != NULL && firstPipe != INVALID_HANDLE_VALUE) {
+            AGENT_LOG("main: handoff client connected — serving multi-client command channels");
+            g_persistAfterEOF.store(false);
+            runCommandPipeServer(firstPipe);   // never returns; watchdog reaps on JVM death
         } else {
             AGENT_LOG("main: handoff accept failed — exiting");
         }

@@ -3,9 +3,9 @@
 #include <tlhelp32.h>
 #include <cctype>
 
-// ============================================================
-// Compressed oop/klass helpers
-// ============================================================
+/* ============================================================
+ * Compressed oop/klass helpers
+ * ============================================================ */
 
 std::string g_compressionDetectLog;
 
@@ -150,9 +150,9 @@ uint64_t readKlass(HANDLE proc, uint64_t addr, bool compressed) {
     }
 }
 
-// ============================================================
-// OOP/Klass heuristic resolution
-// ============================================================
+/* ============================================================
+ * OOP/Klass heuristic resolution
+ * ============================================================ */
 
 static bool containsIgnoreCase(const std::string& text, const char* needle) {
     if (needle == nullptr || needle[0] == '\0') return false;
@@ -319,9 +319,9 @@ bool resolveObjectAndKlassFromRawOop(uint64_t rawOop, DecodedObjectInfo* out) {
     return false;
 }
 
-// ============================================================
-// Thread suspend / resume
-// ============================================================
+/* ============================================================
+ * Thread suspend / resume
+ * ============================================================ */
 
 bool suspendTargetThreads(DWORD pid, std::vector<DWORD>& threadIds) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -355,9 +355,9 @@ void resumeTargetThreads(const std::vector<DWORD>& threadIds) {
     }
 }
 
-// ============================================================
-// Field descriptor helpers
-// ============================================================
+/* ============================================================
+ * Field descriptor helpers
+ * ============================================================ */
 
 int32_t fieldSizeFromDescriptor(const std::string& desc) {
     if (desc.empty()) return 0;
@@ -392,9 +392,9 @@ static std::string dotToSlash(const std::string& name) {
     return result;
 }
 
-// ============================================================
-// Symbol reading
-// ============================================================
+/* ============================================================
+ * Symbol reading
+ * ============================================================ */
 
 bool readSymbolBody(HANDLE proc, uint64_t symbolAddr, std::string* out) {
     int64_t lengthOff = structOffset("Symbol", "_length");
@@ -431,9 +431,9 @@ bool readSymbolBody(HANDLE proc, uint64_t symbolAddr, std::string* out) {
     return true;
 }
 
-// ============================================================
-// Field resolution within InstanceKlass
-// ============================================================
+/* ============================================================
+ * Field resolution within InstanceKlass
+ * ============================================================ */
 
 bool resolveFieldInKlass(uint64_t klassAddr, const std::string& fieldName,
                          const std::string& descriptor, ResolvedField* out) {
@@ -614,9 +614,9 @@ bool resolveFieldInKlass(uint64_t klassAddr, const std::string& fieldName,
     return false;
 }
 
-// ============================================================
-// Field resolution with klass hierarchy walk
-// ============================================================
+/* ============================================================
+ * Field resolution with klass hierarchy walk
+ * ============================================================ */
 
 bool resolveAndCacheField(const char* fieldName,
                           uint64_t objAddr,
@@ -660,9 +660,9 @@ bool resolveAndCacheField(const char* fieldName,
     return true;
 }
 
-// ============================================================
-// put_field: write a primitive field value
-// ============================================================
+/* ============================================================
+ * put_field: write a primitive field value
+ * ============================================================ */
 
 extern "C" __declspec(dllexport) int forgevm_put_field(
         unsigned long long oop,
@@ -787,9 +787,9 @@ extern "C" __declspec(dllexport) int forgevm_put_field_batch(
     return 1;
 }
 
-// ============================================================
-// Card table support for Object reference writes
-// ============================================================
+/* ============================================================
+ * Card table support for Object reference writes
+ * ============================================================ */
 
 static uint64_t g_cardTableBase = 0;
 static bool g_cardTableResolved = false;
@@ -894,9 +894,9 @@ static bool dirtyCard(uint64_t writeAddr) {
     return writeRemoteMem(g_target.handle, cardAddr, &dirty, 1);
 }
 
-// ============================================================
-// put_ref_field: write an Object reference field + dirty card table
-// ============================================================
+/* ============================================================
+ * put_ref_field: write an Object reference field + dirty card table
+ * ============================================================ */
 
 extern "C" __declspec(dllexport) int forgevm_put_ref_field(
         unsigned long long oop,
@@ -1031,16 +1031,16 @@ extern "C" __declspec(dllexport) int forgevm_put_ref_field_batch(
     return 1;
 }
 
-// ============================================================
-// put_field_path: navigate a field chain from a static root
-//
-// className:  "com.example.Server" (dot or slash form)
-// fieldChain: "INSTANCE.config.maxHealth" (dot-separated)
-//
-// Resolves className → Klass, then follows each field in the chain
-// via RPM. Writes valueBytes to the final field.
-// If the final field is a reference type, also dirties the GC card.
-// ============================================================
+/* ============================================================
+ * put_field_path: navigate a field chain from a static root
+ *
+ * className:  "com.example.Server" (dot or slash form)
+ * fieldChain: "INSTANCE.config.maxHealth" (dot-separated)
+ *
+ * Resolves className → Klass, then follows each field in the chain
+ * via RPM. Writes valueBytes to the final field.
+ * If the final field is a reference type, also dirties the GC card.
+ * ============================================================ */
 
 static std::vector<std::string> splitDots(const std::string& s) {
     std::vector<std::string> parts;
@@ -1091,8 +1091,8 @@ extern "C" __declspec(dllexport) int forgevm_put_field_path(
         return 0;
     }
 
-    // Step 2: Navigate the chain
-    // For each field except the last: resolve field, read OOP, get next Klass
+    /* Step 2: Navigate the chain.
+     * For each field except the last: resolve field, read OOP, get next Klass. */
     uint64_t currentObj = 0; // 0 means "reading from Klass (static context)"
     bool isRefWrite = false;
 
@@ -1182,12 +1182,12 @@ extern "C" __declspec(dllexport) int forgevm_put_field_path(
     return 0;
 }
 
-// ============================================================
-// put_object_field_path: read OOP from source path, write to target path
-//
-// Reads the OOP at sourceClass.sourceField, then writes it to
-// targetClass.targetField. Handles compressed oops and GC card dirty.
-// ============================================================
+/* ============================================================
+ * put_object_field_path: read OOP from source path, write to target path
+ *
+ * Reads the OOP at sourceClass.sourceField, then writes it to
+ * targetClass.targetField. Handles compressed oops and GC card dirty.
+ * ============================================================ */
 
 extern "C" __declspec(dllexport) int forgevm_put_object_field_path(
         const char* targetClass, const char* targetField,
@@ -1383,9 +1383,9 @@ extern "C" __declspec(dllexport) int forgevm_put_object_field_path(
     return 0;
 }
 
-// ============================================================
-// Diagnostic: dump barrier/card related structMap entries
-// ============================================================
+/* ============================================================
+ * Diagnostic: dump barrier/card related structMap entries
+ * ============================================================ */
 
 extern "C" __declspec(dllexport) int forgevm_dump_card_structs() {
     if (!g_target.structMapReady) {

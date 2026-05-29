@@ -110,9 +110,9 @@ public final class MemoryUtil {
         sendPutFieldPath(className, fieldChain, new byte[8]);
     }
 
-    // ============================================================
-    // Internals
-    // ============================================================
+    /* ============================================================
+     * Internals
+     * ============================================================ */
 
     private static void sendPutObjectFieldPath(String className, String fieldChain, Object value) {
         if (!ForgeVM.isAgentActive()) {

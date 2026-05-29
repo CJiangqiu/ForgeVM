@@ -63,11 +63,21 @@ public final class FvmLog {
                 Path logDir = Paths.get("ForgeVM", "logs").toAbsolutePath();
                 Files.createDirectories(logDir);
                 Path logFile = logDir.resolve("fvm-java.log");
+                /* Under dual-loading, ForgeVM (hence FvmLog) is loaded by more
+                 * than one classloader, so several FvmLog instances write this
+                 * file in the same JVM run. Coordinate via a JVM-global property:
+                 * the first instance this run truncates for a clean log; the rest
+                 * append, so no classloader clobbers another's session. */
+                boolean firstThisRun = System.getProperty("forgevm.javalog.opened") == null;
+                if (firstThisRun) System.setProperty("forgevm.javalog.opened", "1");
+                StandardOpenOption tail = firstThisRun
+                        ? StandardOpenOption.TRUNCATE_EXISTING
+                        : StandardOpenOption.APPEND;
                 PrintWriter pw = new PrintWriter(
                         Files.newBufferedWriter(logFile, StandardCharsets.UTF_8,
                                 StandardOpenOption.CREATE,
                                 StandardOpenOption.WRITE,
-                                StandardOpenOption.TRUNCATE_EXISTING),
+                                tail),
                         true /* autoFlush */);
                 pw.println("===== ForgeVM Java log session " + FMT.format(LocalDateTime.now()) + " =====");
                 fileSink = pw;

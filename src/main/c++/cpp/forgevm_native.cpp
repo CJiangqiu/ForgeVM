@@ -4,9 +4,9 @@
 #include <shellapi.h>
 #include <string.h>
 
-// ============================================================
-// File-based logging implementation
-// ============================================================
+/* ============================================================
+ * File-based logging implementation
+ * ============================================================ */
 
 static FILE* g_logFile = nullptr;
 static CRITICAL_SECTION g_logLock;
@@ -31,15 +31,15 @@ void fvm_log_init(const char* path) {
     LeaveCriticalSection(&g_logLock);
 }
 
-// fvm_log_open_default() removed — all logging is routed through
-// forgevm_set_log_dir() which places the log in ForgeVM/logs/.
+/* fvm_log_open_default() removed — all logging is routed through
+ * forgevm_set_log_dir() which places the log in ForgeVM/logs/. */
 
 void fvm_log_write(const char* fmt, ...) {
     ensureLogLock();
     EnterCriticalSection(&g_logLock);
 
-    // Log file is initialized by Agent via forgevm_set_log_dir().
-    // If not set, silently discard — no random file creation.
+    /* Log file is initialized by Agent via forgevm_set_log_dir().
+     * If not set, silently discard — no random file creation. */
     if (!g_logFile) {
         LeaveCriticalSection(&g_logLock);
         return;
@@ -87,9 +87,9 @@ void fvm_log_hex(const char* label, const void* data, size_t len) {
     LeaveCriticalSection(&g_logLock);
 }
 
-// ============================================================
-// Global state definitions
-// ============================================================
+/* ============================================================
+ * Global state definitions
+ * ============================================================ */
 
 std::string g_lastError = "ok";
 TargetProcess g_target;
@@ -100,9 +100,9 @@ std::unordered_map<std::string, int64_t> g_intConstants;
 std::unordered_map<std::string, int64_t> g_longConstants;
 std::unordered_map<std::string, CachedFieldInfo> g_fieldInfoCache;
 
-// ============================================================
-// Error state
-// ============================================================
+/* ============================================================
+ * Error state
+ * ============================================================ */
 
 void setError(const char* value) {
     g_lastError = value;
@@ -114,9 +114,9 @@ void setError(const std::string& value) {
     FVM_LOG("ERROR: %s", value.c_str());
 }
 
-// ============================================================
-// Remote memory helpers
-// ============================================================
+/* ============================================================
+ * Remote memory helpers
+ * ============================================================ */
 
 bool readRemoteMem(HANDLE proc, uint64_t addr, void* buf, size_t size) {
     SIZE_T bytesRead = 0;
@@ -175,9 +175,9 @@ bool readRemoteString(HANDLE proc, uint64_t addr, std::string* out, size_t maxLe
     return true;
 }
 
-// ============================================================
-// StructMap / TypeMap lookup helpers
-// ============================================================
+/* ============================================================
+ * StructMap / TypeMap lookup helpers
+ * ============================================================ */
 
 bool structLookup(const std::string& typeName, const std::string& fieldName, StructMapEntry* out) {
     auto it = g_structMap.find(StructMapKey{typeName, fieldName});
@@ -216,9 +216,9 @@ int64_t longConst(const std::string& name, int64_t fallback) {
     return it->second;
 }
 
-// ============================================================
-// Module enumeration
-// ============================================================
+/* ============================================================
+ * Module enumeration
+ * ============================================================ */
 
 bool findModuleBase(HANDLE proc, const wchar_t* moduleName, uint64_t* base, uint64_t* moduleSize) {
     HMODULE modules[1024];
@@ -246,9 +246,9 @@ bool findModuleBase(HANDLE proc, const wchar_t* moduleName, uint64_t* base, uint
     return false;
 }
 
-// ============================================================
-// PE export table parsing
-// ============================================================
+/* ============================================================
+ * PE export table parsing
+ * ============================================================ */
 
 bool parsePEExport(HANDLE proc, uint64_t moduleBase, const char* symbolName, uint64_t* outAddr) {
     *outAddr = 0;
@@ -319,9 +319,9 @@ bool parsePEExport(HANDLE proc, uint64_t moduleBase, const char* symbolName, uin
     return false;
 }
 
-// ============================================================
-// HotSpot self-describing table readers
-// ============================================================
+/* ============================================================
+ * HotSpot self-describing table readers
+ * ============================================================ */
 
 struct VMStructEntryLayout {
     size_t typeNameOffset = 0;
@@ -555,9 +555,9 @@ static bool readVMLongConstants(HANDLE proc, uint64_t tablePtr, const VMLongCons
     return true;
 }
 
-// ============================================================
-// Privilege helpers
-// ============================================================
+/* ============================================================
+ * Privilege helpers
+ * ============================================================ */
 
 bool enableDebugPrivilege() {
     HANDLE token = NULL;
@@ -596,16 +596,16 @@ bool enableDebugPrivilege() {
     return true;
 }
 
-// ============================================================
-// Exported functions
-// ============================================================
+/* ============================================================
+ * Exported functions
+ * ============================================================ */
 
-// Probe: same-user OpenProcess does not require SeDebugPrivilege.
-// We opportunistically enable it (helps if target has a hostile DACL or
-// different integrity), but a normal-user JVM has no SeDebug in its token
-// and AdjustTokenPrivileges returns ERROR_NOT_ALL_ASSIGNED — that is NOT
-// a capability failure. The real capability gate is OpenProcess in
-// forgevm_bootstrap_target.
+/* Probe: same-user OpenProcess does not require SeDebugPrivilege.
+ * We opportunistically enable it (helps if target has a hostile DACL or
+ * different integrity), but a normal-user JVM has no SeDebug in its token
+ * and AdjustTokenPrivileges returns ERROR_NOT_ALL_ASSIGNED — that is NOT
+ * a capability failure. The real capability gate is OpenProcess in
+ * forgevm_bootstrap_target. */
 extern "C" __declspec(dllexport) int forgevm_probe_capability() {
     if (enableDebugPrivilege()) {
         setError("ok");
@@ -795,28 +795,31 @@ extern "C" __declspec(dllexport) const char* forgevm_compression_info() {
     return g_compressionDetectLog.c_str();
 }
 
-// ============================================================
-// Load-time filters.
-//
-//   Java agent attach:
-//     hook jvm.dll!JVM_EnqueueOperation — arg0 (rdx) is the agent
-//     library path as UTF-8. attach() uses CreateRemoteThread to
-//     reach this entry, so DisableAttachMechanism can't cover it.
-//
-//   Native library load:
-//     hook ntdll!LdrLoadDll — the bottom of every user-mode DLL
-//     load path (LoadLibraryW / LoadLibraryExW / kernelbase / JNI
-//     direct LoadLibrary / etc. all funnel here). The DLL name
-//     arrives in r8 as a UNICODE_STRING; the trampoline converts
-//     it to UTF-8 via WideCharToMultiByte before querying the
-//     filter pipe. On block we return STATUS_DLL_NOT_FOUND
-//     (0xC0000135) so callers see the normal "DLL not found"
-//     error path, not a crash.
-//
-//   Both hooks query a named pipe served by the Agent to decide
-//   allow/block per call. Pipe failure → fail-open, to keep the
-//   JVM healthy when the Agent exits unexpectedly.
-// ============================================================
+/* ============================================================
+ * Load-time filters.
+ *
+ *   Java agent attach:
+ *     hook jvm.dll!JVM_EnqueueOperation — arg0 (rdx) is the agent
+ *     library path as UTF-8. attach() uses CreateRemoteThread to
+ *     reach this entry, so DisableAttachMechanism can't cover it.
+ *
+ *   Native library load:
+ *     hook ntdll!LdrLoadDll — the bottom of every user-mode DLL
+ *     load path (LoadLibraryW / LoadLibraryExW / kernelbase / JNI
+ *     direct LoadLibrary / etc. all funnel here). The DLL name
+ *     arrives in r8 as a UNICODE_STRING; the trampoline matches it
+ *     against a resident pattern blob in-process (no IPC). On block
+ *     we return STATUS_DLL_NOT_FOUND (0xC0000135) so callers see the
+ *     normal "DLL not found" error path, not a crash.
+ *
+ *   Process creation:
+ *     hook ntdll!NtCreateUserProcess — same in-process matching
+ *     against the wide image path. Block returns STATUS_ACCESS_DENIED.
+ *
+ *   All three trampolines own a resident mode + pattern blob refreshed
+ *   in place by the install path on each filter update — fully
+ *   self-contained, no per-call IPC.
+ * ============================================================ */
 
 namespace {
     /* Definitions for the forward-declared globals above. */
@@ -839,9 +842,9 @@ static bool writeRemoteCode(HANDLE proc, uint64_t addr, const void* buf, size_t 
     return ok;
 }
 
-// Resolve a jvm.dll export in the target process. Fast path uses a local
-// DONT_RESOLVE_DLL_REFERENCES load + RVA translation; falls back to the
-// existing parsePEExport() which walks the remote PE export table.
+/* Resolve a jvm.dll export in the target process. Fast path uses a local
+ * DONT_RESOLVE_DLL_REFERENCES load + RVA translation; falls back to the
+ * existing parsePEExport() which walks the remote PE export table. */
 static uint64_t resolveJvmExport(HANDLE proc, const char* name) {
     HMODULE localJvm = LoadLibraryExA("jvm.dll", NULL, DONT_RESOLVE_DLL_REFERENCES);
     if (localJvm) {
@@ -860,8 +863,8 @@ static uint64_t resolveJvmExport(HANDLE proc, const char* name) {
     return 0;
 }
 
-// Find free region within 2GB of `near` big enough for `size`.
-// A Windows E9 rel32 requires the trampoline to be reachable from the patch site.
+/* Find free region within 2GB of `near` big enough for `size`.
+ * A Windows E9 rel32 requires the trampoline to be reachable from the patch site. */
 static uint64_t findFreeRegionNear(HANDLE proc, uint64_t anchor, size_t size) {
     const uint64_t MAX_DELTA = (1ULL << 31) - (1ULL << 21); // a bit under 2GB to leave slack
     const uint64_t GRANULARITY = 0x10000ULL;                // 64KB
@@ -918,12 +921,12 @@ struct TrampAsm {
 
     // jmp rel32
     void jmp(const std::string& t) { code.push_back(0xE9); fixup32(t); }
-    // jcc rel32; cc is the two-byte opcode's second byte (0x84=JE, 0x85=JNE,
-    // 0x82=JB, 0x86=JBE, 0x87=JA, ...)
+    /* jcc rel32; cc is the two-byte opcode's second byte (0x84=JE, 0x85=JNE,
+     * 0x82=JB, 0x86=JBE, 0x87=JA, ...) */
     void jcc(uint8_t cc, const std::string& t) { code.push_back(0x0F); code.push_back(cc); fixup32(t); }
 
-    // RIP-relative disp32 to a fixed page offset; emit the opcode/ModRM bytes
-    // first, then call this to append the 4 disp bytes.
+    /* RIP-relative disp32 to a fixed page offset; emit the opcode/ModRM bytes
+     * first, then call this to append the 4 disp bytes. */
     void ripDisp(size_t slot) {
         size_t at = code.size();
         int64_t disp = static_cast<int64_t>(slot) - static_cast<int64_t>(at + 4);
@@ -1062,22 +1065,22 @@ static void emitSubstringMatcher(TrampAsm& a, bool wide) {
     a.jmp("allow");
 }
 
-// Serialize a filter (mode + patterns) into the trampoline data page at 0x310:
-//   [count:1] then per pattern [len:1][lowercased '\'→'/' normalized bytes].
-// "*" → len 0 (match-all). Patterns with internal '*'/'?' are unsupported by the
-// in-process substring matcher and are skipped (logged). buf must be >= 0x400.
+/* Serialize a filter (mode + patterns) into the trampoline data page at 0x310:
+ *   [count:1] then per pattern [len:1][lowercased '\'→'/' normalized bytes].
+ * "*" → len 0 (match-all). Patterns with internal '*'/'?' are unsupported by the
+ * in-process substring matcher and are skipped (logged). buf must be >= 0x400. */
 static void serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
                                 const std::vector<std::string>& patterns);
 
-// Java-agent filter trampoline (JVM_EnqueueOperation). In-process pattern match
-// on the narrow (char*) path argument — no pipe/IPC. Data layout:
-//   +0x300  qword  abs jump target (origPlus5)
-//   +0x308  byte   mode (0=None/block all, 1=Blacklist, 2=Whitelist)
-//   +0x310  pattern blob ([count:1] then per pattern [len:1][lowercased bytes])
-//
-// Entry saves rcx/rdx/r8/r9, allows when the path pointer is null, else measures
-// the string (capped 900) and runs emitSubstringMatcher. Block returns -1 (see
-// note at the _block label). `pathInRdx` picks rdx (EnqueueOperation arg) vs rcx.
+/* Java-agent filter trampoline (JVM_EnqueueOperation). In-process pattern match
+ * on the narrow (char*) path argument — no pipe/IPC. Data layout:
+ *   +0x300  qword  abs jump target (origPlus5)
+ *   +0x308  byte   mode (0=None/block all, 1=Blacklist, 2=Whitelist)
+ *   +0x310  pattern blob ([count:1] then per pattern [len:1][lowercased bytes])
+ *
+ * Entry saves rcx/rdx/r8/r9, allows when the path pointer is null, else measures
+ * the string (capped 900) and runs emitSubstringMatcher. Block returns -1 (see
+ * note at the _block label). `pathInRdx` picks rdx (EnqueueOperation arg) vs rcx. */
 static std::vector<uint8_t> buildFilterTrampoline(const uint8_t* savedPrologue,
                                                   uint64_t origPlus5,
                                                   int mode,
@@ -1161,10 +1164,10 @@ static std::vector<uint8_t> buildFilterTrampoline(const uint8_t* savedPrologue,
     return buf;
 }
 
-// Core install routine shared by ban_java_agent and ban_native_load.
-// Looks up `exportName` in jvm.dll, saves the first 5 bytes, allocates
-// a nearby trampoline page, writes the trampoline image, and redirects
-// the export's prologue via E9 rel32. On any failure, frees the page.
+/* Core install routine shared by ban_java_agent and ban_native_load.
+ * Looks up `exportName` in jvm.dll, saves the first 5 bytes, allocates
+ * a nearby trampoline page, writes the trampoline image, and redirects
+ * the export's prologue via E9 rel32. On any failure, frees the page. */
 static int installFilterTrampoline(PatchState& state,
                                     const char* exportName,
                                     bool pathInRdx,
@@ -1350,15 +1353,15 @@ static int uninstallFilterTrampoline(PatchState& state, const char* logTag) {
     return 1;
 }
 
-// ============================================================
-// ntdll!LdrLoadDll hook — native library load filter (deeper sink)
-//
-// LdrLoadDll is the bottom of every user-mode DLL load path. All of
-// LoadLibraryA/W, LoadLibraryExA/W, kernelbase internals and JNI code
-// that calls LoadLibrary directly funnel here. Hooking jvm.dll's
-// JVM_LoadLibrary (our earlier approach) only caught System.load /
-// Runtime.load; it missed any DLL that JNI / malware loaded directly.
-// ============================================================
+/* ============================================================
+ * ntdll!LdrLoadDll hook — native library load filter (deeper sink)
+ *
+ * LdrLoadDll is the bottom of every user-mode DLL load path. All of
+ * LoadLibraryA/W, LoadLibraryExA/W, kernelbase internals and JNI code
+ * that calls LoadLibrary directly funnel here. Hooking jvm.dll's
+ * JVM_LoadLibrary (our earlier approach) only caught System.load /
+ * Runtime.load; it missed any DLL that JNI / malware loaded directly.
+ * ============================================================ */
 
 static uint64_t resolveNtdllExport(HANDLE proc, const char* exportName) {
     uint64_t base = 0, size = 0;
@@ -1382,39 +1385,22 @@ static uint64_t resolveNtdllExport(HANDLE proc, const char* exportName) {
     return 0;
 }
 
-// LdrLoadDll x64 signature:
-//   NTSTATUS NTAPI LdrLoadDll(PWSTR SearchPath,         // rcx  (may be NULL)
-//                             PULONG DllCharacteristics,// rdx
-//                             PUNICODE_STRING DllName,  // r8   ← the name
-//                             PHANDLE DllHandle);       // r9
-// UNICODE_STRING: { USHORT Length (+0); USHORT MaxLength (+2); PWSTR Buffer (+8); }
-//
-// Data layout (matches buildFilterTrampoline where possible; adds a
-// WideCharToMultiByte slot so the wchar name can be converted in-place):
-//   +0x300  fn_CreateFileA
-//   +0x308  fn_WriteFile
-//   +0x310  fn_ReadFile
-//   +0x318  fn_CloseHandle
-//   +0x320  abs_orig_plus_5
-//   +0x328  fn_WideCharToMultiByte
-//   +0x330  kind_byte ('N')
-//   +0x340  pipe_name (NUL-terminated, <=127 bytes)
-//
-// Stack frame after `sub rsp, 0x478`:
-//   +0x20..0x3F   shadow space + extra args for API calls
-//   +0x40         kind byte (copied from data at 0x330)
-//   +0x41..0x3F0  UTF-8 path buffer (WideCharToMultiByte output); we
-//                 cap at 400 wide chars in, 800 bytes out
-//   +0x440        saved pipe HANDLE
-//   +0x448        WriteFile bytes-written (DWORD)
-//   +0x44C        ReadFile bytes-read (DWORD)
-//   +0x450        reply byte
-//   +0x458..0x470 saved rcx/rdx/r8/r9
-//
-// Control flow: if the UNICODE_STRING or its Buffer is NULL, or if
-// WideCharToMultiByte fails, we fall through to _allow_direct (fail-open).
-// On pipe '0' reply we branch to _block and return STATUS_DLL_NOT_FOUND
-// (0xC0000135); the loader maps that to a normal "DLL not found" error.
+/* LdrLoadDll x64 signature:
+ *   NTSTATUS NTAPI LdrLoadDll(PWSTR SearchPath,          // rcx  (may be NULL)
+ *                             PULONG DllCharacteristics, // rdx
+ *                             PUNICODE_STRING DllName,   // r8   ← the name
+ *                             PHANDLE DllHandle);        // r9
+ * UNICODE_STRING: { USHORT Length (+0); USHORT MaxLength (+2); PWSTR Buffer (+8); }
+ *
+ * Trampoline data layout (in-process matcher, no IPC):
+ *   +0x300  qword  abs jump target (origPlus5 or chain head)
+ *   +0x308  byte   mode (0=None/block all, 1=Blacklist, 2=Whitelist)
+ *   +0x310  pattern blob ([count:1] then per pattern [len:1][lowercased bytes])
+ *
+ * Control flow: a null UNICODE_STRING or Buffer falls through to allow.
+ * Otherwise the wide name is matched directly against the resident pattern
+ * blob via emitSubstringMatcher. On block we return STATUS_DLL_NOT_FOUND
+ * (0xC0000135) so the loader maps it to a normal "DLL not found" error. */
 /* replaySavedPrologue: true for a clean prologue — the trampoline replays the
  * original first 5 bytes then jumps to origPlus5 (= addr+5). false when chaining
  * onto a pre-existing inline hook: the saved prologue is itself a 5-byte rel jmp
@@ -1866,9 +1852,9 @@ extern "C" __declspec(dllexport) int forgevm_unban_java_agent() {
     return uninstallFilterTrampoline(g_javaAgentPatch, "unban_java_agent");
 }
 
-// mode: 0=None(block all), 1=Blacklist, 2=Whitelist. patternsLF: patterns
-// joined by '\n' (may be empty/NULL). Decisions are made in-process by the
-// trampoline against this resident pattern set — no per-load IPC.
+/* mode: 0=None(block all), 1=Blacklist, 2=Whitelist. patternsLF: patterns
+ * joined by '\n' (may be empty/NULL). Decisions are made in-process by the
+ * trampoline against this resident pattern set — no per-load IPC. */
 extern "C" __declspec(dllexport) int forgevm_ban_native_load(int mode, const char* patternsLF) {
     return installLdrLoadDllFilter(g_nativeLoadPatch, mode, splitPatternsLF(patternsLF));
 }
@@ -1877,40 +1863,35 @@ extern "C" __declspec(dllexport) int forgevm_unban_native_load() {
     return uninstallFilterTrampoline(g_nativeLoadPatch, "unban_native_load");
 }
 
-// ============================================================
-// ntdll!NtCreateUserProcess hook — process creation filter
-//
-// NtCreateUserProcess is the single kernel-mode entry point for all
-// user-mode process creation: CreateProcessW, ProcessBuilder,
-// and any native code calling CreateProcess* directly all funnel here.
-//
-// NtCreateUserProcess x64 signature (11 parameters):
-//   NTSTATUS NTAPI NtCreateUserProcess(
-//       PHANDLE  ProcessHandle,               // rcx
-//       PHANDLE  ThreadHandle,                // rdx
-//       ACCESS_MASK ProcessDesiredAccess,     // r8
-//       ACCESS_MASK ThreadDesiredAccess,      // r9
-//       POBJECT_ATTRIBUTES ProcessObjAttrs,  // [rsp+0x28]  ← image path here
-//       POBJECT_ATTRIBUTES ThreadObjAttrs,   // [rsp+0x30]
-//       ULONG    ProcessFlags,               // [rsp+0x38]
-//       ULONG    ThreadFlags,                // [rsp+0x40]
-//       PRTL_USER_PROCESS_PARAMETERS Params, // [rsp+0x48]
-//       PPS_CREATE_INFO CreateInfo,          // [rsp+0x50]
-//       PPS_ATTRIBUTE_LIST AttrList);        // [rsp+0x58]
-//
-// Image path: ProcessObjAttrs->ObjectName (UNICODE_STRING* at OA+0x10).
-// The NT path may carry a \??\ prefix; glob matching on the full path
-// (including prefix) still works with patterns like *processproxy*.
-// Block return: STATUS_ACCESS_DENIED (0xC0000005).
-//
-// In-process match on the wide image path (no pipe). Data layout:
-//   +0x300  qword  abs jump target (origPlus5)
-//   +0x308  byte   mode (0=None/block all, 1=Blacklist, 2=Whitelist)
-//   +0x310  pattern blob
-// Frame is `sub rsp, 0x4A8` (larger than 0x478) so the 5th stack arg,
-// ProcessObjAttrs, sits at [rsp+0x4D0] = [caller_rsp+0x28]. Block returns
-// STATUS_ACCESS_DENIED (0xC0000005).
-// ============================================================
+/* ============================================================
+ * ntdll!NtCreateUserProcess hook — process creation filter
+ *
+ * NtCreateUserProcess is the single kernel-mode entry point for all user-mode
+ * process creation: CreateProcessW, ProcessBuilder, and any native code calling
+ * CreateProcess* directly all funnel here.
+ *
+ * NtCreateUserProcess x64 signature (11 parameters):
+ *   NTSTATUS NTAPI NtCreateUserProcess(
+ *       PHANDLE  ProcessHandle,              // rcx
+ *       PHANDLE  ThreadHandle,               // rdx
+ *       ACCESS_MASK ProcessDesiredAccess,    // r8
+ *       ACCESS_MASK ThreadDesiredAccess,     // r9
+ *       POBJECT_ATTRIBUTES ProcessObjAttrs,  // [rsp+0x28]  ← image path here
+ *       POBJECT_ATTRIBUTES ThreadObjAttrs,   // [rsp+0x30]
+ *       ULONG    ProcessFlags,               // [rsp+0x38]
+ *       ULONG    ThreadFlags,                // [rsp+0x40]
+ *       PRTL_USER_PROCESS_PARAMETERS Params, // [rsp+0x48]
+ *       PPS_CREATE_INFO CreateInfo,          // [rsp+0x50]
+ *       PPS_ATTRIBUTE_LIST AttrList);        // [rsp+0x58]
+ *
+ * Image path: ProcessObjAttrs->ObjectName (UNICODE_STRING* at OA+0x10). The NT
+ * path may carry a \??\ prefix; substring matching on the full path still works
+ * with patterns like *processproxy*. In-process match against the resident
+ * pattern blob (no IPC). Data layout matches the LdrLoadDll trampoline. Frame
+ * is `sub rsp, 0x4A8` (larger than 0x478) so the 5th stack arg,
+ * ProcessObjAttrs, sits at [rsp+0x4D0] = [caller_rsp+0x28]. Block returns
+ * STATUS_ACCESS_DENIED (0xC0000005).
+ * ============================================================ */
 static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
     const uint8_t* savedPrologue,
     uint64_t origPlus5,

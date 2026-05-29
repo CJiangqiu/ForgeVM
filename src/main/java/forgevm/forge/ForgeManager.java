@@ -79,6 +79,16 @@ public final class ForgeManager {
         }
         if (prepared.isEmpty()) return 0;
 
+        /* The agent connection is per-classloader state. Under dual-loading, the
+         * classloader that registers ingots (late, when target classes are
+         * linked) is often not the one that first launched. Since the agent is a
+         * single shared process reachable via the JVM-global handoff pipe, just
+         * launch() here too: in a relaunched JVM that connects to the existing
+         * agent (no new process), giving this classloader its own command
+         * channel. */
+        if (!ForgeVM.isAgentActive()) {
+            ForgeVM.launch();
+        }
         if (!ForgeVM.isAgentActive()) {
             FvmLog.error("FORGE result: FAILED | reason: agent not active");
             return 0;
@@ -145,9 +155,9 @@ public final class ForgeManager {
         String targetClass = entry.ingot().targetClass();
         boolean includeSubclasses = entry.ingot().includeSubclasses();
 
-        // Native restoreClassPlan reverts the entire InstanceKlass plan (all hooks on the class).
-        // With includeSubclasses=true, the Native side also reverts plans for every loaded subclass.
-        // Collect survivors -- ingots whose patches were erased and must be re-applied.
+        /* Native restoreClassPlan reverts the entire InstanceKlass plan (all hooks on the class).
+         * With includeSubclasses=true, the Native side also reverts plans for every loaded subclass.
+         * Collect survivors -- ingots whose patches were erased and must be re-applied. */
         List<LoadedIngot> survivors = new ArrayList<>();
         for (LoadedIngot li : loaded.values()) {
             if (li.key().equals(key)) continue;
@@ -203,11 +213,11 @@ public final class ForgeManager {
         return loaded.size();
     }
 
-    // ============================================================
-    // Legacy fallback path (per-ingot forge_load / forge_unload).
-    // Active only when Native side has not yet been updated to support
-    // forge_batch_plan / forge_class_unload (returns "unknown_command").
-    // ============================================================
+    /* ============================================================
+     * Legacy fallback path (per-ingot forge_load / forge_unload).
+     * Active only when Native side has not yet been updated to support
+     * forge_batch_plan / forge_class_unload (returns "unknown_command").
+     * ============================================================ */
 
     private int legacyLoadLoop(List<PreparedIngot> prepared) {
         int succeeded = 0;
@@ -268,9 +278,9 @@ public final class ForgeManager {
         }
     }
 
-    // ============================================================
-    // IPC builders
-    // ============================================================
+    /* ============================================================
+     * IPC builders
+     * ============================================================ */
 
     private String buildBatchPlanCommand(List<PreparedIngot> prepared) {
         StringBuilder sb = new StringBuilder();
@@ -361,9 +371,9 @@ public final class ForgeManager {
         return false;
     }
 
-    // ============================================================
-    // Response parsing
-    // ============================================================
+    /* ============================================================
+     * Response parsing
+     * ============================================================ */
 
     /**
      * Parse the per-ingot results array out of a batch_plan response and
@@ -471,9 +481,9 @@ public final class ForgeManager {
                 || reason.contains("not_exported");
     }
 
-    // ============================================================
-    // Helpers
-    // ============================================================
+    /* ============================================================
+     * Helpers
+     * ============================================================ */
 
     private static String ingotKey(FvmIngot ingot) {
         return ingot.getClass().getName();
