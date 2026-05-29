@@ -6,6 +6,8 @@
 #include <wbemidl.h>
 /* EnumProcessModulesEx / GetModuleBaseNameW for relaunch post-resume watcher. Link Psapi.lib. */
 #include <psapi.h>
+/* Toolhelp thread enumeration for the optional [JVM] health poller. */
+#include <tlhelp32.h>
 
 #include <iostream>
 #include <sstream>
@@ -48,19 +50,47 @@ static void agentLogInit(const std::string& logDir) {
     }
 }
 
+/* ============================================================
+ * Live status window plumbing (optional, gated at startup)
+ *
+ * One scrolling feed mixing two prefixed streams in arrival order:
+ *   [FVM] — agent activity, teed here from every AGENT_LOG call
+ *   [JVM] — target JVM health, sampled cross-process by the poller thread
+ * Lines flow through this mutex-guarded queue; the UI thread drains it. Both
+ * the poller and the UI live on their own threads and never touch the command
+ * loop. windowPublish is a no-op until the window is enabled at startup. */
+static std::atomic<bool>        g_windowEnabled{false};
+static std::atomic<bool>        g_jvmDiedPostMortem{false};  // target died; window kept for review
+static std::mutex               g_windowQueueMutex;
+static std::vector<std::string> g_windowQueue;
+
+static void windowPublish(const std::string& line) {
+    if (!g_windowEnabled.load()) return;
+    std::lock_guard<std::mutex> g(g_windowQueueMutex);
+    g_windowQueue.push_back(line);
+}
+
 static void agentLog(const char* fmt, ...) {
-    if (!g_agentLog) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
-    fprintf(g_agentLog, "%04d-%02d-%02d %02d:%02d:%02d.%03d | ",
-            st.wYear, st.wMonth, st.wDay,
-            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+    char body[2048];
     va_list args;
     va_start(args, fmt);
-    vfprintf(g_agentLog, fmt, args);
+    _vsnprintf_s(body, sizeof(body), _TRUNCATE, fmt, args);
     va_end(args);
-    fprintf(g_agentLog, "\n");
-    fflush(g_agentLog);
+
+    if (g_agentLog) {
+        fprintf(g_agentLog, "%04d-%02d-%02d %02d:%02d:%02d.%03d | %s\n",
+                st.wYear, st.wMonth, st.wDay,
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, body);
+        fflush(g_agentLog);
+    }
+    if (g_windowEnabled.load()) {
+        char ts[16];
+        sprintf_s(ts, sizeof(ts), "%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+        windowPublish(std::string(ts) + " [FVM] " + body);
+    }
 }
 
 #define AGENT_LOG(fmt, ...) agentLog(fmt, ##__VA_ARGS__)
@@ -254,7 +284,17 @@ DWORD WINAPI parentWatchdogThread(LPVOID) {
             lastPid = 0;
             continue;
         }
-        /* Truly orphaned — exit. */
+        /* Truly orphaned. Normally we exit so no zombie agent lingers. But when
+         * the status window is up, the JVM's death is exactly what the operator
+         * wants to inspect — exiting would close the window before it can be
+         * read. So keep the agent (and window) alive for post-mortem; the
+         * operator closes the window to quit (statusWndProc handles WM_CLOSE). */
+        if (g_windowEnabled.load()) {
+            windowPublish("[JVM] \xE2\x9A\xA0 target JVM (pid " + std::to_string(lastPid) +
+                          ") exited/crashed — agent kept alive for review, close window to quit");
+            g_jvmDiedPostMortem.store(true);
+            return 0;   /* stop watching; UI thread keeps the process alive */
+        }
         ExitProcess(0);
     }
     return 0;
@@ -2453,6 +2493,230 @@ static void runCommandPipeServer(HANDLE firstPipe) {
     }
 }
 
+/* ============================================================
+ * Live status window: UI thread + JVM health poller
+ * ============================================================ */
+
+static HWND g_statusEdit = NULL;
+static const size_t kStatusTextCap = 200000;   // trim the edit buffer past this
+
+static void statusAppend(const std::string& line) {
+    if (g_statusEdit == NULL) return;
+    int len = GetWindowTextLengthA(g_statusEdit);
+    if (len > (int)kStatusTextCap) {
+        /* Drop the oldest ~25% so the control never grows unbounded. */
+        SendMessageA(g_statusEdit, EM_SETSEL, 0, kStatusTextCap / 4);
+        SendMessageA(g_statusEdit, EM_REPLACESEL, FALSE, (LPARAM)"");
+        len = GetWindowTextLengthA(g_statusEdit);
+    }
+    std::string out = line;
+    out += "\r\n";
+    SendMessageA(g_statusEdit, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    SendMessageA(g_statusEdit, EM_REPLACESEL, FALSE, (LPARAM)out.c_str());
+    SendMessageA(g_statusEdit, EM_SCROLLCARET, 0, 0);
+}
+
+static LRESULT CALLBACK statusWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE:
+            if (g_statusEdit) MoveWindow(g_statusEdit, 0, 0, LOWORD(lp), HIWORD(lp), TRUE);
+            return 0;
+        case WM_TIMER: {
+            std::vector<std::string> batch;
+            {
+                std::lock_guard<std::mutex> g(g_windowQueueMutex);
+                batch.swap(g_windowQueue);
+            }
+            for (const auto& l : batch) statusAppend(l);
+            return 0;
+        }
+        case WM_CLOSE:
+            /* While the JVM is alive the agent is still serving it — closing the
+             * X must NOT kill the agent, so just hide. But once the JVM has died
+             * and we're only keeping the window for post-mortem review, closing
+             * it is the operator's "I'm done" → quit the agent. */
+            if (g_jvmDiedPostMortem.load()) {
+                ExitProcess(0);
+            }
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        case WM_DESTROY:
+            g_statusEdit = NULL;
+            return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static DWORD WINAPI statusWindowThread(LPVOID) {
+    HINSTANCE inst = GetModuleHandleA(NULL);
+    WNDCLASSA wc = {};
+    wc.lpfnWndProc   = statusWndProc;
+    wc.hInstance     = inst;
+    wc.lpszClassName = "ForgeVMStatusWnd";
+    wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    if (!RegisterClassA(&wc)) return 0;
+
+    HWND hwnd = CreateWindowExA(
+        0, "ForgeVMStatusWnd", "ForgeVM — live status",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 760, 480,
+        NULL, NULL, inst, NULL);
+    if (hwnd == NULL) return 0;
+
+    g_statusEdit = CreateWindowExA(
+        0, "EDIT", "",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+        0, 0, 760, 480, hwnd, NULL, inst, NULL);
+    if (g_statusEdit) {
+        HFONT mono = (HFONT)GetStockObject(ANSI_FIXED_FONT);
+        SendMessageA(g_statusEdit, WM_SETFONT, (WPARAM)mono, TRUE);
+    }
+
+    /* Drain the queue ~10x/sec — cheap, keeps the feed live without busy-wait. */
+    SetTimer(hwnd, 1, 100, NULL);
+
+    MSG msg;
+    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    return 0;
+}
+
+/* Sum a thread's kernel+user CPU as 100ns ticks; 0 if unreadable. */
+static ULONGLONG threadCpu100ns(DWORD tid) {
+    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (h == NULL) return 0;
+    FILETIME c{}, e{}, k{}, u{};
+    ULONGLONG total = 0;
+    if (GetThreadTimes(h, &c, &e, &k, &u)) {
+        ULARGE_INTEGER ku{}, uu{};
+        ku.LowPart = k.dwLowDateTime; ku.HighPart = k.dwHighDateTime;
+        uu.LowPart = u.dwLowDateTime; uu.HighPart = u.dwHighDateTime;
+        total = ku.QuadPart + uu.QuadPart;
+    }
+    CloseHandle(h);
+    return total;
+}
+
+/* Best-effort OS thread name (JDK 17 sets these via SetThreadDescription on
+ * Windows, so the busiest thread often shows as e.g. "Render thread"). */
+static std::string threadName(DWORD tid) {
+    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (h == NULL) return std::string();
+    PWSTR desc = NULL;
+    std::string name;
+    if (SUCCEEDED(GetThreadDescription(h, &desc)) && desc != NULL) {
+        if (desc[0] != L'\0') name = wideToUtf8(desc);
+        LocalFree(desc);
+    }
+    CloseHandle(h);
+    return name;
+}
+
+static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
+    const DWORD intervalMs = 1500;
+    std::unordered_map<DWORD, ULONGLONG> prevCpu;
+    DWORD trackedPid = 0;
+    int spinTicks = 0, stallTicks = 0;
+    bool spinWarned = false, stallWarned = false;
+
+    for (;;) {
+        Sleep(intervalMs);
+        /* Once the target has died and we're only keeping the window for review,
+         * stop sampling — no point, and it would spam "not found" each tick. */
+        if (g_jvmDiedPostMortem.load()) continue;
+        DWORD pid = g_parentPid.load();
+        if (pid == 0) { prevCpu.clear(); trackedPid = 0; continue; }
+        if (pid != trackedPid) {
+            prevCpu.clear();
+            trackedPid = pid;
+            spinTicks = stallTicks = 0;
+            spinWarned = stallWarned = false;
+            windowPublish("[JVM] tracking target pid=" + std::to_string(pid));
+        }
+
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) continue;
+
+        THREADENTRY32 te = {}; te.dwSize = sizeof(te);
+        int threadCount = 0;
+        ULONGLONG totalDelta = 0;
+        DWORD hotTid = 0;
+        ULONGLONG hotDelta = 0;
+        std::unordered_map<DWORD, ULONGLONG> curCpu;
+
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID != pid) continue;
+                threadCount++;
+                ULONGLONG cpu = threadCpu100ns(te.th32ThreadID);
+                curCpu[te.th32ThreadID] = cpu;
+                auto it = prevCpu.find(te.th32ThreadID);
+                if (it != prevCpu.end() && cpu >= it->second) {
+                    ULONGLONG d = cpu - it->second;
+                    totalDelta += d;
+                    if (d > hotDelta) { hotDelta = d; hotTid = te.th32ThreadID; }
+                }
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+        prevCpu.swap(curCpu);
+
+        if (threadCount == 0) {
+            windowPublish("[JVM] target pid=" + std::to_string(pid) + " not found (exited?)");
+            continue;
+        }
+
+        /* 100ns ticks → ms; one core fully busy over the interval = intervalMs ms. */
+        ULONGLONG totalMs = totalDelta / 10000ULL;
+        ULONGLONG hotMs   = hotDelta / 10000ULL;
+        int hotPctOfCore  = (int)((hotMs * 100) / intervalMs);
+        int totalPctOfCore = (int)((totalMs * 100) / intervalMs);
+
+        std::string hot;
+        if (hotTid != 0 && hotMs > 0) {
+            std::string nm = threadName(hotTid);
+            hot = " | hot:" + (nm.empty() ? ("tid" + std::to_string(hotTid)) : ("\"" + nm + "\""))
+                + " " + std::to_string(hotPctOfCore) + "%core";
+        }
+
+        std::string line = "[JVM] alive | " + std::to_string(threadCount) + " thr | cpu "
+                         + std::to_string(totalPctOfCore) + "%core" + hot;
+
+        /* Spin: one thread pinned near a full core for several intervals. */
+        if (hotPctOfCore >= 80) {
+            if (++spinTicks >= 3 && !spinWarned) {
+                std::string nm = threadName(hotTid);
+                windowPublish("[JVM] ⚠ spin: " +
+                    (nm.empty() ? ("tid" + std::to_string(hotTid)) : ("\"" + nm + "\"")) +
+                    " pinned ~1 core for " + std::to_string(spinTicks * intervalMs / 1000) + "s");
+                spinWarned = true;
+            }
+        } else { spinTicks = 0; spinWarned = false; }
+
+        /* Stall: process alive but essentially no CPU anywhere — possible deadlock. */
+        if (totalPctOfCore <= 1) {
+            if (++stallTicks >= 4 && !stallWarned) {
+                windowPublish("[JVM] ⚠ stall: no CPU activity for " +
+                    std::to_string(stallTicks * intervalMs / 1000) + "s — possible deadlock");
+                stallWarned = true;
+            }
+        } else { stallTicks = 0; stallWarned = false; }
+
+        windowPublish(line);
+    }
+    return 0;
+}
+
+static void startStatusWindow() {
+    g_windowEnabled.store(true);
+    CreateThread(NULL, 0, statusWindowThread, NULL, 0, NULL);
+    CreateThread(NULL, 0, jvmHealthPollerThread, NULL, 0, NULL);
+    AGENT_LOG("status window enabled");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2489,6 +2753,13 @@ int main(int argc, char** argv) {
     agentLogInit(logDir);
     AGENT_LOG("agent starting: dll=%s, serve=%d, logdir=%s",
               dllPath.c_str(), (int)serve, logDir.c_str());
+
+    /* Optional live status window: enabled by the --window flag (passed by Java
+     * when the forgevm.window system property is set) or the FORGEVM_WINDOW
+     * environment variable. Debug/diagnostic only — off by default. */
+    bool wantWindow = hasFlag("--window", argc, argv)
+                   || GetEnvironmentVariableA("FORGEVM_WINDOW", NULL, 0) > 0;
+    if (wantWindow) startStatusWindow();
 
     if (!loadNativeApi(dllPathWide, dllPath, &api, &loadReason)) {
         AGENT_LOG("loadNativeApi FAILED: %s", loadReason.c_str());
@@ -2556,6 +2827,16 @@ int main(int argc, char** argv) {
         } else {
             AGENT_LOG("main: handoff accept failed — exiting");
         }
+    }
+
+    /* If the status window is up, the JVM has just gone (stdin EOF) without a
+     * relaunch handoff — keep the agent alive so the window stays readable for
+     * post-mortem. The operator closes the window to quit (WM_CLOSE → ExitProcess
+     * once g_jvmDiedPostMortem is set by the watchdog). */
+    if (g_windowEnabled.load()) {
+        g_jvmDiedPostMortem.store(true);
+        windowPublish("[JVM] command stream ended — window kept open for review, close window to quit");
+        for (;;) Sleep(1000);
     }
 
     if (api.module != NULL) FreeLibrary(api.module);

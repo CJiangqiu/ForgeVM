@@ -24,6 +24,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.StringJoiner;
@@ -85,9 +86,27 @@ public final class ForgeVM {
     private ForgeVM() {
     }
 
+    /** Whether the next gen0 agent spawn should open the live status window.
+     *  Set by {@link #launch(boolean)}; gen1+ inherit the window via the
+     *  persistent agent (handoff), so it only matters at the first launch. */
+    private static volatile boolean statusWindowRequested = false;
+
     // -- launch --
 
-    public static synchronized LaunchResult launch() {
+    /** Launch ForgeVM without the status window (equivalent to {@code launch(false)}). */
+    public static LaunchResult launch() {
+        return launch(false);
+    }
+
+    /**
+     * Launch ForgeVM, optionally opening the agent's live status window — a
+     * separate-process window streaming [FVM] agent activity and [JVM] target
+     * health (thread/CPU sampling, spin/deadlock warnings) in real time. The
+     * window lives in the persistent agent and survives relaunch automatically.
+     */
+    public static synchronized LaunchResult launch(boolean withStatusWindow) {
+        statusWindowRequested = withStatusWindow;
+
         AgentSession currentSession = agentSession;
         if (currentSession != null && !currentSession.isAlive()) {
             clearAgentExitSender();
@@ -445,12 +464,20 @@ public final class ForgeVM {
             Path logDir = Paths.get("ForgeVM", "logs").toAbsolutePath();
             try { Files.createDirectories(logDir); } catch (Exception ignored) {}
 
-            Process process = startProcessReflectively(List.of(
+            List<String> agentArgs = new ArrayList<>(List.of(
                     agentPath.toAbsolutePath().toString(),
                     "--serve",
                     option(chars('d', 'l', 'l'), dllPath.toAbsolutePath().toString()),
                     "--logdir=" + logDir
             ));
+            /* Optional live status window: requested via launch(true), or the
+             * -Dforgevm.window property as an external fallback. Enabled on the
+             * persistent (gen0) agent; later JVM generations reach it via
+             * handoff, so the flag belongs only on this fresh-spawn path. */
+            if (statusWindowRequested || System.getProperty("forgevm.window") != null) {
+                agentArgs.add("--window");
+            }
+            Process process = startProcessReflectively(agentArgs);
 
             AgentSession session = new AgentSession(
                     process,
