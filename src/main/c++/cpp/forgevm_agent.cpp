@@ -2502,18 +2502,21 @@ static const size_t kStatusTextCap = 200000;   // trim the edit buffer past this
 
 static void statusAppend(const std::string& line) {
     if (g_statusEdit == NULL) return;
-    int len = GetWindowTextLengthA(g_statusEdit);
+    int len = GetWindowTextLengthW(g_statusEdit);
     if (len > (int)kStatusTextCap) {
         /* Drop the oldest ~25% so the control never grows unbounded. */
-        SendMessageA(g_statusEdit, EM_SETSEL, 0, kStatusTextCap / 4);
-        SendMessageA(g_statusEdit, EM_REPLACESEL, FALSE, (LPARAM)"");
-        len = GetWindowTextLengthA(g_statusEdit);
+        SendMessageW(g_statusEdit, EM_SETSEL, 0, kStatusTextCap / 4);
+        SendMessageW(g_statusEdit, EM_REPLACESEL, FALSE, (LPARAM)L"");
+        len = GetWindowTextLengthW(g_statusEdit);
     }
-    std::string out = line;
-    out += "\r\n";
-    SendMessageA(g_statusEdit, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-    SendMessageA(g_statusEdit, EM_REPLACESEL, FALSE, (LPARAM)out.c_str());
-    SendMessageA(g_statusEdit, EM_SCROLLCARET, 0, 0);
+    /* The whole publish pipeline carries UTF-8 (source literals, wideToUtf8'd
+     * thread names, ⚠ glyphs). Feed the EDIT control wide chars so a non-Latin
+     * system codepage can't mangle it. */
+    std::wstring out = toWide(line);
+    out += L"\r\n";
+    SendMessageW(g_statusEdit, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    SendMessageW(g_statusEdit, EM_REPLACESEL, FALSE, (LPARAM)out.c_str());
+    SendMessageW(g_statusEdit, EM_SCROLLCARET, 0, 0);
 }
 
 static LRESULT CALLBACK statusWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2544,42 +2547,49 @@ static LRESULT CALLBACK statusWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_statusEdit = NULL;
             return 0;
     }
-    return DefWindowProcA(hwnd, msg, wp, lp);
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 static DWORD WINAPI statusWindowThread(LPVOID) {
-    HINSTANCE inst = GetModuleHandleA(NULL);
-    WNDCLASSA wc = {};
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    WNDCLASSW wc = {};
     wc.lpfnWndProc   = statusWndProc;
     wc.hInstance     = inst;
-    wc.lpszClassName = "ForgeVMStatusWnd";
-    wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+    wc.lpszClassName = L"ForgeVMStatusWnd";
+    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    if (!RegisterClassA(&wc)) return 0;
+    if (!RegisterClassW(&wc)) return 0;
 
-    HWND hwnd = CreateWindowExA(
-        0, "ForgeVMStatusWnd", "ForgeVM — live status",
+    HWND hwnd = CreateWindowExW(
+        0, L"ForgeVMStatusWnd", L"ForgeVM — live status",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 760, 480,
         NULL, NULL, inst, NULL);
     if (hwnd == NULL) return 0;
 
-    g_statusEdit = CreateWindowExA(
-        0, "EDIT", "",
+    g_statusEdit = CreateWindowExW(
+        0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
         0, 0, 760, 480, hwnd, NULL, inst, NULL);
     if (g_statusEdit) {
-        HFONT mono = (HFONT)GetStockObject(ANSI_FIXED_FONT);
-        SendMessageA(g_statusEdit, WM_SETFONT, (WPARAM)mono, TRUE);
+        /* A TrueType monospace face (not the ANSI_FIXED_FONT raster font) so GDI
+         * font-linking can fall back to CJK glyphs for non-Latin content;
+         * DEFAULT_CHARSET keeps that fallback path open. */
+        HFONT mono = CreateFontW(
+            -14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+        if (mono == NULL) mono = (HFONT)GetStockObject(ANSI_FIXED_FONT);
+        SendMessageW(g_statusEdit, WM_SETFONT, (WPARAM)mono, TRUE);
     }
 
     /* Drain the queue ~10x/sec — cheap, keeps the feed live without busy-wait. */
     SetTimer(hwnd, 1, 100, NULL);
 
     MSG msg;
-    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        DispatchMessageW(&msg);
     }
     return 0;
 }

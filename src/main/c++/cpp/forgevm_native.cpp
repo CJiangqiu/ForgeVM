@@ -1065,6 +1065,105 @@ static void emitSubstringMatcher(TrampAsm& a, bool wide) {
     a.jmp("allow");
 }
 
+/* ---- conservative x64 prologue length decoder ----------------------------
+ * A 5-byte E9 patch must not split an instruction, or the trampoline's
+ * prologue replay mis-decodes and crashes (observed on the NtCreateUserProcess
+ * syscall stub). alignedPrologueLen decodes whole instructions from `p` until
+ * the cumulative length reaches `need`, returning that instruction-aligned
+ * length. It only advances over encodings it fully understands (the forms that
+ * appear in real function prologues) and returns 0 on anything unfamiliar, so
+ * callers fall back to the legacy fixed 5-byte copy rather than guess wrong. */
+static size_t modrmBytes(const uint8_t* p, size_t avail) {
+    if (avail < 1) return 0;
+    uint8_t modrm = p[0];
+    uint8_t mod = modrm >> 6;
+    uint8_t rm  = modrm & 7;
+    size_t len = 1;                            // ModRM byte
+    if (mod == 3) return len;                  // register-direct: no SIB/disp
+    bool hasSib = (rm == 4);
+    uint8_t base = 0;
+    if (hasSib) {
+        if (avail < 2) return 0;
+        base = p[1] & 7;
+        len += 1;                              // SIB byte
+    }
+    if (mod == 0) {
+        if (!hasSib && rm == 5) len += 4;          // RIP-relative disp32
+        else if (hasSib && base == 5) len += 4;    // SIB, no base → disp32
+    } else if (mod == 1) {
+        len += 1;                              // disp8
+    } else {                                   // mod == 2
+        len += 4;                              // disp32
+    }
+    return len;
+}
+
+static size_t alignedPrologueLen(const uint8_t* p, size_t avail, size_t need) {
+    size_t i = 0;
+    int guard = 0;
+    while (i < need) {
+        if (++guard > 16) return 0;
+        size_t start = i;
+        uint8_t rex = 0;
+        // prefixes: skip legacy + REX (REX last before opcode). Bail on operand/
+        // address-size overrides — they change immediate/disp widths we don't model.
+        for (;;) {
+            if (i >= avail) return 0;
+            uint8_t b = p[i];
+            if (b == 0x66 || b == 0x67) return 0;
+            if (b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+                b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 ||
+                b == 0x64 || b == 0x65) { i++; continue; }
+            if ((b & 0xF0) == 0x40) { rex = b; i++; continue; }
+            break;
+        }
+        if (i >= avail) return 0;
+        uint8_t op = p[i++];
+        bool rexW = (rex & 0x08) != 0;
+
+        if (op == 0x0F) {                       // two-byte opcode (whitelist)
+            if (i >= avail) return 0;
+            uint8_t op2 = p[i++];
+            if (op2 == 0x1E || op2 == 0x1F ||           // hint-NOP / endbr64
+                op2 == 0xB6 || op2 == 0xB7 ||           // movzx
+                op2 == 0xBE || op2 == 0xBF) {           // movsx
+                size_t m = modrmBytes(p + i, avail - i);
+                if (m == 0) return 0;
+                i += m;
+            } else {
+                return 0;
+            }
+        } else if (op >= 0x50 && op <= 0x5F) {          // push/pop reg
+            // no extra bytes
+        } else if (op >= 0xB8 && op <= 0xBF) {          // mov reg, imm32 / imm64
+            i += rexW ? 8 : 4;
+        } else if (op == 0x88 || op == 0x89 || op == 0x8A || op == 0x8B ||
+                   op == 0x8D ||                        // lea
+                   op == 0x01 || op == 0x03 || op == 0x09 || op == 0x0B ||
+                   op == 0x21 || op == 0x23 || op == 0x29 || op == 0x2B ||
+                   op == 0x31 || op == 0x33 || op == 0x39 || op == 0x3B ||
+                   op == 0x84 || op == 0x85) {          // ModRM, no immediate
+            size_t m = modrmBytes(p + i, avail - i);
+            if (m == 0) return 0;
+            i += m;
+        } else if (op == 0x83 || op == 0xC6) {          // grp1 imm8 / mov r/m8,imm8
+            size_t m = modrmBytes(p + i, avail - i);
+            if (m == 0) return 0;
+            i += m + 1;
+        } else if (op == 0x81 || op == 0xC7) {          // grp1 imm32 / mov r/m,imm32
+            size_t m = modrmBytes(p + i, avail - i);
+            if (m == 0) return 0;
+            i += m + 4;
+        } else if (op == 0x90) {                        // nop
+            // no extra bytes
+        } else {
+            return 0;                           // unknown — caller falls back to 5
+        }
+        if (i > avail || i <= start) return 0;
+    }
+    return i;
+}
+
 /* Serialize a filter (mode + patterns) into the trampoline data page at 0x310:
  *   [count:1] then per pattern [len:1][lowercased '\'→'/' normalized bytes].
  * "*" → len 0 (match-all). Patterns with internal '*'/'?' are unsupported by the
@@ -1074,7 +1173,7 @@ static void serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
 
 /* Java-agent filter trampoline (JVM_EnqueueOperation). In-process pattern match
  * on the narrow (char*) path argument — no pipe/IPC. Data layout:
- *   +0x300  qword  abs jump target (origPlus5)
+ *   +0x300  qword  abs jump target (origPlusN)
  *   +0x308  byte   mode (0=None/block all, 1=Blacklist, 2=Whitelist)
  *   +0x310  pattern blob ([count:1] then per pattern [len:1][lowercased bytes])
  *
@@ -1082,7 +1181,8 @@ static void serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
  * the string (capped 900) and runs emitSubstringMatcher. Block returns -1 (see
  * note at the _block label). `pathInRdx` picks rdx (EnqueueOperation arg) vs rcx. */
 static std::vector<uint8_t> buildFilterTrampoline(const uint8_t* savedPrologue,
-                                                  uint64_t origPlus5,
+                                                  size_t prologueLen,
+                                                  uint64_t origPlusN,
                                                   int mode,
                                                   const std::vector<std::string>& patterns,
                                                   bool pathInRdx) {
@@ -1136,7 +1236,8 @@ static std::vector<uint8_t> buildFilterTrampoline(const uint8_t* savedPrologue,
     a.emit({0x4C, 0x8B, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});  // mov r8, [rsp+0x468]
     a.emit({0x4C, 0x8B, 0x8C, 0x24, 0x70, 0x04, 0x00, 0x00});  // mov r9, [rsp+0x470]
     a.emit({0x48, 0x81, 0xC4, 0x78, 0x04, 0x00, 0x00});        // add rsp, 0x478
-    for (int i = 0; i < 5; i++) code.push_back(savedPrologue[i]);
+    // replay the whole saved prologue (instruction-aligned, may be >5) then jump on
+    for (size_t i = 0; i < prologueLen; i++) code.push_back(savedPrologue[i]);
     a.emit({0xFF, 0x25}); a.ripDisp(SLOT_JMP);  // jmp qword [rip+abs_jump]
 
     /* _block — return -1 (not 0). HotSpot attach protocol: JVM_EnqueueOperation
@@ -1158,7 +1259,7 @@ static std::vector<uint8_t> buildFilterTrampoline(const uint8_t* savedPrologue,
     }
     for (size_t i = 0; i < code.size(); i++) buf[i] = code[i];
 
-    writeU64(buf, SLOT_JMP, origPlus5);
+    writeU64(buf, SLOT_JMP, origPlusN);
     buf[SLOT_MODE] = static_cast<uint8_t>(mode);
     serializeFilterBlob(buf, mode, patterns);
     return buf;
@@ -1203,13 +1304,13 @@ static int installFilterTrampoline(PatchState& state,
     }
     FVM_LOG("%s: %s @ 0x%llX", logTag, exportName, (unsigned long long)addr);
 
-    uint8_t saved5[5] = {};
-    if (!readRemoteMem(proc, addr, saved5, 5)) {
+    uint8_t saved[16] = {};
+    if (!readRemoteMem(proc, addr, saved, sizeof(saved))) {
         setError("read_original_failed");
         return 0;
     }
     FVM_LOG("%s: original prologue: %02X %02X %02X %02X %02X", logTag,
-            saved5[0], saved5[1], saved5[2], saved5[3], saved5[4]);
+            saved[0], saved[1], saved[2], saved[3], saved[4]);
 
     /* MSVC incremental-linking emits each exported function as a 5-byte
      * `JMP rel32` thunk that jumps to the real function body. Modern JDK 17+
@@ -1217,31 +1318,36 @@ static int installFilterTrampoline(PatchState& state,
      * `E9 xx xx xx xx`. Patching the thunk itself would corrupt other code
      * (the byte after E9+4 may be the next thunk's first byte), but we can
      * just follow the jump and hook the real body instead. */
-    for (int hop = 0; hop < 2 && saved5[0] == 0xE9; hop++) {
-        int32_t rel = (int32_t)saved5[1]
-                    | ((int32_t)saved5[2] << 8)
-                    | ((int32_t)saved5[3] << 16)
-                    | ((int32_t)saved5[4] << 24);
+    for (int hop = 0; hop < 2 && saved[0] == 0xE9; hop++) {
+        int32_t rel = (int32_t)saved[1]
+                    | ((int32_t)saved[2] << 8)
+                    | ((int32_t)saved[3] << 16)
+                    | ((int32_t)saved[4] << 24);
         uint64_t realAddr = addr + 5 + (int64_t)rel;
         FVM_LOG("%s: prologue is JMP thunk, following 0x%llX -> 0x%llX",
                 logTag, (unsigned long long)addr, (unsigned long long)realAddr);
-        if (!readRemoteMem(proc, realAddr, saved5, 5)) {
+        if (!readRemoteMem(proc, realAddr, saved, sizeof(saved))) {
             setError("read_real_prologue_failed");
             return 0;
         }
         FVM_LOG("%s: real prologue: %02X %02X %02X %02X %02X", logTag,
-                saved5[0], saved5[1], saved5[2], saved5[3], saved5[4]);
+                saved[0], saved[1], saved[2], saved[3], saved[4]);
         addr = realAddr;
     }
 
     // Refuse dangerous starters (rel jumps/calls we can't safely relocate).
-    uint8_t b0 = saved5[0];
+    uint8_t b0 = saved[0];
     bool dangerous = (b0 == 0xE8) || (b0 == 0xE9) || (b0 == 0xEB) ||
                      (b0 >= 0x70 && b0 <= 0x7F) || (b0 == 0xFF);
     if (dangerous) {
         setError("unsafe_prologue");
         return 0;
     }
+
+    // Copy a whole number of instructions (>=5) so the E9 patch never splits one.
+    size_t prologueLen = alignedPrologueLen(saved, sizeof(saved), 5);
+    if (prologueLen == 0) prologueLen = 5;
+    FVM_LOG("%s: prologue copy length = %zu bytes", logTag, prologueLen);
 
     const size_t kPage = 0x400;
     uint64_t allocHint = findFreeRegionNear(proc, addr, kPage);
@@ -1267,7 +1373,7 @@ static int installFilterTrampoline(PatchState& state,
             (unsigned long long)trampAddr, (long long)delta);
 
     std::vector<uint8_t> image = buildFilterTrampoline(
-        saved5, addr + 5, mode, patterns, pathInRdx);
+        saved, prologueLen, addr + prologueLen, mode, patterns, pathInRdx);
     if (image.empty()) {
         VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
         setError("trampoline_build_failed");
@@ -1280,31 +1386,32 @@ static int installFilterTrampoline(PatchState& state,
     }
     FlushInstructionCache(proc, reinterpret_cast<LPCVOID>(trampAddr), image.size());
 
-    uint8_t patch[5];
+    uint8_t patch[16];
     patch[0] = 0xE9;
     int32_t rel = static_cast<int32_t>(delta);
     patch[1] = static_cast<uint8_t>(rel);
     patch[2] = static_cast<uint8_t>(rel >> 8);
     patch[3] = static_cast<uint8_t>(rel >> 16);
     patch[4] = static_cast<uint8_t>(rel >> 24);
+    for (size_t i = 5; i < prologueLen; i++) patch[i] = 0x90;  // NOP-pad split tail
 
-    if (!writeRemoteCode(proc, addr, patch, sizeof(patch))) {
+    if (!writeRemoteCode(proc, addr, patch, prologueLen)) {
         VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
         setError("write_patch_failed");
         return 0;
     }
 
-    uint8_t verify[5] = {};
-    readRemoteMem(proc, addr, verify, sizeof(verify));
-    if (memcmp(verify, patch, sizeof(patch)) != 0) {
+    uint8_t verify[16] = {};
+    readRemoteMem(proc, addr, verify, prologueLen);
+    if (memcmp(verify, patch, prologueLen) != 0) {
         VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
         setError("verify_failed");
         return 0;
     }
 
     state.targetAddr = addr;
-    state.patchSize = 5;
-    memcpy(state.original, saved5, 5);
+    state.patchSize = prologueLen;
+    memcpy(state.original, saved, prologueLen);
     state.patched = true;
     state.trampolineAddr = trampAddr;
     state.trampolineSize = kPage;
@@ -1393,7 +1500,7 @@ static uint64_t resolveNtdllExport(HANDLE proc, const char* exportName) {
  * UNICODE_STRING: { USHORT Length (+0); USHORT MaxLength (+2); PWSTR Buffer (+8); }
  *
  * Trampoline data layout (in-process matcher, no IPC):
- *   +0x300  qword  abs jump target (origPlus5 or chain head)
+ *   +0x300  qword  abs jump target (origPlusN or chain head)
  *   +0x308  byte   mode (0=None/block all, 1=Blacklist, 2=Whitelist)
  *   +0x310  pattern blob ([count:1] then per pattern [len:1][lowercased bytes])
  *
@@ -1402,15 +1509,17 @@ static uint64_t resolveNtdllExport(HANDLE proc, const char* exportName) {
  * blob via emitSubstringMatcher. On block we return STATUS_DLL_NOT_FOUND
  * (0xC0000135) so the loader maps it to a normal "DLL not found" error. */
 /* replaySavedPrologue: true for a clean prologue — the trampoline replays the
- * original first 5 bytes then jumps to origPlus5 (= addr+5). false when chaining
- * onto a pre-existing inline hook: the saved prologue is itself a 5-byte rel jmp
- * whose rel32 is relative to LdrLoadDll, so replaying it from the trampoline
- * would land at the wrong address. Instead origPlus5 carries the absolute
- * resolved hook target and the 5 prologue bytes are NOP'd, so on allow we jump
- * straight into the prior hook's stub (which replays the genuine original bytes
- * and returns to LdrLoadDll+5 on its own — the chain completes itself). */
+ * original prologueLen bytes (instruction-aligned, >=5) then jumps to origPlusN
+ * (= addr+prologueLen). false when chaining onto a pre-existing inline hook: the
+ * saved prologue is itself a 5-byte rel jmp whose rel32 is relative to
+ * LdrLoadDll, so replaying it from the trampoline would land at the wrong
+ * address. Instead origPlusN carries the absolute resolved hook target and the
+ * prologue bytes are NOP'd, so on allow we jump straight into the prior hook's
+ * stub (which replays the genuine original bytes and returns to LdrLoadDll+5 on
+ * its own — the chain completes itself). */
 static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedPrologue,
-                                                      uint64_t origPlus5,
+                                                      size_t prologueLen,
+                                                      uint64_t origPlusN,
                                                       int mode,
                                                       const std::vector<std::string>& patterns,
                                                       bool replaySavedPrologue) {
@@ -1551,9 +1660,10 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
     a.emit({0x4C, 0x8B, 0x8C, 0x24, 0x70, 0x04, 0x00, 0x00});  // mov r9, [rsp+0x470]
     a.emit({0x48, 0x81, 0xC4, 0x78, 0x04, 0x00, 0x00});        // add rsp, 0x478
     if (replaySavedPrologue) {
-        for (int i = 0; i < 5; i++) code.push_back(savedPrologue[i]);
+        // replay the whole saved prologue (instruction-aligned, may be >5) then jump on
+        for (size_t i = 0; i < prologueLen; i++) code.push_back(savedPrologue[i]);
     } else {
-        for (int i = 0; i < 5; i++) code.push_back(0x90);  // chaining: prior hook replays original
+        for (size_t i = 0; i < prologueLen; i++) code.push_back(0x90);  // chaining: prior hook replays original
     }
     a.emit({0xFF, 0x25}); a.ripDisp(SLOT_JMP);  // jmp qword [rip+abs_jump]
 
@@ -1574,7 +1684,7 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
     }
     for (size_t i = 0; i < code.size(); i++) buf[i] = code[i];
 
-    writeU64(buf, SLOT_JMP, origPlus5);
+    writeU64(buf, SLOT_JMP, origPlusN);
     buf[SLOT_MODE] = static_cast<uint8_t>(mode);
     serializeFilterBlob(buf, mode, patterns);
     return buf;
@@ -1662,13 +1772,13 @@ static int installLdrLoadDllFilter(PatchState& state, int mode,
     }
     FVM_LOG("ban_native_load: ntdll!LdrLoadDll @ 0x%llX", (unsigned long long)addr);
 
-    uint8_t saved5[5] = {};
-    if (!readRemoteMem(proc, addr, saved5, 5)) {
+    uint8_t saved[16] = {};
+    if (!readRemoteMem(proc, addr, saved, sizeof(saved))) {
         setError("read_original_failed");
         return 0;
     }
     FVM_LOG("ban_native_load: original prologue: %02X %02X %02X %02X %02X",
-            saved5[0], saved5[1], saved5[2], saved5[3], saved5[4]);
+            saved[0], saved[1], saved[2], saved[3], saved[4]);
 
     /* When the prologue is already a 5-byte rel jmp (a pre-existing inline hook,
      * e.g. an EDR), we chain onto it rather than refuse: our trampoline jumps to
@@ -1679,7 +1789,7 @@ static int installLdrLoadDllFilter(PatchState& state, int mode,
     bool chaining = false;
     uint64_t origJumpTarget = addr + 5;
 
-    uint8_t b0 = saved5[0];
+    uint8_t b0 = saved[0];
     bool dangerous = (b0 == 0xE8) || (b0 == 0xE9) || (b0 == 0xEB) ||
                      (b0 >= 0x70 && b0 <= 0x7F) || (b0 == 0xFF);
     if (dangerous) {
@@ -1688,10 +1798,10 @@ static int installLdrLoadDllFilter(PatchState& state, int mode,
          * module list of the target process so a suspicious unknown DLL stands
          * out. For the E9 case this also feeds the chain target. */
         if (b0 == 0xE9) {
-            int32_t rel = (int32_t)saved5[1]
-                        | ((int32_t)saved5[2] << 8)
-                        | ((int32_t)saved5[3] << 16)
-                        | ((int32_t)saved5[4] << 24);
+            int32_t rel = (int32_t)saved[1]
+                        | ((int32_t)saved[2] << 8)
+                        | ((int32_t)saved[3] << 16)
+                        | ((int32_t)saved[4] << 24);
             uint64_t target = addr + 5 + (int64_t)rel;
             chaining = true;
             origJumpTarget = target;
@@ -1755,6 +1865,16 @@ static int installLdrLoadDllFilter(PatchState& state, int mode,
         }
     }
 
+    // Clean replay copies a whole number of instructions (>=5) so the E9 patch
+    // never splits one; chaining just NOPs the 5-byte rel-jmp it overwrites.
+    size_t prologueLen = 5;
+    if (!chaining) {
+        prologueLen = alignedPrologueLen(saved, sizeof(saved), 5);
+        if (prologueLen == 0) prologueLen = 5;
+        origJumpTarget = addr + prologueLen;
+    }
+    FVM_LOG("ban_native_load: prologue copy length = %zu bytes", prologueLen);
+
     const size_t kPage = 0x400;
     uint64_t allocHint = findFreeRegionNear(proc, addr, kPage);
     if (allocHint == 0) {
@@ -1779,7 +1899,7 @@ static int installLdrLoadDllFilter(PatchState& state, int mode,
             (unsigned long long)trampAddr, (long long)delta);
 
     std::vector<uint8_t> image = buildLdrLoadDllTrampoline(
-        saved5, origJumpTarget, mode, patterns,
+        saved, prologueLen, origJumpTarget, mode, patterns,
         /*replaySavedPrologue=*/!chaining);
     if (image.empty()) {
         VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
@@ -1793,31 +1913,32 @@ static int installLdrLoadDllFilter(PatchState& state, int mode,
     }
     FlushInstructionCache(proc, reinterpret_cast<LPCVOID>(trampAddr), image.size());
 
-    uint8_t patch[5];
+    uint8_t patch[16];
     patch[0] = 0xE9;
     int32_t rel = static_cast<int32_t>(delta);
     patch[1] = static_cast<uint8_t>(rel);
     patch[2] = static_cast<uint8_t>(rel >> 8);
     patch[3] = static_cast<uint8_t>(rel >> 16);
     patch[4] = static_cast<uint8_t>(rel >> 24);
+    for (size_t i = 5; i < prologueLen; i++) patch[i] = 0x90;  // NOP-pad split tail
 
-    if (!writeRemoteCode(proc, addr, patch, sizeof(patch))) {
+    if (!writeRemoteCode(proc, addr, patch, prologueLen)) {
         VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
         setError("write_patch_failed");
         return 0;
     }
 
-    uint8_t verify[5] = {};
-    readRemoteMem(proc, addr, verify, sizeof(verify));
-    if (memcmp(verify, patch, sizeof(patch)) != 0) {
+    uint8_t verify[16] = {};
+    readRemoteMem(proc, addr, verify, prologueLen);
+    if (memcmp(verify, patch, prologueLen) != 0) {
         VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
         setError("verify_failed");
         return 0;
     }
 
     state.targetAddr = addr;
-    state.patchSize = 5;
-    memcpy(state.original, saved5, 5);
+    state.patchSize = prologueLen;
+    memcpy(state.original, saved, prologueLen);
     state.patched = true;
     state.trampolineAddr = trampAddr;
     state.trampolineSize = kPage;
@@ -1894,7 +2015,8 @@ extern "C" __declspec(dllexport) int forgevm_unban_native_load() {
  * ============================================================ */
 static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
     const uint8_t* savedPrologue,
-    uint64_t origPlus5,
+    size_t prologueLen,
+    uint64_t origPlusN,
     int mode,
     const std::vector<std::string>& patterns)
 {
@@ -1943,7 +2065,8 @@ static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
     a.emit({0x4C, 0x8B, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});  // mov r8, [rsp+0x468]
     a.emit({0x4C, 0x8B, 0x8C, 0x24, 0x70, 0x04, 0x00, 0x00});  // mov r9, [rsp+0x470]
     a.emit({0x48, 0x81, 0xC4, 0xA8, 0x04, 0x00, 0x00});        // add rsp, 0x4A8
-    for (int i = 0; i < 5; i++) code.push_back(savedPrologue[i]);
+    // replay the whole saved prologue (instruction-aligned, may be >5) then jump on
+    for (size_t i = 0; i < prologueLen; i++) code.push_back(savedPrologue[i]);
     a.emit({0xFF, 0x25}); a.ripDisp(SLOT_JMP);                 // jmp qword [rip+abs_jump]
 
     // --- block: STATUS_ACCESS_DENIED ---
@@ -1962,7 +2085,7 @@ static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
     }
     for (size_t i = 0; i < code.size(); i++) buf[i] = code[i];
 
-    writeU64(buf, SLOT_JMP, origPlus5);
+    writeU64(buf, SLOT_JMP, origPlusN);
     buf[SLOT_MODE] = static_cast<uint8_t>(mode);
     serializeFilterBlob(buf, mode, patterns);
     return buf;
@@ -1999,21 +2122,33 @@ static int installNtCreateUserProcessFilter(PatchState& state, int mode,
     }
     FVM_LOG("ban_process_create: ntdll!NtCreateUserProcess @ 0x%llX", (unsigned long long)addr);
 
-    uint8_t saved5[5] = {};
-    if (!readRemoteMem(proc, addr, saved5, 5)) {
+    uint8_t saved[8] = {};
+    if (!readRemoteMem(proc, addr, saved, sizeof(saved))) {
         setError("read_original_failed");
         return 0;
     }
-    FVM_LOG("ban_process_create: original prologue: %02X %02X %02X %02X %02X",
-            saved5[0], saved5[1], saved5[2], saved5[3], saved5[4]);
+    FVM_LOG("ban_process_create: original prologue: %02X %02X %02X %02X %02X %02X %02X %02X",
+            saved[0], saved[1], saved[2], saved[3], saved[4], saved[5], saved[6], saved[7]);
 
-    uint8_t b0 = saved5[0];
+    uint8_t b0 = saved[0];
     bool dangerous = (b0 == 0xE8) || (b0 == 0xE9) || (b0 == 0xEB) ||
                      (b0 >= 0x70 && b0 <= 0x7F) || (b0 == 0xFF);
     if (dangerous) {
         setError("unsafe_prologue");
         return 0;
     }
+
+    // The 5-byte E9 patch must not split an instruction, or the trampoline's
+    // prologue replay mis-decodes and crashes. ntdll syscall stubs begin with
+    // `mov r10,rcx` (4C 8B D1) + `mov eax,imm32` (B8 ........) — an 8-byte pair
+    // whose 2nd instruction straddles the 5-byte boundary. Copy the whole pair
+    // and resume at addr+8; the 3 leftover bytes after the E9 are NOP-padded.
+    // Any other prologue keeps the classic 5-byte aligned copy.
+    size_t prologueLen = 5;
+    if (saved[0] == 0x4C && saved[1] == 0x8B && saved[2] == 0xD1 && saved[3] == 0xB8) {
+        prologueLen = 8;
+    }
+    FVM_LOG("ban_process_create: prologue copy length = %zu bytes", prologueLen);
 
     const size_t kPage = 0x400;
     uint64_t allocHint = findFreeRegionNear(proc, addr, kPage);
@@ -2039,7 +2174,7 @@ static int installNtCreateUserProcessFilter(PatchState& state, int mode,
             (unsigned long long)trampAddr, (long long)delta);
 
     std::vector<uint8_t> image = buildNtCreateUserProcessTrampoline(
-        saved5, addr + 5, mode, patterns);
+        saved, prologueLen, addr + prologueLen, mode, patterns);
     if (image.empty()) {
         VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
         setError("trampoline_build_failed");
@@ -2052,31 +2187,32 @@ static int installNtCreateUserProcessFilter(PatchState& state, int mode,
     }
     FlushInstructionCache(proc, reinterpret_cast<LPCVOID>(trampAddr), image.size());
 
-    uint8_t patch[5];
+    uint8_t patch[16];
     patch[0] = 0xE9;
     int32_t rel = static_cast<int32_t>(delta);
     patch[1] = static_cast<uint8_t>(rel);
     patch[2] = static_cast<uint8_t>(rel >> 8);
     patch[3] = static_cast<uint8_t>(rel >> 16);
     patch[4] = static_cast<uint8_t>(rel >> 24);
+    for (size_t i = 5; i < prologueLen; i++) patch[i] = 0x90;  // NOP-pad split tail
 
-    if (!writeRemoteCode(proc, addr, patch, sizeof(patch))) {
+    if (!writeRemoteCode(proc, addr, patch, prologueLen)) {
         VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
         setError("write_patch_failed");
         return 0;
     }
 
-    uint8_t verify[5] = {};
-    readRemoteMem(proc, addr, verify, sizeof(verify));
-    if (memcmp(verify, patch, sizeof(patch)) != 0) {
+    uint8_t verify[16] = {};
+    readRemoteMem(proc, addr, verify, prologueLen);
+    if (memcmp(verify, patch, prologueLen) != 0) {
         VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
         setError("verify_failed");
         return 0;
     }
 
     state.targetAddr = addr;
-    state.patchSize = 5;
-    memcpy(state.original, saved5, 5);
+    state.patchSize = prologueLen;
+    memcpy(state.original, saved, prologueLen);
     state.patched = true;
     state.trampolineAddr = trampAddr;
     state.trampolineSize = kPage;
