@@ -7,17 +7,19 @@ import java.util.List;
  *
  * <p>Matching is performed against the library path passed to
  * {@code System.load} / {@code System.loadLibrary} / {@code Runtime.load*}.
- * Patterns use glob syntax: {@code *} matches any sequence, {@code ?} matches a single char.
+ * Patterns are matched case-insensitively as path substrings; surrounding
+ * {@code *} characters are accepted for readability. Unsupported internal
+ * wildcards fail closed in the native guard instead of being silently ignored.
  *
  * <pre>{@code
  * // block any DLL whose path contains "cheat":
  * ForgeVM.banNativeLoad(NativeFilter.Blacklist("*cheat*"));
  *
  * // allow only lwjgl natives, block everything else:
- * ForgeVM.banNativeLoad(NativeFilter.Whitelist("lwjgl*", "*lwjgl*.dll"));
+ * ForgeVM.banNativeLoad(NativeFilter.Whitelist("*lwjgl*", "*trusted-native*"));
  *
  * // multiple patterns:
- * ForgeVM.banNativeLoad(NativeFilter.Blacklist("*hack*.dll", "*inject*.dll"));
+ * ForgeVM.banNativeLoad(NativeFilter.Blacklist("*hack*", "*inject*"));
  * }</pre>
  */
 public final class NativeFilter {

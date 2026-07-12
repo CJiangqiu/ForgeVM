@@ -13,6 +13,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cwctype>
+#include <cctype>
 /* For redirecting stdin/stdout to the handoff command pipe after old JVM dies. */
 #include <io.h>
 #include <fcntl.h>
@@ -61,6 +63,8 @@ static void agentLogInit(const std::string& logDir) {
  * loop. windowPublish is a no-op until the window is enabled at startup. */
 static std::atomic<bool>        g_windowEnabled{false};
 static std::atomic<bool>        g_jvmDiedPostMortem{false};  // target died; window kept for review
+static std::atomic<bool>        g_independentLifecycle{false};
+static std::atomic<bool>        g_jvmLockRequested{false};
 static std::mutex               g_windowQueueMutex;
 static std::vector<std::string> g_windowQueue;
 
@@ -112,6 +116,8 @@ typedef int(__cdecl* BanJavaAgentFn)(int, const char*);
 typedef int(__cdecl* UnbanJavaAgentFn)();
 typedef int(__cdecl* BanNativeLoadFn)(int, const char*);
 typedef int(__cdecl* UnbanNativeLoadFn)();
+typedef int(__cdecl* BanJvmtiFn)(int, const char*);
+typedef int(__cdecl* UnbanJvmtiFn)();
 typedef int(__cdecl* BanProcessCreateFn)(int, const char*);
 typedef int(__cdecl* UnbanProcessCreateFn)();
 typedef int(__cdecl* ForgeClassPlanFn)(const char*, const char*, int, int, char*, int);
@@ -142,6 +148,8 @@ struct NativeApi {
     UnbanJavaAgentFn unbanJavaAgent = NULL;
     BanNativeLoadFn banNativeLoad = NULL;
     UnbanNativeLoadFn unbanNativeLoad = NULL;
+    BanJvmtiFn banJvmti = NULL;
+    UnbanJvmtiFn unbanJvmti = NULL;
     BanProcessCreateFn banProcessCreate = NULL;
     UnbanProcessCreateFn unbanProcessCreate = NULL;
     ForgeClassPlanFn forgeClassPlan = NULL;
@@ -207,6 +215,20 @@ static bool hardenSelfProcessDACL() {
 
 // Parent process watchdog: exits agent when parent JVM dies
 static std::atomic<DWORD> g_parentPid{0};
+/* Guard is intentionally opt-in: it is only armed by --lock-jvm, which Java
+ * validates as requiring an independent lifecycle and the control window. */
+static std::atomic<bool> g_guardMode{false};
+static std::atomic<bool> g_guardAuthorizedExit{false};
+static std::atomic<bool> g_guardRecoveryRunning{false};
+static std::atomic<unsigned long long> g_guardGeneration{0};
+static std::mutex g_guardMutex;
+static std::wstring g_guardCommandLine;
+static std::vector<ULONGLONG> g_guardCrashTicks;
+static const ULONGLONG kGuardCrashWindowMs = 60000ULL;
+static const size_t kGuardCrashLimit = 5;
+
+static std::wstring queryProcessCommandLine(DWORD pid);
+static void autoRelaunchAfterCrash(DWORD deadPid);
 
 /* Set true by handleRelaunch after a successful CREATE_SUSPENDED + suspended-time
  * hook install. Tells main() to NOT exit when stdin EOFs (old JVM is dead) — the
@@ -284,12 +306,19 @@ DWORD WINAPI parentWatchdogThread(LPVOID) {
             lastPid = 0;
             continue;
         }
+        if (g_guardMode.load() && !g_guardAuthorizedExit.load()) {
+            /* The JVM died without the FVM relaunch handoff. The guard owns
+             * recovery and will either publish a new pid or fail closed. */
+            autoRelaunchAfterCrash(lastPid);
+            lastPid = 0;
+            continue;
+        }
         /* Truly orphaned. Normally we exit so no zombie agent lingers. But when
          * the status window is up, the JVM's death is exactly what the operator
          * wants to inspect — exiting would close the window before it can be
          * read. So keep the agent (and window) alive for post-mortem; the
          * operator closes the window to quit (statusWndProc handles WM_CLOSE). */
-        if (g_windowEnabled.load()) {
+        if (g_windowEnabled.load() && g_independentLifecycle.load()) {
             windowPublish("[JVM] \xE2\x9A\xA0 target JVM (pid " + std::to_string(lastPid) +
                           ") exited/crashed — agent kept alive for review, close window to quit");
             g_jvmDiedPostMortem.store(true);
@@ -320,8 +349,11 @@ std::wstring toWide(const std::string& utf8) {
     if (utf8.empty()) return std::wstring();
     int length = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, NULL, 0);
     if (length <= 0) return std::wstring();
-    std::wstring wide(length - 1, L'\0');
+    /* `length` includes the trailing NUL because cbMultiByte is -1.  Keep room
+     * for it while converting, then remove it from the C++ string. */
+    std::wstring wide(length, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &wide[0], length);
+    wide.resize(length - 1);
     return wide;
 }
 
@@ -355,8 +387,10 @@ std::string wideToUtf8(const std::wstring& wide) {
     if (wide.empty()) return std::string();
     int len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, NULL, 0, NULL, NULL);
     if (len <= 0) return std::string();
-    std::string utf8(len - 1, '\0');
+    /* `len` also includes the terminating NUL when cchWideChar is -1. */
+    std::string utf8(len, '\0');
     WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, &utf8[0], len, NULL, NULL);
+    utf8.resize(len - 1);
     return utf8;
 }
 
@@ -631,6 +665,8 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->unbanJavaAgent  = reinterpret_cast<UnbanJavaAgentFn>(GetProcAddress(module, "forgevm_unban_java_agent"));
     api->banNativeLoad   = reinterpret_cast<BanNativeLoadFn>(GetProcAddress(module, "forgevm_ban_native_load"));
     api->unbanNativeLoad = reinterpret_cast<UnbanNativeLoadFn>(GetProcAddress(module, "forgevm_unban_native_load"));
+    api->banJvmti        = reinterpret_cast<BanJvmtiFn>(GetProcAddress(module, "forgevm_ban_jvmti"));
+    api->unbanJvmti      = reinterpret_cast<UnbanJvmtiFn>(GetProcAddress(module, "forgevm_unban_jvmti"));
     api->banProcessCreate   = reinterpret_cast<BanProcessCreateFn>(GetProcAddress(module, "forgevm_ban_process_create"));
     api->unbanProcessCreate = reinterpret_cast<UnbanProcessCreateFn>(GetProcAddress(module, "forgevm_unban_process_create"));
     api->forgeClassPlan   = reinterpret_cast<ForgeClassPlanFn>(GetProcAddress(module, "forgevm_forge_class_plan"));
@@ -672,6 +708,16 @@ void handleBootstrap(const NativeApi& api,
     unsigned long long pid = getJsonUnsignedField(line, "pid", 0ULL);
     if (pid != 0ULL) {
         g_parentPid.store(static_cast<DWORD>(pid));
+        if (g_guardMode.load()) {
+            std::wstring cmd = queryProcessCommandLine(static_cast<DWORD>(pid));
+            if (!cmd.empty()) {
+                std::lock_guard<std::mutex> guard(g_guardMutex);
+                g_guardCommandLine = std::move(cmd);
+                AGENT_LOG("guard: cached command line for pid=%llu", pid);
+            } else {
+                AGENT_LOG("guard: failed to cache command line for pid=%llu", pid);
+            }
+        }
     }
     if (pid != 0ULL && api.bootstrapTarget != NULL) {
         AGENT_LOG("bootstrap_target(pid=%llu)...", pid);
@@ -1253,6 +1299,7 @@ struct LoadFilter {
 
 LoadFilter g_javaAgentFilter;
 LoadFilter g_nativeLoadFilter;
+LoadFilter g_jvmtiFilter;
 LoadFilter g_processCreateFilter;
 std::mutex g_filterMutex;
 std::atomic<bool> g_filterPipeStarted{false};
@@ -1812,6 +1859,38 @@ void handleUnbanNativeLoad(const NativeApi& api, const std::string& dllPath) {
                 api.lastError ? api.lastError() : "unknown");
 }
 
+void handleBanJvmti(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    int mode;
+    std::string joined;
+    {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        applyFilterFromJson(&g_jvmtiFilter, line);
+        mode = static_cast<int>(g_jvmtiFilter.mode);
+        joined = joinPatternsLF(g_jvmtiFilter);
+    }
+    if (api.banJvmti == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "ban_jvmti_not_exported");
+        return;
+    }
+    int r = api.banJvmti(mode, joined.c_str());
+    printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
+                api.lastError ? api.lastError() : "unknown");
+}
+
+void handleUnbanJvmti(const NativeApi& api, const std::string& dllPath) {
+    {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_jvmtiFilter = LoadFilter{};
+    }
+    if (api.unbanJvmti == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "unban_jvmti_not_exported");
+        return;
+    }
+    int r = api.unbanJvmti();
+    printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
+                api.lastError ? api.lastError() : "unknown");
+}
+
 void handleBanProcessCreate(const NativeApi& api, const std::string& line, const std::string& dllPath) {
     int mode;
     std::string joined;
@@ -2002,9 +2081,10 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
 
     bool hasAgentFilter   = getJsonBoolField(line, "hasAgentFilter",   false);
     bool hasNativeFilter  = getJsonBoolField(line, "hasNativeFilter",  false);
+    bool hasJvmtiFilter   = getJsonBoolField(line, "hasJvmtiFilter",   false);
     bool hasProcessFilter = getJsonBoolField(line, "hasProcessFilter", false);
 
-    LoadFilter agentFlt, nativeFlt, processFlt;
+    LoadFilter agentFlt, nativeFlt, jvmtiFlt, processFlt;
 
     auto buildFilter = [&](LoadFilter& f, const char* modeKey, const char* patsKey) {
         std::string mode = getJsonStringField(line, modeKey);
@@ -2024,27 +2104,31 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
 
     if (hasAgentFilter)   buildFilter(agentFlt,   "agentMode",   "agentPatterns");
     if (hasNativeFilter)  buildFilter(nativeFlt,  "nativeMode",  "nativePatterns");
+    if (hasJvmtiFilter)   buildFilter(jvmtiFlt,   "jvmtiMode",   "jvmtiPatterns");
     if (hasProcessFilter) buildFilter(processFlt, "processMode", "processPatterns");
 
     /* Snapshot pre-relaunch ban state. Trampolines in the old JVM die with it,
      * so the new JVM needs fresh installs whenever a ban was active OR the
      * caller passed a new filter. Without this, relaunch() with no filter
      * args silently drops active protection that was installed before the call. */
-    bool wasAgentBanActive, wasNativeBanActive, wasProcessBanActive;
+    bool wasAgentBanActive, wasNativeBanActive, wasJvmtiBanActive, wasProcessBanActive;
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
         wasAgentBanActive   = g_javaAgentFilter.active;
         wasNativeBanActive  = g_nativeLoadFilter.active;
+        wasJvmtiBanActive   = g_jvmtiFilter.active;
         wasProcessBanActive = g_processCreateFilter.active;
     }
     bool installNativeBan  = hasNativeFilter  || wasNativeBanActive;
     bool installAgentBan   = hasAgentFilter   || wasAgentBanActive;
+    bool installJvmtiBan   = hasJvmtiFilter || wasJvmtiBanActive;
     bool installProcessBan = hasProcessFilter || wasProcessBanActive;
 
-    AGENT_LOG("relaunch: pid=%llu hasAgentFilter=%d hasNativeFilter=%d hasProcessFilter=%d "
-              "wasAgentActive=%d wasNativeActive=%d wasProcessActive=%d",
-              pid, (int)hasAgentFilter, (int)hasNativeFilter, (int)hasProcessFilter,
-              (int)wasAgentBanActive, (int)wasNativeBanActive, (int)wasProcessBanActive);
+    AGENT_LOG("relaunch: pid=%llu hasAgentFilter=%d hasNativeFilter=%d hasJvmtiFilter=%d hasProcessFilter=%d "
+              "wasAgentActive=%d wasNativeActive=%d wasJvmtiActive=%d wasProcessActive=%d",
+              pid, (int)hasAgentFilter, (int)hasNativeFilter, (int)hasJvmtiFilter, (int)hasProcessFilter,
+              (int)wasAgentBanActive, (int)wasNativeBanActive,
+              (int)wasJvmtiBanActive, (int)wasProcessBanActive);
 
     std::wstring cmdLine = queryProcessCommandLine(static_cast<DWORD>(pid));
     if (cmdLine.empty()) {
@@ -2173,6 +2257,10 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         std::lock_guard<std::mutex> g(g_filterMutex);
         g_javaAgentFilter = agentFlt;
     }
+    if (hasJvmtiFilter) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_jvmtiFilter = jvmtiFlt;
+    }
 
     /* Resume new JVM. ntdll hooks are installed later by the watcher once the
      * loader bootstrap is past (jvm.dll loaded), not here — see the stash note. */
@@ -2197,13 +2285,15 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         DWORD newPid;
         bool installAgentBan;
         bool installNativeBan;
+        bool installJvmtiBan;
         bool installProcessBan;
         const NativeApi* api;
         std::string dllPath;
         HANDLE abortEvent;
     };
     auto* ctx = new RelaunchPostResumeCtx{
-        pi.hProcess, pi.dwProcessId, installAgentBan, installNativeBan, installProcessBan, &api, dllPath, abortEvent
+        pi.hProcess, pi.dwProcessId, installAgentBan, installNativeBan, installJvmtiBan,
+        installProcessBan, &api, dllPath, abortEvent
     };
     HANDLE watcher = CreateThread(NULL, 0, [](LPVOID p) -> DWORD {
         auto* c = static_cast<RelaunchPostResumeCtx*>(p);
@@ -2211,6 +2301,7 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         DWORD newPid = c->newPid;
         bool installAgentBan = c->installAgentBan;
         bool installNativeBan = c->installNativeBan;
+        bool installJvmtiBan = c->installJvmtiBan;
         bool installProcessBan = c->installProcessBan;
         const NativeApi* api = c->api;
         HANDLE abortEvent = c->abortEvent;
@@ -2270,6 +2361,15 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
                     AGENT_LOG("post-relaunch watcher: banJavaAgent r=%d reason=%s",
                               r, api->lastError ? api->lastError() : "");
                 }
+                if (installJvmtiBan && api->banJvmti != NULL) {
+                    int m; std::string j;
+                    { std::lock_guard<std::mutex> g(g_filterMutex);
+                      m = static_cast<int>(g_jvmtiFilter.mode);
+                      j = joinPatternsLF(g_jvmtiFilter); }
+                    int r = api->banJvmti(m, j.c_str());
+                    AGENT_LOG("post-relaunch watcher: banJvmti r=%d reason=%s",
+                              r, api->lastError ? api->lastError() : "");
+                }
                 if (installProcessBan && api->banProcessCreate != NULL) {
                     int m; std::string j;
                     { std::lock_guard<std::mutex> g(g_filterMutex);
@@ -2325,6 +2425,162 @@ std::mutex g_commandMutex;
 AgentLockState g_lockState;          // guarded by g_commandMutex
 const NativeApi* g_api = nullptr;    // set in main() before serving
 std::string g_cmdDllPath;            // set in main() before serving
+
+struct GuardPostResumeCtx {
+    HANDLE process;
+    DWORD pid;
+    const NativeApi* api;
+};
+
+static void guardReapplyActiveFilters(const NativeApi& api) {
+    LoadFilter javaAgent, nativeLoad, jvmti, process;
+    {
+        std::lock_guard<std::mutex> filters(g_filterMutex);
+        javaAgent = g_javaAgentFilter;
+        nativeLoad = g_nativeLoadFilter;
+        jvmti = g_jvmtiFilter;
+        process = g_processCreateFilter;
+    }
+    auto apply = [&](const char* name, const LoadFilter& filter, auto fn) {
+        if (!filter.active || fn == NULL) return;
+        int result = fn(static_cast<int>(filter.mode), joinPatternsLF(filter).c_str());
+        AGENT_LOG("guard: %s reinstalled result=%d reason=%s", name, result,
+                  api.lastError ? api.lastError() : "");
+    };
+    apply("banNativeLoad", nativeLoad, api.banNativeLoad);
+    apply("banJavaAgent", javaAgent, api.banJavaAgent);
+    apply("banJvmti", jvmti, api.banJvmti);
+    apply("banProcessCreate", process, api.banProcessCreate);
+}
+
+static DWORD WINAPI guardPostResumeWatcher(LPVOID param) {
+    GuardPostResumeCtx* ctx = static_cast<GuardPostResumeCtx*>(param);
+    HANDLE process = ctx->process;
+    DWORD pid = ctx->pid;
+    const NativeApi* api = ctx->api;
+    delete ctx;
+
+    bool jvmLoaded = false;
+    for (int i = 0; i < 600 && !jvmLoaded; ++i) {
+        HMODULE modules[256];
+        DWORD needed = 0;
+        if (EnumProcessModulesEx(process, modules, sizeof(modules), &needed, LIST_MODULES_ALL)) {
+            size_t count = (needed / sizeof(HMODULE) < ARRAYSIZE(modules))
+                         ? needed / sizeof(HMODULE) : ARRAYSIZE(modules);
+            for (size_t m = 0; m < count; ++m) {
+                wchar_t name[MAX_PATH] = {};
+                if (GetModuleBaseNameW(process, modules[m], name, ARRAYSIZE(name)) > 0) {
+                    std::wstring lower(name);
+                    for (wchar_t& ch : lower) ch = (wchar_t)towlower(ch);
+                    if (lower == L"jvm.dll") { jvmLoaded = true; break; }
+                }
+            }
+        }
+        if (!jvmLoaded) Sleep(50);
+    }
+    if (!jvmLoaded) {
+        AGENT_LOG("guard: jvm.dll did not appear in recovered pid=%lu", pid);
+        CloseHandle(process);
+        return 0;
+    }
+    if (api->bootstrapTarget == NULL || api->bootstrapTarget(pid) != 1) {
+        AGENT_LOG("guard: bootstrap_target(%lu) failed: %s", pid,
+                  api->lastError ? api->lastError() : "unknown");
+        CloseHandle(process);
+        return 0;
+    }
+    guardReapplyActiveFilters(*api);
+    AGENT_LOG("guard: recovered JVM pid=%lu fully bootstrapped", pid);
+    windowPublish("[GUARD] JVM recovered and hooks reinstalled (pid " + std::to_string(pid) + ")");
+    CloseHandle(process);
+    return 0;
+}
+
+static void autoRelaunchAfterCrash(DWORD deadPid) {
+    if (g_guardRecoveryRunning.exchange(true)) return;
+    std::wstring source;
+    unsigned long long generation = 0;
+    {
+        std::lock_guard<std::mutex> guard(g_guardMutex);
+        ULONGLONG now = GetTickCount64();
+        g_guardCrashTicks.erase(
+            std::remove_if(g_guardCrashTicks.begin(), g_guardCrashTicks.end(),
+                           [now](ULONGLONG tick) { return now - tick > kGuardCrashWindowMs; }),
+            g_guardCrashTicks.end());
+        g_guardCrashTicks.push_back(now);
+        if (g_guardCrashTicks.size() >= kGuardCrashLimit) {
+            AGENT_LOG("guard_crash_loop: %zu abnormal JVM exits within 60 seconds; stopping FVM", g_guardCrashTicks.size());
+            windowPublish("[GUARD] crash loop detected (5 exits / 60s); JVM and FVM stopped");
+            ExitProcess(70);
+        }
+        source = g_guardCommandLine;
+        generation = g_guardGeneration.fetch_add(1) + 1;
+    }
+    if (source.empty() || g_api == nullptr) {
+        AGENT_LOG("guard: recovery unavailable (no cached command line or API)");
+        windowPublish("[GUARD] recovery failed: no cached JVM command line; FVM stopped");
+        ExitProcess(71);
+    }
+
+    std::vector<std::wstring> oldTokens = tokenizeCmdLine(source);
+    if (oldTokens.empty()) {
+        AGENT_LOG("guard: cached command line parse failed");
+        ExitProcess(72);
+    }
+    std::vector<std::wstring> tokens;
+    tokens.push_back(oldTokens[0]);
+    wchar_t agentPidToken[64];
+    swprintf_s(agentPidToken, ARRAYSIZE(agentPidToken), L"-Dforgevm.agent.pid=%lu",
+               (unsigned long)GetCurrentProcessId());
+    tokens.push_back(agentPidToken);
+    wchar_t genToken[64];
+    swprintf_s(genToken, ARRAYSIZE(genToken), L"-Dforgevm.relaunch.gen=%llu", generation);
+    tokens.push_back(genToken);
+    for (size_t i = 1; i < oldTokens.size(); ++i) {
+        if (!isForgevmRelaunchInjectedToken(oldTokens[i])) tokens.push_back(oldTokens[i]);
+    }
+    std::wstring commandLine;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (i != 0) commandLine += L' ';
+        commandLine += quoteIfNeeded(tokens[i]);
+    }
+
+    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+    mutableCommand.push_back(L'\0');
+    STARTUPINFOW startup = {}; startup.cb = sizeof(startup);
+    PROCESS_INFORMATION pi = {};
+    BOOL created = CreateProcessW(NULL, mutableCommand.data(), NULL, NULL, FALSE,
+                                  CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                                  NULL, NULL, &startup, &pi);
+    if (!created) {
+        AGENT_LOG("guard: CreateProcessW failed after pid=%lu death: %lu", deadPid, GetLastError());
+        windowPublish("[GUARD] recovery CreateProcessW failed; FVM stopped");
+        ExitProcess(73);
+    }
+
+    g_parentPid.store(pi.dwProcessId);
+    g_guardAuthorizedExit.store(false);
+    g_persistAfterEOF.store(true);
+    {
+        std::lock_guard<std::mutex> guard(g_guardMutex);
+        g_guardCommandLine = commandLine;
+    }
+    HANDLE duplicate = NULL;
+    if (DuplicateHandle(GetCurrentProcess(), pi.hProcess, GetCurrentProcess(), &duplicate,
+                        SYNCHRONIZE, FALSE, 0)) {
+        HANDLE previous = g_relaunchNewJvm.exchange(duplicate);
+        if (previous != NULL) CloseHandle(previous);
+    }
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    GuardPostResumeCtx* ctx = new GuardPostResumeCtx{pi.hProcess, pi.dwProcessId, g_api};
+    HANDLE watcher = CreateThread(NULL, 0, guardPostResumeWatcher, ctx, 0, NULL);
+    if (watcher != NULL) CloseHandle(watcher);
+    AGENT_LOG("guard: abnormal pid=%lu restarted as pid=%lu generation=%llu", deadPid,
+              pi.dwProcessId, generation);
+    windowPublish("[GUARD] abnormal JVM exit; restarting as pid " + std::to_string(pi.dwProcessId));
+    g_guardRecoveryRunning.store(false);
+}
 
 // Returns true if the command was "shutdown" (caller should stop the channel).
 static bool dispatchCommand(const NativeApi& api, const std::string& dllPath,
@@ -2391,6 +2647,10 @@ static bool dispatchCommand(const NativeApi& api, const std::string& dllPath,
         handleBanNativeLoad(api, line, dllPath);
     } else if (cmd == "unban_native_load") {
         handleUnbanNativeLoad(api, dllPath);
+    } else if (cmd == "ban_jvmti") {
+        handleBanJvmti(api, line, dllPath);
+    } else if (cmd == "unban_jvmti") {
+        handleUnbanJvmti(api, dllPath);
     } else if (cmd == "ban_process_create") {
         handleBanProcessCreate(api, line, dllPath);
     } else if (cmd == "unban_process_create") {
@@ -2498,7 +2758,16 @@ static void runCommandPipeServer(HANDLE firstPipe) {
  * ============================================================ */
 
 static HWND g_statusEdit = NULL;
+static HWND g_commandResultEdit = NULL;
+static HWND g_commandInput = NULL;
+static HWND g_commandSuggestions = NULL;
 static const size_t kStatusTextCap = 200000;   // trim the edit buffer past this
+static WNDPROC g_commandInputProc = NULL;
+static const UINT WM_FVM_STOP_AGENT = WM_APP + 41;
+
+static const wchar_t* const kWindowCommands[] = {
+    L"/help", L"/status", L"/clear", L"/stop", L"/stop jvm", L"/stop fvm"
+};
 
 static void statusAppend(const std::string& line) {
     if (g_statusEdit == NULL) return;
@@ -2519,10 +2788,174 @@ static void statusAppend(const std::string& line) {
     SendMessageW(g_statusEdit, EM_SCROLLCARET, 0, 0);
 }
 
+static void commandResultSet(const std::wstring& text) {
+    if (g_commandResultEdit == NULL) return;
+    SetWindowTextW(g_commandResultEdit, text.c_str());
+    SendMessageW(g_commandResultEdit, EM_SETSEL, 0, 0);
+}
+
+static std::wstring commandInputText() {
+    if (g_commandInput == NULL) return std::wstring();
+    int len = GetWindowTextLengthW(g_commandInput);
+    std::wstring text((size_t)len + 1, L'\0');
+    GetWindowTextW(g_commandInput, &text[0], len + 1);
+    text.resize((size_t)len);
+    size_t first = text.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos) return std::wstring();
+    size_t last = text.find_last_not_of(L" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+static std::wstring lowerWide(std::wstring value) {
+    for (wchar_t& ch : value) ch = (wchar_t)towlower(ch);
+    return value;
+}
+
+static bool stopTargetJvm(std::wstring* detail) {
+    DWORD pid = g_parentPid.load();
+    if (pid == 0) {
+        *detail = L"JVM: not attached";
+        return true;
+    }
+    HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+    if (process == NULL) {
+        *detail = L"JVM: unable to open pid " + std::to_wstring(pid) +
+                  L" (error " + std::to_wstring(GetLastError()) + L")";
+        return false;
+    }
+    bool ok = TerminateProcess(process, 0) != FALSE;
+    DWORD err = ok ? 0 : GetLastError();
+    CloseHandle(process);
+    if (!ok) {
+        *detail = L"JVM: terminate failed (error " + std::to_wstring(err) + L")";
+        return false;
+    }
+    /* This is an operator-authorized exit: disable watchdog tracking before it
+     * observes the process signal, so a future lock/guard cannot revive it. */
+    g_guardAuthorizedExit.store(true);
+    g_guardMode.store(false);
+    g_jvmLockRequested.store(false);
+    g_parentPid.store(0);
+    g_jvmDiedPostMortem.store(true);
+    *detail = L"JVM: stopped (pid " + std::to_wstring(pid) + L")";
+    return true;
+}
+
+static void updateCommandSuggestions() {
+    if (g_commandSuggestions == NULL) return;
+    std::wstring prefix = lowerWide(commandInputText());
+    SendMessageW(g_commandSuggestions, LB_RESETCONTENT, 0, 0);
+    if (prefix.empty() || prefix[0] != L'/') {
+        ShowWindow(g_commandSuggestions, SW_HIDE);
+        return;
+    }
+    int matches = 0;
+    for (const wchar_t* command : kWindowCommands) {
+        std::wstring candidate(command);
+        if (candidate.compare(0, prefix.size(), prefix) == 0) {
+            SendMessageW(g_commandSuggestions, LB_ADDSTRING, 0, (LPARAM)command);
+            ++matches;
+        }
+    }
+    ShowWindow(g_commandSuggestions, matches ? SW_SHOWNOACTIVATE : SW_HIDE);
+}
+
+static void completeSelectedCommand() {
+    if (g_commandSuggestions == NULL || g_commandInput == NULL) return;
+    LRESULT index = SendMessageW(g_commandSuggestions, LB_GETCURSEL, 0, 0);
+    if (index == LB_ERR) index = 0;
+    wchar_t command[64] = {};
+    if (SendMessageW(g_commandSuggestions, LB_GETTEXT, index, (LPARAM)command) != LB_ERR) {
+        SetWindowTextW(g_commandInput, command);
+        SendMessageW(g_commandInput, EM_SETSEL, wcslen(command), wcslen(command));
+        ShowWindow(g_commandSuggestions, SW_HIDE);
+    }
+}
+
+static void executeWindowCommand(HWND hwnd) {
+    std::wstring command = lowerWide(commandInputText());
+    if (command.empty()) return;
+    SetWindowTextW(g_commandInput, L"");
+    ShowWindow(g_commandSuggestions, SW_HIDE);
+
+    if (command == L"/help") {
+        commandResultSet(L"/help\r\n/status\r\n/clear\r\n/stop\r\n/stop jvm\r\n/stop fvm");
+        windowPublish("[CMD] /help -> OK");
+    } else if (command == L"/status") {
+        DWORD pid = g_parentPid.load();
+        std::wstring jvm = pid ? (std::wstring(L"running (pid ") + std::to_wstring(pid) + L")")
+                               : std::wstring(L"not attached");
+        std::wstring result = std::wstring(L"command: /status\r\nresult: OK\r\njvm: ") + jvm +
+            L"\r\nlifecycle: " + (g_independentLifecycle.load() ? L"independent" : L"dependent") +
+            L"\r\njvm lock: " + (g_guardMode.load() ? L"enabled" : L"disabled") +
+            L"\r\nwindow: enabled";
+        commandResultSet(result);
+        windowPublish("[CMD] /status -> OK");
+    } else if (command == L"/clear") {
+        if (g_statusEdit) SetWindowTextW(g_statusEdit, L"");
+        commandResultSet(L"command: /clear\r\nresult: OK\r\nstatus output cleared");
+        windowPublish("[CMD] /clear -> OK");
+    } else if (command == L"/stop jvm") {
+        std::wstring detail;
+        bool ok = stopTargetJvm(&detail);
+        commandResultSet(L"command: /stop jvm\r\nresult: " + std::wstring(ok ? L"OK" : L"FAILED") +
+                         L"\r\n" + detail + L"\r\nfvm agent: " +
+                         (g_independentLifecycle.load() ? L"running" : L"stopping (dependent lifecycle)"));
+        windowPublish(std::string("[CMD] /stop jvm -> ") + (ok ? "OK" : "FAILED"));
+        if (!g_independentLifecycle.load()) PostMessageW(hwnd, WM_FVM_STOP_AGENT, 0, 0);
+    } else if (command == L"/stop fvm") {
+        commandResultSet(L"command: /stop fvm\r\nresult: OK\r\njvm: unchanged\r\nfvm agent: stopping");
+        windowPublish("[CMD] /stop fvm -> OK");
+        PostMessageW(hwnd, WM_FVM_STOP_AGENT, 0, 0);
+    } else if (command == L"/stop") {
+        std::wstring detail;
+        bool ok = stopTargetJvm(&detail);
+        commandResultSet(L"command: /stop\r\nresult: " + std::wstring(ok ? L"OK" : L"PARTIAL") +
+                         L"\r\n" + detail + L"\r\nfvm agent: stopping");
+        windowPublish(std::string("[CMD] /stop -> ") + (ok ? "OK" : "PARTIAL"));
+        PostMessageW(hwnd, WM_FVM_STOP_AGENT, 0, 0);
+    } else {
+        commandResultSet(L"command: " + command + L"\r\nresult: UNKNOWN_COMMAND\r\nUse /help.");
+        windowPublish("[CMD] unknown command");
+    }
+}
+
+static LRESULT CALLBACK commandInputWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN) {
+        if (wp == VK_RETURN) {
+            executeWindowCommand(GetParent(hwnd));
+            return 0;
+        }
+        if (wp == VK_TAB) {
+            completeSelectedCommand();
+            return 0;
+        }
+        if (wp == VK_DOWN && IsWindowVisible(g_commandSuggestions)) {
+            SendMessageW(g_commandSuggestions, LB_SETCURSEL, 0, 0);
+            SetFocus(g_commandSuggestions);
+            return 0;
+        }
+    }
+    return CallWindowProcW(g_commandInputProc, hwnd, msg, wp, lp);
+}
+
 static LRESULT CALLBACK statusWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_SIZE:
-            if (g_statusEdit) MoveWindow(g_statusEdit, 0, 0, LOWORD(lp), HIWORD(lp), TRUE);
+            {
+                int width = LOWORD(lp), height = HIWORD(lp);
+                int margin = 8, inputHeight = 25, suggestionHeight = 96;
+                int outputHeight = height - margin * 3 - inputHeight;
+                int leftWidth = (width - margin * 3) * 3 / 5;
+                int rightWidth = width - margin * 3 - leftWidth;
+                if (g_statusEdit) MoveWindow(g_statusEdit, margin, margin, leftWidth, outputHeight, TRUE);
+                if (g_commandResultEdit) MoveWindow(g_commandResultEdit, margin * 2 + leftWidth, margin,
+                                                    rightWidth, outputHeight, TRUE);
+                if (g_commandInput) MoveWindow(g_commandInput, margin, margin * 2 + outputHeight,
+                                                width - margin * 2, inputHeight, TRUE);
+                if (g_commandSuggestions) MoveWindow(g_commandSuggestions, margin,
+                    margin * 2 + outputHeight - suggestionHeight, leftWidth, suggestionHeight, TRUE);
+            }
             return 0;
         case WM_TIMER: {
             std::vector<std::string> batch;
@@ -2538,13 +2971,28 @@ static LRESULT CALLBACK statusWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
              * X must NOT kill the agent, so just hide. But once the JVM has died
              * and we're only keeping the window for post-mortem review, closing
              * it is the operator's "I'm done" → quit the agent. */
-            if (g_jvmDiedPostMortem.load()) {
-                ExitProcess(0);
-            }
+            if (g_jvmDiedPostMortem.load()) ExitProcess(0);
             ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        case WM_COMMAND:
+            if ((HWND)lp == g_commandInput && HIWORD(wp) == EN_CHANGE) {
+                updateCommandSuggestions();
+                return 0;
+            }
+            if ((HWND)lp == g_commandSuggestions && HIWORD(wp) == LBN_DBLCLK) {
+                completeSelectedCommand();
+                SetFocus(g_commandInput);
+                return 0;
+            }
+            return 0;
+        case WM_FVM_STOP_AGENT:
+            ExitProcess(0);
             return 0;
         case WM_DESTROY:
             g_statusEdit = NULL;
+            g_commandResultEdit = NULL;
+            g_commandInput = NULL;
+            g_commandSuggestions = NULL;
             return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -2556,21 +3004,33 @@ static DWORD WINAPI statusWindowThread(LPVOID) {
     wc.lpfnWndProc   = statusWndProc;
     wc.hInstance     = inst;
     wc.lpszClassName = L"ForgeVMStatusWnd";
-    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.hCursor       = LoadCursorW(NULL, MAKEINTRESOURCEW(32512)); // IDC_ARROW
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     if (!RegisterClassW(&wc)) return 0;
 
     HWND hwnd = CreateWindowExW(
         0, L"ForgeVMStatusWnd", L"ForgeVM — live status",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 760, 480,
+        CW_USEDEFAULT, CW_USEDEFAULT, 980, 600,
         NULL, NULL, inst, NULL);
     if (hwnd == NULL) return 0;
 
     g_statusEdit = CreateWindowExW(
         0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        0, 0, 760, 480, hwnd, NULL, inst, NULL);
+        0, 0, 1, 1, hwnd, NULL, inst, NULL);
+    g_commandResultEdit = CreateWindowExW(
+        WS_EX_CLIENTEDGE, L"EDIT", L"Run /help for ForgeVM commands.",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+        0, 0, 1, 1, hwnd, NULL, inst, NULL);
+    g_commandInput = CreateWindowExW(
+        WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+        0, 0, 1, 1, hwnd, NULL, inst, NULL);
+    g_commandSuggestions = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+        WS_CHILD | LBS_NOTIFY | WS_VSCROLL,
+        0, 0, 1, 1, hwnd, NULL, inst, NULL);
     if (g_statusEdit) {
         /* A TrueType monospace face (not the ANSI_FIXED_FONT raster font) so GDI
          * font-linking can fall back to CJK glyphs for non-Latin content;
@@ -2581,7 +3041,16 @@ static DWORD WINAPI statusWindowThread(LPVOID) {
             DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
         if (mono == NULL) mono = (HFONT)GetStockObject(ANSI_FIXED_FONT);
         SendMessageW(g_statusEdit, WM_SETFONT, (WPARAM)mono, TRUE);
+        if (g_commandResultEdit) SendMessageW(g_commandResultEdit, WM_SETFONT, (WPARAM)mono, TRUE);
+        if (g_commandInput) SendMessageW(g_commandInput, WM_SETFONT, (WPARAM)mono, TRUE);
+        if (g_commandSuggestions) SendMessageW(g_commandSuggestions, WM_SETFONT, (WPARAM)mono, TRUE);
     }
+    if (g_commandInput) {
+        g_commandInputProc = (WNDPROC)SetWindowLongPtrW(g_commandInput, GWLP_WNDPROC,
+                                                          (LONG_PTR)commandInputWndProc);
+    }
+    SendMessageW(hwnd, WM_SIZE, 0, MAKELPARAM(980, 600));
+    SetFocus(g_commandInput);
 
     /* Drain the queue ~10x/sec — cheap, keeps the feed live without busy-wait. */
     SetTimer(hwnd, 1, 100, NULL);
@@ -2734,6 +3203,9 @@ int main(int argc, char** argv) {
     hardenSelfProcessDACL();
 
     bool serve = hasFlag("--serve", argc, argv);
+    g_independentLifecycle.store(hasFlag("--independent-lifecycle", argc, argv));
+    g_jvmLockRequested.store(hasFlag("--lock-jvm", argc, argv));
+    g_guardMode.store(g_jvmLockRequested.load());
 
     // Parse DLL path from wide command line to handle non-ASCII paths correctly
     int wargc = 0;
@@ -2824,6 +3296,13 @@ int main(int argc, char** argv) {
      * the new JVM dies / never maps jvm.dll, handled by acceptCommandPipeClient),
      * serve it AND keep accepting further clients: each JVM classloader's
      * ForgeVM holds its own independent command channel to this single agent. */
+    /* A guard recovery is initiated by the watchdog, which may observe the
+     * process signal a few milliseconds after this inherited stdin reaches
+     * EOF. Wait for it so the recovered JVM can use the same handoff pipe. */
+    while (g_guardMode.load() && !g_persistAfterEOF.load()) {
+        Sleep(25);
+    }
+
     if (g_persistAfterEOF.load()) {
         AGENT_LOG("main: stdin EOF after relaunch — awaiting handoff on %s",
                   g_commandPipeName.c_str());
@@ -2843,7 +3322,7 @@ int main(int argc, char** argv) {
      * relaunch handoff — keep the agent alive so the window stays readable for
      * post-mortem. The operator closes the window to quit (WM_CLOSE → ExitProcess
      * once g_jvmDiedPostMortem is set by the watchdog). */
-    if (g_windowEnabled.load()) {
+    if (g_windowEnabled.load() && g_independentLifecycle.load()) {
         g_jvmDiedPostMortem.store(true);
         windowPublish("[JVM] command stream ended — window kept open for review, close window to quit");
         for (;;) Sleep(1000);

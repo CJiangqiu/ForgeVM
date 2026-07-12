@@ -3,6 +3,7 @@ package forgevm.core;
 import forgevm.jvm.AgentFilter;
 import forgevm.jvm.JvmControl;
 import forgevm.jvm.NativeFilter;
+import forgevm.jvm.JvmtiFilter;
 import forgevm.jvm.ProcessFilter;
 import forgevm.jvm.RelaunchException;
 import forgevm.memory.MemoryUtil;
@@ -86,16 +87,20 @@ public final class ForgeVM {
     private ForgeVM() {
     }
 
-    /** Whether the next gen0 agent spawn should open the live status window.
-     *  Set by {@link #launch(boolean)}; gen1+ inherit the window via the
-     *  persistent agent (handoff), so it only matters at the first launch. */
-    private static volatile boolean statusWindowRequested = false;
+    /** Policy used when the first agent process is spawned. */
+    private static volatile ForgeVMOptions launchOptions = ForgeVMOptions.defaults();
 
     // -- launch --
 
-    /** Launch ForgeVM without the status window (equivalent to {@code launch(false)}). */
+    /**
+     * Launch ForgeVM with the default startup policy.
+     *
+     * @deprecated Use {@link #launch(ForgeVMOptions)} so lifecycle and JVM
+     * protection policy are explicit.
+     */
+    @Deprecated(since = "0.6.10", forRemoval = false)
     public static LaunchResult launch() {
-        return launch(false);
+        return launch(ForgeVMOptions.defaults());
     }
 
     /**
@@ -103,9 +108,23 @@ public final class ForgeVM {
      * separate-process window streaming [FVM] agent activity and [JVM] target
      * health (thread/CPU sampling, spin/deadlock warnings) in real time. The
      * window lives in the persistent agent and survives relaunch automatically.
+     *
+     * @deprecated Use {@link #launch(ForgeVMOptions)} and set
+     * {@link ForgeVMOptions.Builder#statusWindow(boolean)} instead.
      */
-    public static synchronized LaunchResult launch(boolean withStatusWindow) {
-        statusWindowRequested = withStatusWindow;
+    @Deprecated(since = "0.6.10", forRemoval = false)
+    public static LaunchResult launch(boolean withStatusWindow) {
+        return launch(ForgeVMOptions.builder()
+                .statusWindow(withStatusWindow)
+                .build());
+    }
+
+    /**
+     * Launch ForgeVM with an explicit startup policy. The policy is sent to
+     * the initial agent process and remains fixed for that agent's lifetime.
+     */
+    public static synchronized LaunchResult launch(ForgeVMOptions options) {
+        launchOptions = java.util.Objects.requireNonNull(options, "options");
 
         AgentSession currentSession = agentSession;
         if (currentSession != null && !currentSession.isAlive()) {
@@ -233,6 +252,25 @@ public final class ForgeVM {
         return sendFilterCommand("unban_native_load", null, null);
     }
 
+    // -- JVMTI acquisition guard (native-level, patches JavaVM::GetEnv) --
+
+    /** Block all requests for a JVMTI environment. */
+    public static boolean banJvmti() {
+        return sendFilterCommand("ban_jvmti", null, null);
+    }
+
+    /** Block JVMTI acquisition requests from native modules matching the filter. */
+    public static boolean banJvmti(JvmtiFilter filter) {
+        return sendFilterCommand("ban_jvmti",
+                filter == null ? null : filter.mode().name(),
+                filter == null ? null : filter.patterns());
+    }
+
+    /** Remove the JVMTI acquisition filter. */
+    public static boolean unbanJvmti() {
+        return sendFilterCommand("unban_jvmti", null, null);
+    }
+
     // -- process create guard (loader-level, hooks ntdll!NtCreateUserProcess) --
 
     /** Block all child process creation. */
@@ -255,22 +293,22 @@ public final class ForgeVM {
 
     /** Relaunch the JVM, keeping all existing -javaagent/-agentpath args. Never returns on success. */
     public static void relaunch() throws RelaunchException {
-        relaunchInternal(null, null, null);
+        relaunchInternal(null, null, null, null);
     }
 
     /** Relaunch the JVM, applying agentFilter to -javaagent: args on the new command line. Never returns on success. */
     public static void relaunch(AgentFilter agentFilter) throws RelaunchException {
-        relaunchInternal(agentFilter, null, null);
+        relaunchInternal(agentFilter, null, null, null);
     }
 
     /** Relaunch the JVM, applying nativeFilter to -agentpath: args on the new command line. Never returns on success. */
     public static void relaunch(NativeFilter nativeFilter) throws RelaunchException {
-        relaunchInternal(null, nativeFilter, null);
+        relaunchInternal(null, nativeFilter, null, null);
     }
 
     /** Relaunch the JVM, applying both filters to the new command line. Never returns on success. */
     public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter) throws RelaunchException {
-        relaunchInternal(agentFilter, nativeFilter, null);
+        relaunchInternal(agentFilter, nativeFilter, null, null);
     }
 
     /**
@@ -280,22 +318,66 @@ public final class ForgeVM {
      * Never returns on success.
      */
     public static void relaunch(ProcessFilter processFilter) throws RelaunchException {
-        relaunchInternal(null, null, processFilter);
+        relaunchInternal(null, null, null, processFilter);
     }
 
     /** Relaunch the JVM, applying agentFilter to -javaagent: args and pre-installing processFilter. Never returns on success. */
     public static void relaunch(AgentFilter agentFilter, ProcessFilter processFilter) throws RelaunchException {
-        relaunchInternal(agentFilter, null, processFilter);
+        relaunchInternal(agentFilter, null, null, processFilter);
     }
 
     /** Relaunch the JVM, applying nativeFilter to -agentpath: args and pre-installing processFilter. Never returns on success. */
     public static void relaunch(NativeFilter nativeFilter, ProcessFilter processFilter) throws RelaunchException {
-        relaunchInternal(null, nativeFilter, processFilter);
+        relaunchInternal(null, nativeFilter, null, processFilter);
     }
 
     /** Relaunch the JVM, applying all three filters. Never returns on success. */
     public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter, ProcessFilter processFilter) throws RelaunchException {
-        relaunchInternal(agentFilter, nativeFilter, processFilter);
+        relaunchInternal(agentFilter, nativeFilter, null, processFilter);
+    }
+
+    /** Relaunch with a JVMTI acquisition filter pre-installed once the target JVM exposes jvm.dll. */
+    public static void relaunch(JvmtiFilter jvmtiFilter) throws RelaunchException {
+        relaunchInternal(null, null, jvmtiFilter, null);
+    }
+
+    public static void relaunch(AgentFilter agentFilter, JvmtiFilter jvmtiFilter) throws RelaunchException {
+        relaunchInternal(agentFilter, null, jvmtiFilter, null);
+    }
+
+    public static void relaunch(NativeFilter nativeFilter, JvmtiFilter jvmtiFilter) throws RelaunchException {
+        relaunchInternal(null, nativeFilter, jvmtiFilter, null);
+    }
+
+    public static void relaunch(ProcessFilter processFilter, JvmtiFilter jvmtiFilter) throws RelaunchException {
+        relaunchInternal(null, null, jvmtiFilter, processFilter);
+    }
+
+    public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter,
+                                JvmtiFilter jvmtiFilter) throws RelaunchException {
+        relaunchInternal(agentFilter, nativeFilter, jvmtiFilter, null);
+    }
+
+    public static void relaunch(AgentFilter agentFilter, ProcessFilter processFilter,
+                                JvmtiFilter jvmtiFilter) throws RelaunchException {
+        relaunchInternal(agentFilter, null, jvmtiFilter, processFilter);
+    }
+
+    public static void relaunch(NativeFilter nativeFilter, ProcessFilter processFilter,
+                                JvmtiFilter jvmtiFilter) throws RelaunchException {
+        relaunchInternal(null, nativeFilter, jvmtiFilter, processFilter);
+    }
+
+    /** Relaunch with all four load-time guards configured explicitly. */
+    public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter,
+                                JvmtiFilter jvmtiFilter, ProcessFilter processFilter) throws RelaunchException {
+        relaunchInternal(agentFilter, nativeFilter, jvmtiFilter, processFilter);
+    }
+
+    /** Same four-guard relaunch with JVMTI last, matching the pre-existing process-filter position. */
+    public static void relaunch(AgentFilter agentFilter, NativeFilter nativeFilter,
+                                ProcessFilter processFilter, JvmtiFilter jvmtiFilter) throws RelaunchException {
+        relaunchInternal(agentFilter, nativeFilter, jvmtiFilter, processFilter);
     }
 
     /** Generation of the current JVM in a relaunch chain. Returns 0 for the
@@ -321,14 +403,14 @@ public final class ForgeVM {
     }
 
     private static void relaunchInternal(AgentFilter agentFilter, NativeFilter nativeFilter,
-                                         ProcessFilter processFilter) throws RelaunchException {
+                                          JvmtiFilter jvmtiFilter, ProcessFilter processFilter) throws RelaunchException {
         AgentSession session = agentSession;
         if (session == null || !session.isAlive()) {
             throw new RelaunchException("agent_not_active");
         }
         try {
             int nextGen = relaunchGeneration() + 1;
-            String command = buildRelaunchCommand(agentFilter, nativeFilter, processFilter, nextGen);
+            String command = buildRelaunchCommand(agentFilter, nativeFilter, jvmtiFilter, processFilter, nextGen);
             String response = sendCommand(session, command);
             if (!isOkResponse(response)) {
                 String reason = "relaunch_rejected";
@@ -352,7 +434,8 @@ public final class ForgeVM {
         }
     }
 
-    private static String buildRelaunchCommand(AgentFilter agentFilter, NativeFilter nativeFilter, ProcessFilter processFilter, int nextGen) {
+    private static String buildRelaunchCommand(AgentFilter agentFilter, NativeFilter nativeFilter,
+                                                JvmtiFilter jvmtiFilter, ProcessFilter processFilter, int nextGen) {
         StringBuilder sb = new StringBuilder();
         sb.append("{\"cmd\":\"relaunch\"");
         sb.append(",\"pid\":").append(ProcessHandle.current().pid());
@@ -376,6 +459,17 @@ public final class ForgeVM {
             for (int i = 0; i < np.size(); i++) {
                 if (i > 0) sb.append(',');
                 sb.append('"').append(escapeJson(np.get(i))).append('"');
+            }
+            sb.append(']');
+        }
+        sb.append(",\"hasJvmtiFilter\":").append(jvmtiFilter != null);
+        if (jvmtiFilter != null) {
+            sb.append(",\"jvmtiMode\":\"").append(escapeJson(jvmtiFilter.mode().name().toLowerCase())).append("\"");
+            sb.append(",\"jvmtiPatterns\":[");
+            List<String> jp = jvmtiFilter.patterns();
+            for (int i = 0; i < jp.size(); i++) {
+                if (i > 0) sb.append(',');
+                sb.append('"').append(escapeJson(jp.get(i))).append('"');
             }
             sb.append(']');
         }
@@ -470,12 +564,18 @@ public final class ForgeVM {
                     option(chars('d', 'l', 'l'), dllPath.toAbsolutePath().toString()),
                     "--logdir=" + logDir
             ));
-            /* Optional live status window: requested via launch(true), or the
+            /* Optional live status window: requested via launch(options), or the
              * -Dforgevm.window property as an external fallback. Enabled on the
              * persistent (gen0) agent; later JVM generations reach it via
              * handoff, so the flag belongs only on this fresh-spawn path. */
-            if (statusWindowRequested || System.getProperty("forgevm.window") != null) {
+            if (launchOptions.statusWindow() || System.getProperty("forgevm.window") != null) {
                 agentArgs.add("--window");
+            }
+            if (launchOptions.independentLifecycle()) {
+                agentArgs.add("--independent-lifecycle");
+            }
+            if (launchOptions.lockJvm()) {
+                agentArgs.add("--lock-jvm");
             }
             Process process = startProcessReflectively(agentArgs);
 

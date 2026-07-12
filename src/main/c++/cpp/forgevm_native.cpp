@@ -3,6 +3,7 @@
 #include <psapi.h>
 #include <shellapi.h>
 #include <string.h>
+#include <algorithm>
 
 /* ============================================================
  * File-based logging implementation
@@ -643,7 +644,10 @@ namespace {
     };
     extern PatchState g_javaAgentPatch;
     extern PatchState g_nativeLoadPatch;
+    extern PatchState g_jvmtiPatch;
     extern PatchState g_processCreatePatch;
+    extern uint64_t g_jvmtiGetEnvAddr;
+    extern bool g_jvmtiGetEnvLocateFailed;
 }
 
 extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long targetPid) {
@@ -660,6 +664,9 @@ extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long
     if (oldPid != newPid) {
         g_javaAgentPatch     = PatchState{};
         g_nativeLoadPatch    = PatchState{};
+        g_jvmtiPatch         = PatchState{};
+        g_jvmtiGetEnvAddr = 0;
+        g_jvmtiGetEnvLocateFailed = false;
         g_processCreatePatch = PatchState{};
         FVM_LOG("bootstrap_target: target pid changed %lu -> %lu, patch state cleared",
                 (unsigned long)oldPid, (unsigned long)newPid);
@@ -825,7 +832,10 @@ namespace {
     /* Definitions for the forward-declared globals above. */
     PatchState g_javaAgentPatch;
     PatchState g_nativeLoadPatch;
+    PatchState g_jvmtiPatch;
     PatchState g_processCreatePatch;
+    uint64_t g_jvmtiGetEnvAddr = 0;
+    bool g_jvmtiGetEnvLocateFailed = false;
 }
 
 // Write to remote code section (handles VirtualProtectEx for .text pages)
@@ -1692,7 +1702,6 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
 
 static void serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
                                 const std::vector<std::string>& patterns) {
-    (void)mode;
     const size_t kBlob = 0x310;
     const size_t kEnd  = 0x400;
     size_t pos = kBlob + 1;   // reserve count byte
@@ -1709,8 +1718,19 @@ static void serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
         }
         if (!matchAll && (core.find('*') != std::string::npos ||
                           core.find('?') != std::string::npos)) {
-            FVM_LOG("serializeFilterBlob: skip unsupported pattern '%s' (internal wildcard)",
+            /* The resident matcher is deliberately allocation-free and accepts
+             * one literal core. Never silently drop a security rule: an
+             * unsupported blacklist entry becomes match-all (block all), while
+             * an unsupported whitelist entry is omitted (allow none through
+             * that entry). Both directions fail closed. */
+            FVM_LOG("serializeFilterBlob: unsupported pattern '%s' -> fail closed",
                     pat.c_str());
+            if (mode == 1) {
+                if (pos + 1 > kEnd) break;
+                buf[pos++] = 0;
+                count++;
+                break;
+            }
             continue;
         }
         if (matchAll) {
@@ -1982,6 +2002,356 @@ extern "C" __declspec(dllexport) int forgevm_ban_native_load(int mode, const cha
 
 extern "C" __declspec(dllexport) int forgevm_unban_native_load() {
     return uninstallFilterTrampoline(g_nativeLoadPatch, "unban_native_load");
+}
+
+/* ============================================================
+ * JavaVM::GetEnv hook — JVMTI acquisition guard
+ *
+ * JNIInvokeInterface begins with three reserved NULL pointers followed by
+ * DestroyJavaVM, AttachCurrentThread, DetachCurrentThread, GetEnv and
+ * AttachCurrentThreadAsDaemon.  HotSpot keeps this immutable table inside
+ * jvm.dll.  We locate it structurally instead of relying on private symbols or
+ * version-specific RVAs, and accept the result only when every candidate agrees
+ * on one executable GetEnv address.
+ *
+ * Caller identity is compiled to module address ranges when the policy is
+ * installed/refreshed.  A module that appears later is deliberately unknown and
+ * therefore denied: this keeps both blacklist and whitelist modes fail-closed.
+ * Reissuing banJvmti(filter) refreshes the range table without repatching code.
+ * ============================================================ */
+
+struct JvmtiModuleRule {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    bool allow = false;
+};
+
+static bool globMatchPath(const std::string& pattern, const std::string& text) {
+    auto norm = [](unsigned char c) -> unsigned char {
+        if (c >= 'A' && c <= 'Z') c = static_cast<unsigned char>(c - 'A' + 'a');
+        if (c == '\\') c = '/';
+        return c;
+    };
+    size_t pi = 0, ti = 0, starPi = std::string::npos, starTi = 0;
+    while (ti < text.size()) {
+        if (pi < pattern.size() && pattern[pi] == '*') {
+            starPi = pi++;
+            starTi = ti;
+        } else if (pi < pattern.size() &&
+                   (pattern[pi] == '?' || norm((unsigned char)pattern[pi]) == norm((unsigned char)text[ti]))) {
+            ++pi; ++ti;
+        } else if (starPi != std::string::npos) {
+            pi = starPi + 1;
+            ti = ++starTi;
+        } else {
+            return false;
+        }
+    }
+    while (pi < pattern.size() && pattern[pi] == '*') ++pi;
+    return pi == pattern.size();
+}
+
+static std::string widePathToUtf8(const wchar_t* value) {
+    if (value == nullptr || *value == L'\0') return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return {};
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value, -1, &out[0], n, nullptr, nullptr);
+    out.pop_back();
+    return out;
+}
+
+static bool isExecutableImageAddress(HANDLE proc, uint64_t addr) {
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0) return false;
+    DWORD p = mbi.Protect & 0xFF;
+    bool exec = p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ ||
+                p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+    return mbi.State == MEM_COMMIT && exec;
+}
+
+static bool isReadonlyDataAddress(HANDLE proc, uint64_t addr) {
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0) return false;
+    DWORD p = mbi.Protect & 0xFF;
+    bool executable = p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ ||
+                      p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+    return mbi.State == MEM_COMMIT && !executable &&
+           (p == PAGE_READONLY || p == PAGE_READWRITE || p == PAGE_WRITECOPY);
+}
+
+static uint64_t locateJavaVmGetEnv(HANDLE proc) {
+    if (g_jvmtiGetEnvAddr != 0) return g_jvmtiGetEnvAddr;
+    if (g_jvmtiGetEnvLocateFailed) return 0;
+
+    const uint64_t base = g_target.jvmDllBase;
+    const uint64_t size = g_target.jvmDllSize;
+    if (base == 0 || size < 64) {
+        g_jvmtiGetEnvLocateFailed = true;
+        return 0;
+    }
+
+    const size_t chunkSize = 1 << 20;
+    std::vector<uint8_t> chunk(chunkSize + 64);
+    struct Candidate { uint64_t tableAddr; uint64_t getEnvAddr; };
+    std::vector<Candidate> candidates;
+    std::unordered_set<uint64_t> candidateTables;
+    for (uint64_t off = 0; off < size; off += chunkSize) {
+        size_t want = static_cast<size_t>(std::min<uint64_t>(chunk.size(), size - off));
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(base + off), chunk.data(), want, &got) || got < 64) {
+            continue;
+        }
+        for (size_t i = 0; i + 64 <= got; i += sizeof(uint64_t)) {
+            const uint64_t* q = reinterpret_cast<const uint64_t*>(chunk.data() + i);
+            if (q[0] != 0 || q[1] != 0 || q[2] != 0) continue;
+            uint64_t tableAddr = base + off + i;
+            if (!isReadonlyDataAddress(proc, tableAddr)) continue;
+            bool functionsValid = true;
+            for (int k = 3; k <= 7; ++k) {
+                if (q[k] < base || q[k] >= base + size || !isExecutableImageAddress(proc, q[k])) {
+                    functionsValid = false;
+                    break;
+                }
+            }
+            if (functionsValid && candidateTables.insert(tableAddr).second) {
+                candidates.push_back({tableAddr, q[6]});
+            }
+        }
+    }
+
+    /* A function-table-shaped block alone is not unique in modern HotSpot. The
+     * real JNI invocation table is referenced by the JavaVM object in jvm.dll's
+     * writable data. Require exactly one non-executable pointer reference before
+     * accepting it; this is the discriminator Oracle JDK 17 needs. */
+    std::unordered_set<uint64_t> getEnvTargets;
+    size_t referencedTables = 0;
+    for (const auto& candidate : candidates) {
+        size_t refs = 0;
+        for (uint64_t off = 0; off < size; off += chunkSize) {
+            size_t want = static_cast<size_t>(std::min<uint64_t>(chunk.size(), size - off));
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(base + off), chunk.data(), want, &got) || got < sizeof(uint64_t)) {
+                continue;
+            }
+            for (size_t i = 0; i + sizeof(uint64_t) <= got; i += sizeof(uint64_t)) {
+                uint64_t value = *reinterpret_cast<const uint64_t*>(chunk.data() + i);
+                uint64_t refAddr = base + off + i;
+                if (value == candidate.tableAddr && isReadonlyDataAddress(proc, refAddr)) ++refs;
+            }
+        }
+        if (refs == 1) {
+            ++referencedTables;
+            getEnvTargets.insert(candidate.getEnvAddr);
+        }
+    }
+    if (referencedTables != 1 || getEnvTargets.size() != 1) {
+        FVM_LOG("ban_jvmti: JNIInvokeInterface shapes=%zu referenced=%zu GetEnv targets=%zu",
+                candidates.size(), referencedTables, getEnvTargets.size());
+        g_jvmtiGetEnvLocateFailed = true;
+        return 0;
+    }
+    g_jvmtiGetEnvAddr = *getEnvTargets.begin();
+    FVM_LOG("ban_jvmti: uniquely located JNIInvokeInterface GetEnv @ 0x%llX",
+            (unsigned long long)g_jvmtiGetEnvAddr);
+    return g_jvmtiGetEnvAddr;
+}
+
+static bool buildJvmtiModuleRules(int mode, const std::vector<std::string>& patterns,
+                                  std::vector<JvmtiModuleRule>* out) {
+    out->clear();
+    HANDLE proc = g_target.handle;
+    std::vector<HMODULE> modules(256);
+    DWORD needed = 0;
+    for (;;) {
+        if (!EnumProcessModulesEx(proc, modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
+                                  &needed, LIST_MODULES_ALL)) return false;
+        if (needed <= modules.size() * sizeof(HMODULE)) break;
+        modules.resize(needed / sizeof(HMODULE) + 32);
+    }
+    modules.resize(needed / sizeof(HMODULE));
+    for (HMODULE module : modules) {
+        MODULEINFO mi = {};
+        wchar_t path[32768] = {};
+        if (!GetModuleInformation(proc, module, &mi, sizeof(mi)) || mi.lpBaseOfDll == nullptr || mi.SizeOfImage == 0) continue;
+        if (GetModuleFileNameExW(proc, module, path, ARRAYSIZE(path)) == 0) continue;
+        std::string utf8 = widePathToUtf8(path);
+        bool matched = false;
+        for (const auto& pattern : patterns) {
+            if (globMatchPath(pattern, utf8)) { matched = true; break; }
+        }
+        bool allow = mode == 0 ? false : (mode == 1 ? !matched : matched);
+        uint64_t begin = reinterpret_cast<uint64_t>(mi.lpBaseOfDll);
+        out->push_back({begin, begin + mi.SizeOfImage, allow});
+    }
+    return !out->empty();
+}
+
+static std::vector<uint8_t> buildJvmtiGetEnvTrampoline(const uint8_t* savedPrologue,
+                                                        size_t prologueLen,
+                                                        uint64_t origPlusN,
+                                                        int mode,
+                                                        const std::vector<JvmtiModuleRule>& rules) {
+    const size_t kPage = 0x1000;
+    const size_t SLOT_JMP = 0x400;
+    const size_t SLOT_MODE = 0x408;
+    const size_t SLOT_COUNT = 0x409;
+    const size_t SLOT_RULES = 0x410;
+    std::vector<uint8_t> image(kPage, 0xCC);
+    std::vector<uint8_t> code;
+    TrampAsm a(code);
+
+    // Preserve GetEnv arguments. Original return address is at [rsp+0x88].
+    a.emit({0x48,0x81,0xEC,0x88,0x00,0x00,0x00});
+    a.emit({0x48,0x89,0x4C,0x24,0x40});
+    a.emit({0x48,0x89,0x54,0x24,0x48});
+    a.emit({0x4C,0x89,0x44,0x24,0x50});
+    a.emit({0x4C,0x89,0x4C,0x24,0x58});
+
+    // Only JVMTI versions (interface type 0x30000000) are policy-controlled.
+    a.emit({0x44,0x89,0xC0});                         // mov eax,r8d
+    a.emit({0x25,0x00,0x00,0x00,0x70});              // and eax,70000000h
+    a.emit({0x3D,0x00,0x00,0x00,0x30});              // cmp eax,30000000h
+    a.jcc(0x85, "allow");
+    a.emit({0x0F,0xB6,0x05}); a.ripDisp(SLOT_MODE);
+    a.emit({0x84,0xC0});
+    a.jcc(0x84, "block");                            // mode 0 = block all
+
+    a.emit({0x48,0x8B,0x84,0x24,0x88,0x00,0x00,0x00}); // caller return address
+    a.emit({0x0F,0xB6,0x0D}); a.ripDisp(SLOT_COUNT);  // ecx=count
+    a.emit({0x4C,0x8D,0x15}); a.ripDisp(SLOT_RULES);  // r10=rules
+    a.label("range_loop");
+    a.emit({0x85,0xC9});
+    a.jcc(0x84, "block");                            // unknown future module: fail closed
+    a.emit({0x4D,0x8B,0x1A});                        // r11=[r10].begin
+    a.emit({0x4C,0x39,0xD8});                        // cmp rax,r11
+    a.jcc(0x82, "range_next");
+    a.emit({0x4D,0x8B,0x5A,0x08});                   // r11=[r10+8].end
+    a.emit({0x4C,0x39,0xD8});
+    a.jcc(0x83, "range_next");
+    a.emit({0x41,0x0F,0xB6,0x52,0x10});              // edx=allow
+    a.emit({0x84,0xD2});
+    a.jcc(0x85, "allow");
+    a.jmp("block");
+    a.label("range_next");
+    a.emit({0x49,0x83,0xC2,0x18});                   // next 24-byte record
+    a.emit({0xFF,0xC9});
+    a.jmp("range_loop");
+
+    a.label("allow");
+    a.emit({0x48,0x8B,0x4C,0x24,0x40});
+    a.emit({0x48,0x8B,0x54,0x24,0x48});
+    a.emit({0x4C,0x8B,0x44,0x24,0x50});
+    a.emit({0x4C,0x8B,0x4C,0x24,0x58});
+    a.emit({0x48,0x81,0xC4,0x88,0x00,0x00,0x00});
+    for (size_t i = 0; i < prologueLen; ++i) code.push_back(savedPrologue[i]);
+    a.emit({0xFF,0x25}); a.ripDisp(SLOT_JMP);
+
+    a.label("block");
+    a.emit({0x48,0x8B,0x54,0x24,0x48});              // penv
+    a.emit({0x48,0x85,0xD2});
+    a.jcc(0x84, "block_ret");
+    a.emit({0x48,0xC7,0x02,0x00,0x00,0x00,0x00});   // *penv=null
+    a.label("block_ret");
+    a.emit({0x48,0x81,0xC4,0x88,0x00,0x00,0x00});
+    a.emit({0xB8,0xFD,0xFF,0xFF,0xFF});              // JNI_EVERSION (-3)
+    a.emit({0xC3});
+
+    if (!a.resolve() || code.size() > SLOT_JMP || rules.size() > 255 ||
+        SLOT_RULES + rules.size() * 24 > image.size()) return {};
+    memcpy(image.data(), code.data(), code.size());
+    writeU64(image, SLOT_JMP, origPlusN);
+    image[SLOT_MODE] = static_cast<uint8_t>(mode);
+    image[SLOT_COUNT] = static_cast<uint8_t>(rules.size());
+    size_t pos = SLOT_RULES;
+    for (const auto& rule : rules) {
+        writeU64(image, pos, rule.begin);
+        writeU64(image, pos + 8, rule.end);
+        image[pos + 16] = rule.allow ? 1 : 0;
+        pos += 24;
+    }
+    return image;
+}
+
+static int installJvmtiFilter(int mode, const std::vector<std::string>& patterns) {
+    HANDLE proc = g_target.handle;
+    if (proc == NULL || g_target.jvmDllBase == 0) { setError("no_target_handle"); return 0; }
+
+    std::vector<JvmtiModuleRule> rules;
+    if (!buildJvmtiModuleRules(mode, patterns, &rules)) { setError("module_rules_failed"); return 0; }
+    if (rules.size() > 255) { setError("too_many_modules"); return 0; }
+
+    if (g_jvmtiPatch.patched) {
+        auto image = buildJvmtiGetEnvTrampoline(g_jvmtiPatch.original, g_jvmtiPatch.patchSize,
+                                                g_jvmtiPatch.targetAddr + g_jvmtiPatch.patchSize,
+                                                mode, rules);
+        if (image.empty() || !writeRemoteMem(proc, g_jvmtiPatch.trampolineAddr, image.data(), image.size())) {
+            setError("policy_refresh_failed"); return 0;
+        }
+        FlushInstructionCache(proc, reinterpret_cast<LPCVOID>(g_jvmtiPatch.trampolineAddr), image.size());
+        setError("ok"); return 1;
+    }
+
+    uint64_t addr = locateJavaVmGetEnv(proc);
+    if (addr == 0) { setError("jni_getenv_not_found_or_ambiguous"); return 0; }
+    uint8_t saved[16] = {};
+    if (!readRemoteMem(proc, addr, saved, sizeof(saved))) { setError("read_original_failed"); return 0; }
+    uint8_t b0 = saved[0];
+    if (b0 == 0xE8 || b0 == 0xE9 || b0 == 0xEB || (b0 >= 0x70 && b0 <= 0x7F) || b0 == 0xFF) {
+        setError("dangerous_prologue"); return 0;
+    }
+    size_t prologueLen = alignedPrologueLen(saved, sizeof(saved), 5);
+    if (prologueLen == 0 || prologueLen > sizeof(g_jvmtiPatch.original)) {
+        setError("unsupported_prologue"); return 0;
+    }
+
+    const size_t kPage = 0x1000;
+    uint64_t hint = findFreeRegionNear(proc, addr, kPage);
+    if (hint == 0) { setError("no_near_region"); return 0; }
+    void* allocated = VirtualAllocEx(proc, reinterpret_cast<LPVOID>(hint), kPage,
+                                    MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!allocated) { setError("trampoline_alloc_failed"); return 0; }
+    uint64_t tramp = reinterpret_cast<uint64_t>(allocated);
+    int64_t delta64 = static_cast<int64_t>(tramp) - static_cast<int64_t>(addr + 5);
+    if (delta64 < INT32_MIN || delta64 > INT32_MAX) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("trampoline_out_of_range"); return 0;
+    }
+    auto image = buildJvmtiGetEnvTrampoline(saved, prologueLen, addr + prologueLen, mode, rules);
+    if (image.empty() || !writeRemoteMem(proc, tramp, image.data(), image.size())) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("trampoline_write_failed"); return 0;
+    }
+    FlushInstructionCache(proc, reinterpret_cast<LPCVOID>(tramp), image.size());
+
+    uint8_t patch[16] = {0xE9};
+    int32_t delta = static_cast<int32_t>(delta64);
+    memcpy(patch + 1, &delta, sizeof(delta));
+    for (size_t i = 5; i < prologueLen; ++i) patch[i] = 0x90;
+    if (!writeRemoteCode(proc, addr, patch, prologueLen)) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("write_patch_failed"); return 0;
+    }
+    uint8_t verify[16] = {};
+    if (!readRemoteMem(proc, addr, verify, prologueLen) || memcmp(verify, patch, prologueLen) != 0) {
+        writeRemoteCode(proc, addr, saved, prologueLen);
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("verify_failed"); return 0;
+    }
+    g_jvmtiPatch.targetAddr = addr;
+    memcpy(g_jvmtiPatch.original, saved, prologueLen);
+    g_jvmtiPatch.patchSize = prologueLen;
+    g_jvmtiPatch.patched = true;
+    g_jvmtiPatch.trampolineAddr = tramp;
+    g_jvmtiPatch.trampolineSize = kPage;
+    g_jvmtiPatch.trampolineInstalled = true;
+    FVM_LOG("ban_jvmti: JavaVM::GetEnv @ 0x%llX, modules=%zu", (unsigned long long)addr, rules.size());
+    setError("ok");
+    return 1;
+}
+
+extern "C" __declspec(dllexport) int forgevm_ban_jvmti(int mode, const char* patternsLF) {
+    return installJvmtiFilter(mode, splitPatternsLF(patternsLF));
+}
+
+extern "C" __declspec(dllexport) int forgevm_unban_jvmti() {
+    return uninstallFilterTrampoline(g_jvmtiPatch, "unban_jvmti");
 }
 
 /* ============================================================

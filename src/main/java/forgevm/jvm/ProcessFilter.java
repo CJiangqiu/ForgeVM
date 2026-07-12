@@ -7,7 +7,9 @@ import java.util.List;
  *
  * <p>Matching is performed against the image path of the process being created
  * (NT path with leading {@code \??\} stripped where present).
- * Patterns use glob syntax: {@code *} matches any sequence, {@code ?} matches a single char.
+ * Patterns are matched case-insensitively as path substrings; surrounding
+ * {@code *} characters are accepted for readability. Unsupported internal
+ * wildcards fail closed in the native guard instead of being silently ignored.
  *
  * <pre>{@code
  * // block any process whose path contains "processproxy":
@@ -17,7 +19,7 @@ import java.util.List;
  * ForgeVM.banProcessCreate(ProcessFilter.Whitelist("*\\java.exe", "*\\javaw.exe"));
  *
  * // multiple patterns:
- * ForgeVM.banProcessCreate(ProcessFilter.Blacklist("*cheat*.exe", "*inject*.exe"));
+ * ForgeVM.banProcessCreate(ProcessFilter.Blacklist("*cheat*", "*inject*"));
  * }</pre>
  */
 public final class ProcessFilter {

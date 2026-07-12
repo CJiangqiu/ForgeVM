@@ -7,7 +7,9 @@ import java.util.List;
  *
  * <p>Matching is performed against the agent's library path (the first
  * argument passed to {@code VirtualMachine.loadAgent} / {@code loadAgentPath}).
- * Patterns use glob syntax: {@code *} matches any sequence, {@code ?} matches a single char.
+ * Patterns are matched case-insensitively as path substrings; surrounding
+ * {@code *} characters are accepted for readability. Unsupported internal
+ * wildcards fail closed in the native guard instead of being silently ignored.
  *
  * <pre>{@code
  * // block only agents whose path contains "cheat-agent":
@@ -17,7 +19,7 @@ import java.util.List;
  * ForgeVM.banJavaAgent(AgentFilter.Whitelist("*monitoring-*"));
  *
  * // multiple patterns:
- * ForgeVM.banJavaAgent(AgentFilter.Blacklist("*evil*", "*trojan*.jar"));
+ * ForgeVM.banJavaAgent(AgentFilter.Blacklist("*evil*", "*trojan*"));
  * }</pre>
  */
 public final class AgentFilter {
