@@ -15,7 +15,7 @@
 
 ForgeVM 是一个面向 Windows x64 JVM 的进程外运行时控制库。它由 Java API、独立 agent 和 native DLL 组成：Java 侧描述操作，agent 在 JVM 外执行进程控制与内存访问，native DLL 负责识别 HotSpot 结构、安装 hook 和执行字节码计划。
 
-它适合需要在不使用 `Unsafe`、`Instrumentation` 或普通 JVMTI 工作流的前提下，对运行中的 JVM 做受控修改、拦截和生命周期保护的场景。它不是通用 Java 框架，也不是沙箱；使用前应先阅读本文的安全边界。
+它适合需要在不使用 `Unsafe`、`Instrumentation` 或普通 JVMTI 工作流的前提下，对运行中的 JVM 做受控修改、拦截和生命周期保护的场景。它不是通用 Java 框架；使用前请确保运行环境适合 ForgeVM。
 
 ## 目录
 
@@ -302,7 +302,7 @@ cl.exe /std:c++17 /EHsc /utf-8 /O2 `
 
 ForgeVM is an out-of-process runtime-control library for Windows x64 JVMs. A Java API describes an operation; a standalone agent performs process control and memory work outside the JVM; the native DLL recognizes HotSpot structures, installs hooks, and applies bytecode plans.
 
-It is intended for controlled runtime modification, interception, and JVM-lifecycle protection where ordinary `Unsafe`, `Instrumentation`, or a conventional JVMTI workflow is not the chosen integration point.
+It is intended for controlled runtime modification, interception, and JVM-lifecycle protection where ordinary `Unsafe`, `Instrumentation`, or a conventional JVMTI workflow is not the chosen integration point. It is not a general-purpose Java framework; ensure the runtime environment is appropriate for ForgeVM before use.
 
 ## Contents
 
