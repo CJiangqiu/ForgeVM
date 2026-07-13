@@ -646,52 +646,20 @@ namespace {
     extern PatchState g_nativeLoadPatch;
     extern PatchState g_jvmtiPatch;
     extern PatchState g_processCreatePatch;
+    extern PatchState g_terminatePatch;
+    extern PatchState g_jvmHaltPatch;
+    extern PatchState g_sectionImagePatch;
+    extern PatchState g_createProcessExPatch;
     extern uint64_t g_jvmtiGetEnvAddr;
     extern bool g_jvmtiGetEnvLocateFailed;
 }
 
-extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long targetPid) {
-    FVM_LOG("forgevm_bootstrap_target(pid=%llu)", targetPid);
-    DWORD oldPid = g_target.pid;
-    DWORD newPid = static_cast<DWORD>(targetPid);
-    if (g_target.handle != NULL) {
-        CloseHandle(g_target.handle);
-        g_target = TargetProcess{};
-    }
-    /* Patch state is per-target: when the target PID changes, the previous
-     * target's trampolines live in an address space that's gone, so reset to
-     * avoid future install calls bailing with "already_patched". */
-    if (oldPid != newPid) {
-        g_javaAgentPatch     = PatchState{};
-        g_nativeLoadPatch    = PatchState{};
-        g_jvmtiPatch         = PatchState{};
-        g_jvmtiGetEnvAddr = 0;
-        g_jvmtiGetEnvLocateFailed = false;
-        g_processCreatePatch = PatchState{};
-        FVM_LOG("bootstrap_target: target pid changed %lu -> %lu, patch state cleared",
-                (unsigned long)oldPid, (unsigned long)newPid);
-    }
-    g_structMap.clear();
-    g_typeMap.clear();
-    g_intConstants.clear();
-    g_longConstants.clear();
-    g_fieldInfoCache.clear();
-
-    if (targetPid == 0ULL) {
-        setError("target_pid_zero");
-        return 0;
-    }
-
-    HANDLE proc = OpenProcess(
-        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
-        FALSE, static_cast<DWORD>(targetPid));
-    if (proc == NULL) {
-        setError("open_target_process_failed");
-        return 0;
-    }
-
+/* Common bootstrap logic shared by forgevm_bootstrap_target and
+ * forgevm_bootstrap_target_with_handle. The caller is responsible for
+ * obtaining a handle with VM permissions and closing any previous target. */
+static int bootstrapTargetCommon(HANDLE proc, DWORD targetPid) {
     g_target.handle = proc;
-    g_target.pid = static_cast<DWORD>(targetPid);
+    g_target.pid = targetPid;
 
     if (!findModuleBase(proc, L"jvm.dll", &g_target.jvmDllBase, &g_target.jvmDllSize)) {
         setError("jvm_dll_not_found");
@@ -707,7 +675,6 @@ extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long
     readEntryLayoutOffsets(proc, jvmBase, &structLayout, &typeLayout, &intLayout, &longLayout);
 
     uint64_t structsPtr = 0, typesPtr = 0, intConstsPtr = 0, longConstsPtr = 0;
-
     if (!parsePEExport(proc, jvmBase, "gHotSpotVMStructs", &structsPtr) || structsPtr == 0) {
         setError("export_not_found:gHotSpotVMStructs");
         return 0;
@@ -741,6 +708,102 @@ extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long
             (unsigned long long)g_target.narrowKlassBase, g_target.narrowKlassShift);
     setError("ok");
     return 1;
+}
+
+extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long targetPid) {
+    FVM_LOG("forgevm_bootstrap_target(pid=%llu)", targetPid);
+    DWORD oldPid = g_target.pid;
+    DWORD newPid = static_cast<DWORD>(targetPid);
+    if (g_target.handle != NULL) {
+        CloseHandle(g_target.handle);
+        g_target = TargetProcess{};
+    }
+    /* Patch state is per-target: when the target PID changes, the previous
+     * target's trampolines live in an address space that's gone, so reset to
+     * avoid future install calls bailing with "already_patched". */
+    if (oldPid != newPid) {
+        g_javaAgentPatch     = PatchState{};
+        g_nativeLoadPatch    = PatchState{};
+        g_jvmtiPatch         = PatchState{};
+        g_jvmtiGetEnvAddr = 0;
+        g_jvmtiGetEnvLocateFailed = false;
+        g_processCreatePatch = PatchState{};
+        g_terminatePatch     = PatchState{};
+        g_jvmHaltPatch     = PatchState{};
+        g_sectionImagePatch   = PatchState{};
+        g_createProcessExPatch = PatchState{};
+        FVM_LOG("bootstrap_target: target pid changed %lu -> %lu, patch state cleared",
+                (unsigned long)oldPid, (unsigned long)newPid);
+    }
+    g_structMap.clear();
+    g_typeMap.clear();
+    g_intConstants.clear();
+    g_longConstants.clear();
+    g_fieldInfoCache.clear();
+
+    if (targetPid == 0ULL) {
+        setError("target_pid_zero");
+        return 0;
+    }
+
+    HANDLE proc = OpenProcess(
+        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
+        FALSE, static_cast<DWORD>(targetPid));
+    if (proc == NULL) {
+        setError("open_target_process_failed");
+        return 0;
+    }
+
+    return bootstrapTargetCommon(proc, newPid);
+}
+
+/* Variant that accepts a pre-opened handle. Required after the comprehensive
+ * DACL is applied: OpenProcess with VM permissions is denied by the DACL,
+ * so the agent must pass the handle it opened before the DACL change
+ * (e.g. pi.hProcess from CreateProcessW). The handle is duplicated so the
+ * caller retains ownership of its copy. */
+extern "C" __declspec(dllexport) int forgevm_bootstrap_target_with_handle(unsigned long long targetPid, void* externalHandle) {
+    FVM_LOG("forgevm_bootstrap_target_with_handle(pid=%llu)", targetPid);
+    DWORD oldPid = g_target.pid;
+    DWORD newPid = static_cast<DWORD>(targetPid);
+    if (g_target.handle != NULL) {
+        CloseHandle(g_target.handle);
+        g_target = TargetProcess{};
+    }
+    if (oldPid != newPid) {
+        g_javaAgentPatch     = PatchState{};
+        g_nativeLoadPatch    = PatchState{};
+        g_jvmtiPatch         = PatchState{};
+        g_jvmtiGetEnvAddr = 0;
+        g_jvmtiGetEnvLocateFailed = false;
+        g_processCreatePatch = PatchState{};
+        g_terminatePatch     = PatchState{};
+        g_jvmHaltPatch     = PatchState{};
+        g_sectionImagePatch   = PatchState{};
+        g_createProcessExPatch = PatchState{};
+        FVM_LOG("bootstrap_target_with_handle: target pid changed %lu -> %lu, patch state cleared",
+                (unsigned long)oldPid, (unsigned long)newPid);
+    }
+    g_structMap.clear();
+    g_typeMap.clear();
+    g_intConstants.clear();
+    g_longConstants.clear();
+    g_fieldInfoCache.clear();
+
+    if (targetPid == 0ULL || externalHandle == NULL) {
+        setError("invalid_argument");
+        return 0;
+    }
+
+    HANDLE proc = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), externalHandle, GetCurrentProcess(), &proc,
+                         PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
+                         FALSE, 0)) {
+        setError("duplicate_handle_failed");
+        return 0;
+    }
+
+    return bootstrapTargetCommon(proc, newPid);
 }
 
 extern "C" __declspec(dllexport) int forgevm_shutdown() {
@@ -834,6 +897,10 @@ namespace {
     PatchState g_nativeLoadPatch;
     PatchState g_jvmtiPatch;
     PatchState g_processCreatePatch;
+    PatchState g_terminatePatch;
+    PatchState g_jvmHaltPatch;
+    PatchState g_sectionImagePatch;
+    PatchState g_createProcessExPatch;
     uint64_t g_jvmtiGetEnvAddr = 0;
     bool g_jvmtiGetEnvLocateFailed = false;
 }
@@ -1073,6 +1140,14 @@ static void emitSubstringMatcher(TrampAsm& a, bool wide) {
     a.emit({0x84, 0xD2});                       // test dl, dl
     a.jcc(0x84, "block");                       // whitelist + no match → block
     a.jmp("allow");
+}
+
+/* Increment a qword in the trampoline's private data page without touching
+ * application state. The counters are sampled by the out-of-process agent, so
+ * the hot hooks never perform I/O or IPC under the loader lock. */
+static void emitAuditIncrement(TrampAsm& a, size_t slot) {
+    a.emit({0xF0, 0x48, 0xFF, 0x05});  // lock inc qword ptr [rip+disp32]
+    a.ripDisp(slot);
 }
 
 /* ---- conservative x64 prologue length decoder ----------------------------
@@ -1533,12 +1608,14 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
                                                       int mode,
                                                       const std::vector<std::string>& patterns,
                                                       bool replaySavedPrologue) {
-    const size_t kPageSize = 0x400;
+    const size_t kPageSize = 0x1000;
     std::vector<uint8_t> buf(kPageSize, 0xCC);
 
     const size_t SLOT_JMP  = 0x300;   // qword: absolute jump-on / chain target
     const size_t SLOT_MODE = 0x308;   // byte: 0=None(block all), 1=Blacklist, 2=Whitelist
     const size_t SLOT_BLOB = 0x310;   // [count:1] then per pattern [len:1][bytes]
+    const size_t SLOT_ALLOW_COUNT = 0x800;
+    const size_t SLOT_BLOCK_COUNT = 0x808;
 
     std::vector<uint8_t> code;
     code.reserve(0x300);
@@ -1664,6 +1741,7 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
 
     // --- allow: restore args, replay/skip prologue, jump on ---
     a.label("allow");
+    emitAuditIncrement(a, SLOT_ALLOW_COUNT);
     a.emit({0x48, 0x8B, 0x8C, 0x24, 0x58, 0x04, 0x00, 0x00});  // mov rcx, [rsp+0x458]
     a.emit({0x48, 0x8B, 0x94, 0x24, 0x60, 0x04, 0x00, 0x00});  // mov rdx, [rsp+0x460]
     a.emit({0x4C, 0x8B, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});  // mov r8, [rsp+0x468]
@@ -1679,6 +1757,7 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
 
     // --- block: return STATUS_DLL_NOT_FOUND ---
     a.label("block");
+    emitAuditIncrement(a, SLOT_BLOCK_COUNT);
     a.emit({0x48, 0x81, 0xC4, 0x78, 0x04, 0x00, 0x00});  // add rsp, 0x478
     a.emit({0xB8, 0x35, 0x01, 0x00, 0xC0});              // mov eax, 0xC0000135
     a.emit({0xC3});                                       // ret
@@ -1697,6 +1776,8 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
     writeU64(buf, SLOT_JMP, origPlusN);
     buf[SLOT_MODE] = static_cast<uint8_t>(mode);
     serializeFilterBlob(buf, mode, patterns);
+    writeU64(buf, SLOT_ALLOW_COUNT, 0);
+    writeU64(buf, SLOT_BLOCK_COUNT, 0);
     return buf;
 }
 
@@ -1895,7 +1976,7 @@ static int installLdrLoadDllFilter(PatchState& state, int mode,
     }
     FVM_LOG("ban_native_load: prologue copy length = %zu bytes", prologueLen);
 
-    const size_t kPage = 0x400;
+    const size_t kPage = 0x1000;
     uint64_t allocHint = findFreeRegionNear(proc, addr, kPage);
     if (allocHint == 0) {
         setError("no_nearby_free_region");
@@ -1996,12 +2077,258 @@ extern "C" __declspec(dllexport) int forgevm_unban_java_agent() {
 /* mode: 0=None(block all), 1=Blacklist, 2=Whitelist. patternsLF: patterns
  * joined by '\n' (may be empty/NULL). Decisions are made in-process by the
  * trampoline against this resident pattern set — no per-load IPC. */
+static int installNtCreateSectionGuard();
+static int installNtCreateProcessExBlock();
+
 extern "C" __declspec(dllexport) int forgevm_ban_native_load(int mode, const char* patternsLF) {
-    return installLdrLoadDllFilter(g_nativeLoadPatch, mode, splitPatternsLF(patternsLF));
+    int r = installLdrLoadDllFilter(g_nativeLoadPatch, mode, splitPatternsLF(patternsLF));
+    installNtCreateSectionGuard();
+    return r;
 }
 
 extern "C" __declspec(dllexport) int forgevm_unban_native_load() {
-    return uninstallFilterTrampoline(g_nativeLoadPatch, "unban_native_load");
+    uninstallFilterTrampoline(g_nativeLoadPatch, "unban_native_load");
+    uninstallFilterTrampoline(g_sectionImagePatch, "unban_section_image");
+    return 1;
+}
+
+/* ============================================================
+ * ntdll!NtCreateSection guard — manual DLL mapping prevention
+ *
+ * LdrLoadDll is the loader's public entry point, but an adversary with
+ * in-process native code can bypass it entirely by calling
+ * NtCreateSection(SEC_IMAGE, FileHandle) + NtMapViewOfSection directly.
+ * This creates a mapped PE image without the loader's involvement — the
+ * DLL never appears in the PEB module list, and LdrLoadDll is never called.
+ *
+ * This hook blocks NtCreateSection calls that request SEC_IMAGE when the
+ * caller's return address is outside ntdll.dll. The loader's internal
+ * NtCreateSection calls (from LdrLoadDll → LdrpMapDllNtFileName) have
+ * return addresses within ntdll and are allowed through. All other
+ * SEC_IMAGE section creations are blocked.
+ *
+ * Non-SEC_IMAGE sections (shared memory, data file mappings) are always
+ * allowed — only PE image mapping from non-loader code is blocked.
+ * ============================================================ */
+static std::vector<uint8_t> buildNtCreateSectionTrampoline(const uint8_t* savedPrologue,
+                                                            size_t prologueLen,
+                                                            uint64_t origPlusN,
+                                                            uint64_t ntdllBase,
+                                                            uint64_t ntdllEnd) {
+    const size_t kPageSize = 0x400;
+    const size_t SLOT_JMP   = 0x300;
+    const size_t SLOT_NTBASE = 0x308;
+    const size_t SLOT_NTEND  = 0x310;
+    const size_t SLOT_ALLOW  = 0x318;
+    const size_t SLOT_BLOCK  = 0x320;
+
+    std::vector<uint8_t> buf(kPageSize, 0xCC);
+    std::vector<uint8_t> code;
+    code.reserve(0x300);
+    TrampAsm a(code);
+
+    // sub rsp, 0x478; save rcx/rdx/r8/r9
+    a.emit({0x48, 0x81, 0xEC, 0x78, 0x04, 0x00, 0x00});
+    a.emit({0x48, 0x89, 0x8C, 0x24, 0x58, 0x04, 0x00, 0x00});
+    a.emit({0x48, 0x89, 0x94, 0x24, 0x60, 0x04, 0x00, 0x00});
+    a.emit({0x4C, 0x89, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});
+    a.emit({0x4C, 0x89, 0x8C, 0x24, 0x70, 0x04, 0x00, 0x00});
+
+    // return address → rax
+    a.emit({0x48, 0x8B, 0x84, 0x24, 0x78, 0x04, 0x00, 0x00}); // mov rax, [rsp+0x478]
+
+    // compare rax with ntdll base
+    a.emit({0x48, 0x8B, 0x0D}); a.ripDisp(SLOT_NTBASE);  // mov rcx, [rip+ntbase]
+    a.emit({0x48, 0x39, 0xC8});                           // cmp rax, rcx
+    a.jcc(0x82, "check_sec");                             // jb check_sec (rax < base → not ntdll)
+
+    // compare rax with ntdll end
+    a.emit({0x48, 0x8B, 0x0D}); a.ripDisp(SLOT_NTEND);   // mov rcx, [rip+ntend]
+    a.emit({0x48, 0x39, 0xC8});                           // cmp rax, rcx
+    a.jcc(0x82, "allow");                                 // jb allow (base ≤ rax < end → ntdll)
+
+    // --- not from ntdll: check SEC_IMAGE in AllocationAttributes ---
+    a.label("check_sec");
+    // AllocationAttributes is the 6th arg at [rsp+0x478+0x30] = [rsp+0x4A8]
+    a.emit({0x8B, 0x84, 0x24, 0xA8, 0x04, 0x00, 0x00});  // mov eax, [rsp+0x4A8]
+    a.emit({0xA9, 0x00, 0x00, 0x00, 0x01});               // test eax, 0x1000000 (SEC_IMAGE)
+    a.jcc(0x84, "allow");                                  // jz allow (not SEC_IMAGE)
+
+    // --- SEC_IMAGE from non-ntdll → block ---
+    a.jmp("block");
+
+    // --- allow ---
+    a.label("allow");
+    emitAuditIncrement(a, SLOT_ALLOW);
+    a.emit({0x48, 0x8B, 0x8C, 0x24, 0x58, 0x04, 0x00, 0x00});
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x60, 0x04, 0x00, 0x00});
+    a.emit({0x4C, 0x8B, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});
+    a.emit({0x4C, 0x8B, 0x8C, 0x24, 0x70, 0x04, 0x00, 0x00});
+    a.emit({0x48, 0x81, 0xC4, 0x78, 0x04, 0x00, 0x00});
+    for (size_t i = 0; i < prologueLen; i++) code.push_back(savedPrologue[i]);
+    a.emit({0xFF, 0x25}); a.ripDisp(SLOT_JMP);
+
+    // --- block: STATUS_ACCESS_DENIED ---
+    a.label("block");
+    emitAuditIncrement(a, SLOT_BLOCK);
+    a.emit({0x48, 0x81, 0xC4, 0x78, 0x04, 0x00, 0x00});
+    a.emit({0xB8, 0x22, 0x00, 0x00, 0xC0}); // mov eax, STATUS_ACCESS_DENIED
+    a.emit({0xC3});
+
+    if (!a.resolve()) { FVM_LOG("buildNtCreateSectionTrampoline: resolve failed"); return {}; }
+    if (code.size() > SLOT_JMP) { FVM_LOG("buildNtCreateSectionTrampoline: code too large"); return {}; }
+    for (size_t i = 0; i < code.size(); i++) buf[i] = code[i];
+    writeU64(buf, SLOT_JMP, origPlusN);
+    writeU64(buf, SLOT_NTBASE, ntdllBase);
+    writeU64(buf, SLOT_NTEND, ntdllEnd);
+    writeU64(buf, SLOT_ALLOW, 0);
+    writeU64(buf, SLOT_BLOCK, 0);
+    return buf;
+}
+
+static int installNtCreateSectionGuard() {
+    if (g_target.handle == NULL) { setError("no_target_handle"); return 0; }
+    HANDLE proc = g_target.handle;
+    if (g_sectionImagePatch.patched) { setError("ok"); return 1; }
+
+    uint64_t addr = resolveNtdllExport(proc, "NtCreateSection");
+    if (addr == 0) { setError("section_export_not_found"); return 0; }
+
+    uint8_t saved[16] = {};
+    if (!readRemoteMem(proc, addr, saved, sizeof(saved))) { setError("read_original_failed"); return 0; }
+    if (saved[0] == 0xE9 || saved[0] == 0xE8 || saved[0] == 0xEB || saved[0] == 0xFF) {
+        setError("unsafe_section_prologue"); return 0;
+    }
+    size_t prologueLen = alignedPrologueLen(saved, sizeof(saved), 5);
+    if (prologueLen == 0) prologueLen = 5;
+
+    uint64_t ntBase = 0, ntSize = 0;
+    if (!findModuleBase(proc, L"ntdll.dll", &ntBase, &ntSize) || ntBase == 0) {
+        ntBase = reinterpret_cast<uint64_t>(GetModuleHandleW(L"ntdll.dll"));
+        ntSize = 0x180000;
+    }
+
+    const size_t kPage = 0x400;
+    uint64_t hint = findFreeRegionNear(proc, addr, kPage);
+    if (hint == 0) { setError("no_nearby_free_region"); return 0; }
+    void* allocated = VirtualAllocEx(proc, reinterpret_cast<LPVOID>(hint), kPage,
+                                     MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!allocated) { setError("virtual_alloc_failed"); return 0; }
+    uint64_t tramp = reinterpret_cast<uint64_t>(allocated);
+    int64_t delta = static_cast<int64_t>(tramp) - static_cast<int64_t>(addr + 5);
+    if (delta < INT32_MIN || delta > INT32_MAX) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("tramp_out_of_rel32_range"); return 0;
+    }
+
+    std::vector<uint8_t> image = buildNtCreateSectionTrampoline(saved, prologueLen, addr + prologueLen,
+                                                                  ntBase, ntBase + ntSize);
+    if (image.empty() || !writeRemoteMem(proc, tramp, image.data(), image.size())) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("trampoline_write_failed"); return 0;
+    }
+    uint8_t patch[16] = {0xE9};
+    int32_t rel = static_cast<int32_t>(delta);
+    memcpy(patch + 1, &rel, sizeof(rel));
+    for (size_t i = 5; i < prologueLen; ++i) patch[i] = 0x90;
+    if (!writeRemoteCode(proc, addr, patch, prologueLen)) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("patch_failed"); return 0;
+    }
+    uint8_t verify[16] = {};
+    if (!readRemoteMem(proc, addr, verify, prologueLen) || memcmp(verify, patch, prologueLen) != 0) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("verify_failed"); return 0;
+    }
+
+    g_sectionImagePatch.targetAddr = addr;
+    g_sectionImagePatch.patchSize = prologueLen;
+    memcpy(g_sectionImagePatch.original, saved, prologueLen);
+    g_sectionImagePatch.patched = true;
+    g_sectionImagePatch.trampolineAddr = tramp;
+    g_sectionImagePatch.trampolineSize = kPage;
+    g_sectionImagePatch.trampolineInstalled = true;
+    FVM_LOG("section_image_guard: NtCreateSection hook installed @ 0x%llX (ntdll=0x%llX-0x%llX)",
+            (unsigned long long)tramp, (unsigned long long)ntBase, (unsigned long long)(ntBase + ntSize));
+    setError("ok");
+    return 1;
+}
+
+/* ============================================================
+ * ntdll!NtCreateProcessEx guard — legacy process creation block
+ *
+ * NtCreateProcessEx is the pre-Vista process creation syscall. On modern
+ * Windows it is deprecated but still callable, providing a bypass for
+ * the NtCreateUserProcess hook. This guard unconditionally blocks all
+ * NtCreateProcessEx calls — no modern legitimate code uses it.
+ * ============================================================ */
+static int installNtCreateProcessExBlock() {
+    if (g_target.handle == NULL) { setError("no_target_handle"); return 0; }
+    HANDLE proc = g_target.handle;
+    if (g_createProcessExPatch.patched) { setError("ok"); return 1; }
+
+    uint64_t addr = resolveNtdllExport(proc, "NtCreateProcessEx");
+    if (addr == 0) {
+        FVM_LOG("create_process_ex_guard: NtCreateProcessEx not found in ntdll (harmless on some builds)");
+        setError("ok");
+        return 1;
+    }
+
+    uint8_t saved[16] = {};
+    if (!readRemoteMem(proc, addr, saved, sizeof(saved))) { setError("read_original_failed"); return 0; }
+    if (saved[0] == 0xE9 || saved[0] == 0xE8 || saved[0] == 0xEB || saved[0] == 0xFF) {
+        setError("unsafe_prologue"); return 0;
+    }
+    size_t prologueLen = alignedPrologueLen(saved, sizeof(saved), 5);
+    if (prologueLen == 0) prologueLen = 5;
+
+    const size_t kPage = 0x400;
+    uint64_t hint = findFreeRegionNear(proc, addr, kPage);
+    if (hint == 0) { setError("no_nearby_free_region"); return 0; }
+    void* allocated = VirtualAllocEx(proc, reinterpret_cast<LPVOID>(hint), kPage,
+                                     MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!allocated) { setError("virtual_alloc_failed"); return 0; }
+    uint64_t tramp = reinterpret_cast<uint64_t>(allocated);
+    int64_t delta = static_cast<int64_t>(tramp) - static_cast<int64_t>(addr + 5);
+    if (delta < INT32_MIN || delta > INT32_MAX) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("tramp_out_of_rel32_range"); return 0;
+    }
+
+    std::vector<uint8_t> code;
+    TrampAsm a(code);
+    emitAuditIncrement(a, 0x320);
+    a.emit({0xB8, 0x22, 0x00, 0x00, 0xC0}); // mov eax, STATUS_ACCESS_DENIED
+    a.emit({0xC3});
+    if (!a.resolve()) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("resolve_failed"); return 0;
+    }
+    std::vector<uint8_t> image(kPage, 0xCC);
+    for (size_t i = 0; i < code.size(); i++) image[i] = code[i];
+    writeU64(image, 0x300, addr + prologueLen);
+    writeU64(image, 0x320, 0);
+    if (!writeRemoteMem(proc, tramp, image.data(), image.size())) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("trampoline_write_failed"); return 0;
+    }
+
+    uint8_t patch[16] = {0xE9};
+    int32_t rel = static_cast<int32_t>(delta);
+    memcpy(patch + 1, &rel, sizeof(rel));
+    for (size_t i = 5; i < prologueLen; ++i) patch[i] = 0x90;
+    if (!writeRemoteCode(proc, addr, patch, prologueLen)) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("patch_failed"); return 0;
+    }
+    uint8_t verify[16] = {};
+    if (!readRemoteMem(proc, addr, verify, prologueLen) || memcmp(verify, patch, prologueLen) != 0) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("verify_failed"); return 0;
+    }
+
+    g_createProcessExPatch.targetAddr = addr;
+    g_createProcessExPatch.patchSize = prologueLen;
+    memcpy(g_createProcessExPatch.original, saved, prologueLen);
+    g_createProcessExPatch.patched = true;
+    g_createProcessExPatch.trampolineAddr = tramp;
+    g_createProcessExPatch.trampolineSize = kPage;
+    g_createProcessExPatch.trampolineInstalled = true;
+    FVM_LOG("create_process_ex_guard: NtCreateProcessEx blocked @ 0x%llX",
+            (unsigned long long)addr);
+    setError("ok");
+    return 1;
 }
 
 /* ============================================================
@@ -2375,13 +2702,19 @@ extern "C" __declspec(dllexport) int forgevm_unban_jvmti() {
  *       PPS_CREATE_INFO CreateInfo,          // [rsp+0x50]
  *       PPS_ATTRIBUTE_LIST AttrList);        // [rsp+0x58]
  *
- * Image path: ProcessObjAttrs->ObjectName (UNICODE_STRING* at OA+0x10). The NT
- * path may carry a \??\ prefix; substring matching on the full path still works
- * with patterns like *processproxy*. In-process match against the resident
- * pattern blob (no IPC). Data layout matches the LdrLoadDll trampoline. Frame
- * is `sub rsp, 0x4A8` (larger than 0x478) so the 5th stack arg,
- * ProcessObjAttrs, sits at [rsp+0x4D0] = [caller_rsp+0x28]. Block returns
- * STATUS_ACCESS_DENIED (0xC0000005).
+ * Image path: normal CreateProcess callers leave ProcessObjectAttributes null;
+ * that structure describes the new process object, not its executable. The
+ * executable is carried by arg9, RTL_USER_PROCESS_PARAMETERS::ImagePathName
+ * (UNICODE_STRING at x64 offset 0x60). Reading arg5 here used to turn every
+ * ordinary CreateProcess/ProcessBuilder request into an unconditional allow.
+ *
+ * The NT path may carry a \??\ prefix; substring matching on the full path
+ * still works with patterns like *processproxy*. If the image name cannot be
+ * read, fail closed: allowing an unclassified process is a security bypass,
+ * especially for a blacklist containing *java* / *javaw*. Data layout matches
+ * the LdrLoadDll trampoline. Frame is `sub rsp, 0x4A8`; arg9 is at
+ * [rsp+0x4F0] = [caller_rsp+0x48]. Block returns STATUS_ACCESS_DENIED
+ * (0xC0000022).
  * ============================================================ */
 static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
     const uint8_t* savedPrologue,
@@ -2390,12 +2723,14 @@ static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
     int mode,
     const std::vector<std::string>& patterns)
 {
-    const size_t kPageSize = 0x400;
+    const size_t kPageSize = 0x1000;
     std::vector<uint8_t> buf(kPageSize, 0xCC);
 
     const size_t SLOT_JMP  = 0x300;
     const size_t SLOT_MODE = 0x308;
     const size_t SLOT_BLOB = 0x310;
+    const size_t SLOT_ALLOW_COUNT = 0x800;
+    const size_t SLOT_BLOCK_COUNT = 0x808;
     (void)SLOT_BLOB;
 
     std::vector<uint8_t> code;
@@ -2409,15 +2744,15 @@ static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
     a.emit({0x4C, 0x89, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});  // mov [rsp+0x468], r8
     a.emit({0x4C, 0x89, 0x8C, 0x24, 0x70, 0x04, 0x00, 0x00});  // mov [rsp+0x470], r9
 
-    // --- arg5 ProcessObjAttrs → ObjectName → UNICODE_STRING Buffer/Length ---
-    a.emit({0x4C, 0x8B, 0x94, 0x24, 0xD0, 0x04, 0x00, 0x00});  // mov r10, [rsp+0x4D0]
-    a.emit({0x4D, 0x85, 0xD2}); a.jcc(0x84, "allow");          // test r10,r10; je allow
-    a.emit({0x4D, 0x8B, 0x52, 0x10});                          // mov r10, [r10+0x10] ; ObjectName
-    a.emit({0x4D, 0x85, 0xD2}); a.jcc(0x84, "allow");
-    a.emit({0x45, 0x0F, 0xB7, 0x1A});                          // movzx r11d, word [r10] ; Length
-    a.emit({0x45, 0x85, 0xDB}); a.jcc(0x84, "allow");          // test r11d,r11d; je allow
-    a.emit({0x4D, 0x8B, 0x52, 0x08});                          // mov r10, [r10+8] ; Buffer
-    a.emit({0x4D, 0x85, 0xD2}); a.jcc(0x84, "allow");
+    // --- arg9 ProcessParameters->ImagePathName (UNICODE_STRING at +0x60) ---
+    // Do not use arg5 ProcessObjectAttributes: it is normally null and is not
+    // the image path for NtCreateUserProcess.
+    a.emit({0x4C, 0x8B, 0x94, 0x24, 0xF0, 0x04, 0x00, 0x00});  // mov r10, [rsp+0x4F0]
+    a.emit({0x4D, 0x85, 0xD2}); a.jcc(0x84, "block");          // test r10,r10; je block
+    a.emit({0x45, 0x0F, 0xB7, 0x5A, 0x60});                    // movzx r11d, word [r10+0x60] ; Length
+    a.emit({0x45, 0x85, 0xDB}); a.jcc(0x84, "block");          // test r11d,r11d; je block
+    a.emit({0x4D, 0x8B, 0x52, 0x68});                          // mov r10, [r10+0x68] ; Buffer
+    a.emit({0x4D, 0x85, 0xD2}); a.jcc(0x84, "block");
     a.emit({0x41, 0xD1, 0xEB});                                // shr r11d, 1 ; wchar count
     a.emit({0x41, 0x81, 0xFB, 0x90, 0x01, 0x00, 0x00});        // cmp r11d, 400
     a.jcc(0x86, "len_ok");                                     // jbe len_ok
@@ -2430,6 +2765,7 @@ static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
 
     // --- allow: restore args, replay prologue, jump on ---
     a.label("allow");
+    emitAuditIncrement(a, SLOT_ALLOW_COUNT);
     a.emit({0x48, 0x8B, 0x8C, 0x24, 0x58, 0x04, 0x00, 0x00});  // mov rcx, [rsp+0x458]
     a.emit({0x48, 0x8B, 0x94, 0x24, 0x60, 0x04, 0x00, 0x00});  // mov rdx, [rsp+0x460]
     a.emit({0x4C, 0x8B, 0x84, 0x24, 0x68, 0x04, 0x00, 0x00});  // mov r8, [rsp+0x468]
@@ -2441,8 +2777,9 @@ static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
 
     // --- block: STATUS_ACCESS_DENIED ---
     a.label("block");
+    emitAuditIncrement(a, SLOT_BLOCK_COUNT);
     a.emit({0x48, 0x81, 0xC4, 0xA8, 0x04, 0x00, 0x00});        // add rsp, 0x4A8
-    a.emit({0xB8, 0x05, 0x00, 0x00, 0xC0});                    // mov eax, 0xC0000005
+    a.emit({0xB8, 0x22, 0x00, 0x00, 0xC0});                    // mov eax, 0xC0000022 (STATUS_ACCESS_DENIED)
     a.emit({0xC3});                                             // ret
 
     if (!a.resolve()) {
@@ -2458,6 +2795,8 @@ static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
     writeU64(buf, SLOT_JMP, origPlusN);
     buf[SLOT_MODE] = static_cast<uint8_t>(mode);
     serializeFilterBlob(buf, mode, patterns);
+    writeU64(buf, SLOT_ALLOW_COUNT, 0);
+    writeU64(buf, SLOT_BLOCK_COUNT, 0);
     return buf;
 }
 
@@ -2520,7 +2859,7 @@ static int installNtCreateUserProcessFilter(PatchState& state, int mode,
     }
     FVM_LOG("ban_process_create: prologue copy length = %zu bytes", prologueLen);
 
-    const size_t kPage = 0x400;
+    const size_t kPage = 0x1000;
     uint64_t allocHint = findFreeRegionNear(proc, addr, kPage);
     if (allocHint == 0) {
         setError("no_nearby_free_region");
@@ -2594,9 +2933,505 @@ static int installNtCreateUserProcessFilter(PatchState& state, int mode,
 }
 
 extern "C" __declspec(dllexport) int forgevm_ban_process_create(int mode, const char* patternsLF) {
-    return installNtCreateUserProcessFilter(g_processCreatePatch, mode, splitPatternsLF(patternsLF));
+    int r = installNtCreateUserProcessFilter(g_processCreatePatch, mode, splitPatternsLF(patternsLF));
+    installNtCreateProcessExBlock();
+    return r;
 }
 
 extern "C" __declspec(dllexport) int forgevm_unban_process_create() {
-    return uninstallFilterTrampoline(g_processCreatePatch, "unban_process_create");
+    uninstallFilterTrampoline(g_processCreatePatch, "unban_process_create");
+    uninstallFilterTrampoline(g_createProcessExPatch, "unban_process_create_ex");
+    return 1;
+}
+
+/* ============================================================
+ * NtTerminateProcess self-termination guard
+ *
+ * A ProcessHandle.current().destroyForcibly() often opens a real handle to the
+ * current process before issuing NtTerminateProcess, so checking only the
+ * NtCurrentProcess pseudo-handle is insufficient. While lockJvm is active,
+ * block every NtTerminateProcess issued *from the target JVM*. FVM-authorized
+ * termination is issued by the external agent and is therefore unaffected.
+ * ============================================================ */
+static std::vector<uint8_t> buildSelfTerminateTrampoline(const uint8_t* savedPrologue,
+                                                          size_t prologueLen,
+                                                          uint64_t origPlusN) {
+    const size_t kPage = 0x400;
+    const size_t SLOT_JMP = 0x300;
+    const size_t SLOT_SELF_BLOCK = 0x320;
+    std::vector<uint8_t> image(kPage, 0xCC);
+    std::vector<uint8_t> code;
+    TrampAsm a(code);
+
+    emitAuditIncrement(a, SLOT_SELF_BLOCK);
+    a.emit({0xB8, 0x22, 0x00, 0x00, 0xC0}); // STATUS_ACCESS_DENIED
+    a.emit({0xC3});                         // ret
+    (void)savedPrologue;
+    (void)prologueLen;
+    (void)origPlusN;
+    if (code.size() > SLOT_JMP) return {};
+    for (size_t i = 0; i < code.size(); ++i) image[i] = code[i];
+    writeU64(image, SLOT_JMP, origPlusN);
+    writeU64(image, SLOT_SELF_BLOCK, 0);
+    return image;
+}
+
+static int installSelfTerminateGuard(PatchState& state) {
+    if (g_target.handle == NULL) { setError("no_target_handle"); return 0; }
+    HANDLE proc = g_target.handle;
+    if (state.patched) { setError("ok"); return 1; }
+    uint64_t addr = resolveNtdllExport(proc, "NtTerminateProcess");
+    if (addr == 0) { setError("terminate_export_not_found"); return 0; }
+    uint8_t saved[16] = {};
+    if (!readRemoteMem(proc, addr, saved, sizeof(saved))) { setError("read_original_failed"); return 0; }
+    if (saved[0] == 0xE9 || saved[0] == 0xE8 || saved[0] == 0xEB || saved[0] == 0xFF) {
+        setError("unsafe_terminate_prologue"); return 0;
+    }
+    size_t prologueLen = alignedPrologueLen(saved, sizeof(saved), 5);
+    if (prologueLen == 0) prologueLen = 5;
+    const size_t kPage = 0x400;
+    uint64_t hint = findFreeRegionNear(proc, addr, kPage);
+    if (hint == 0) { setError("no_nearby_free_region"); return 0; }
+    void* allocated = VirtualAllocEx(proc, reinterpret_cast<LPVOID>(hint), kPage,
+                                     MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!allocated) { setError("virtual_alloc_failed"); return 0; }
+    uint64_t tramp = reinterpret_cast<uint64_t>(allocated);
+    int64_t delta = static_cast<int64_t>(tramp) - static_cast<int64_t>(addr + 5);
+    if (delta < INT32_MIN || delta > INT32_MAX) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("tramp_out_of_rel32_range"); return 0;
+    }
+    std::vector<uint8_t> image = buildSelfTerminateTrampoline(saved, prologueLen, addr + prologueLen);
+    if (image.empty() || !writeRemoteMem(proc, tramp, image.data(), image.size())) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("terminate_trampoline_write_failed"); return 0;
+    }
+    uint8_t patch[16] = {0xE9};
+    int32_t rel = static_cast<int32_t>(delta);
+    memcpy(patch + 1, &rel, sizeof(rel));
+    for (size_t i = 5; i < prologueLen; ++i) patch[i] = 0x90;
+    if (!writeRemoteCode(proc, addr, patch, prologueLen)) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("terminate_patch_failed"); return 0;
+    }
+    uint8_t verify[16] = {};
+    if (!readRemoteMem(proc, addr, verify, prologueLen) || memcmp(verify, patch, prologueLen) != 0) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE); setError("terminate_verify_failed"); return 0;
+    }
+    state.targetAddr = addr;
+    state.patchSize = prologueLen;
+    memcpy(state.original, saved, prologueLen);
+    state.patched = true;
+    state.trampolineAddr = tramp;
+    state.trampolineSize = kPage;
+    state.trampolineInstalled = true;
+    FVM_LOG("self_terminate_guard: installed NtTerminateProcess trampoline @ 0x%llX",
+            (unsigned long long)tramp);
+    setError("ok");
+    return 1;
+}
+
+extern "C" __declspec(dllexport) int forgevm_install_self_terminate_guard() {
+    return installSelfTerminateGuard(g_terminatePatch);
+}
+
+/* Return one in-process filter decision counter:
+ *   0 native-load allow, 1 native-load block,
+ *   2 process-create allow, 3 process-create block,
+ *   4 JVM_Halt blocked, 5 NtTerminateProcess(self) blocked.
+ * Zero also covers an uninstalled filter; callers treat the counters as a
+ * best-effort diagnostic, never as an enforcement decision. */
+extern "C" __declspec(dllexport) unsigned long long forgevm_filter_audit(int kind) {
+    PatchState* state = NULL;
+    size_t slot = 0;
+    switch (kind) {
+        case 0: state = &g_nativeLoadPatch;    slot = 0x800; break;
+        case 1: state = &g_nativeLoadPatch;    slot = 0x808; break;
+        case 2: state = &g_processCreatePatch; slot = 0x800; break;
+        case 3: state = &g_processCreatePatch; slot = 0x808; break;
+        case 4: state = &g_jvmHaltPatch;        slot = 0x320; break;
+        case 5: state = &g_terminatePatch;      slot = 0x320; break;
+        default: return 0;
+    }
+    if (state == NULL || !state->patched || state->trampolineAddr == 0 ||
+        g_target.handle == NULL) return 0;
+    uint64_t count = 0;
+    if (!readRemoteMem(g_target.handle, state->trampolineAddr + slot,
+                       &count, sizeof(count))) return 0;
+    return count;
+}
+
+/* ============================================================
+ * Hook integrity verification + auto-repair
+ *
+ * All inline hooks installed by ForgeVM use a 0xE9 (JMP rel32) prologue
+ * patch. An in-process adversary that manages to execute native code
+ * (e.g. through a pre-ban JVMTI agent or a DLL loaded in the filter
+ * window) can restore the original bytes at the hook site, neutralising
+ * the guard. This function reads the current bytes at every active hook
+ * site, detects tampering (first byte != 0xE9), and re-applies the
+ * original patch via writeRemoteCode.
+ *
+ * The agent calls this from the health poller thread on every tick,
+ * giving a maximum detection-to-repair window of ~1.5 s.
+ * ============================================================ */
+extern "C" __declspec(dllexport) int forgevm_verify_hook_integrity() {
+    if (g_target.handle == NULL) { setError("no_target_handle"); return -1; }
+
+    PatchState* patches[] = {
+        &g_terminatePatch,
+        &g_jvmHaltPatch,
+        &g_nativeLoadPatch,
+        &g_processCreatePatch,
+        &g_javaAgentPatch,
+        &g_jvmtiPatch,
+        &g_sectionImagePatch,
+        &g_createProcessExPatch,
+    };
+
+    int repaired = 0;
+    for (size_t i = 0; i < ARRAYSIZE(patches); ++i) {
+        PatchState* st = patches[i];
+        if (!st->patched || st->targetAddr == 0 || st->trampolineAddr == 0 || st->patchSize == 0)
+            continue;
+
+        uint8_t current[16] = {};
+        if (!readRemoteMem(g_target.handle, st->targetAddr, current, st->patchSize)) {
+            FVM_LOG("hook_integrity: read failed at 0x%llX, skipping",
+                    (unsigned long long)st->targetAddr);
+            continue;
+        }
+
+        if (current[0] == 0xE9)
+            continue;
+
+        int64_t delta64 = static_cast<int64_t>(st->trampolineAddr) -
+                          static_cast<int64_t>(st->targetAddr + 5);
+        if (delta64 < INT32_MIN || delta64 > INT32_MAX) {
+            FVM_LOG("hook_integrity: rel32 out of range for 0x%llX, cannot repair",
+                    (unsigned long long)st->targetAddr);
+            continue;
+        }
+
+        uint8_t patch[16] = {0xE9};
+        int32_t rel = static_cast<int32_t>(delta64);
+        memcpy(patch + 1, &rel, sizeof(rel));
+        for (size_t j = 5; j < st->patchSize; ++j) patch[j] = 0x90;
+
+        if (writeRemoteCode(g_target.handle, st->targetAddr, patch, st->patchSize)) {
+            ++repaired;
+            FVM_LOG("hook_integrity: RE-APPLIED hook at 0x%llX (was tampered, patchSize=%zu)",
+                    (unsigned long long)st->targetAddr, st->patchSize);
+        } else {
+            FVM_LOG("hook_integrity: FAILED to re-apply hook at 0x%llX",
+                    (unsigned long long)st->targetAddr);
+        }
+    }
+
+    if (repaired > 0) {
+        FVM_LOG("hook_integrity: %d hook(s) re-applied after tamper detection", repaired);
+    }
+    setError("ok");
+    return repaired;
+}
+
+/* ============================================================
+ * JVM_Halt lock — integrated with the --lock-jvm guard.
+ *
+ * When active, this trampoline blocks the in-process Shutdown.halt()
+ * path (jvm.dll!JVM_Halt) that DACL hardening cannot reach. A
+ * heartbeat written by the agent into the trampoline data page lets
+ * the trampoline detect agent death: if the heartbeat is stale (>15s)
+ * the trampoline allows the halt so a crashed/stopped agent does not
+ * leave the JVM permanently unkillable from within.
+ *
+ * FVM-authorized termination goes through TerminateProcess on the
+ * retained JVM control handle and never touches JVM_Halt, so the
+ * trampoline does not interfere with normal FVM shutdown.
+ *
+ * Data page layout (0x400 bytes):
+ *   +0x300  qword  origPlusN          (JVM_Halt + prologueLen)
+ *   +0x308  byte   mode               (0=block, 1=allow)
+ *   +0x30C  dword  agent_pid          (informational)
+ *   +0x310  qword  last_heartbeat     (GetTickCount64 from agent)
+ *   +0x318  qword  kuser_addr         (0x7FFE0000)
+ *   +0x320  qword  blocked_halt_count
+ * ============================================================ */
+
+static std::vector<uint8_t> buildHaltBlockTrampoline(const uint8_t* savedPrologue,
+                                                      size_t prologueLen,
+                                                      uint64_t origPlusN) {
+    const size_t kPageSize = 0x400;
+    const size_t SLOT_JMP       = 0x300;
+    const size_t SLOT_MODE      = 0x308;
+    const size_t SLOT_AGENT_PID = 0x30C;
+    const size_t SLOT_HEARTBEAT = 0x310;
+    const size_t SLOT_KUSER     = 0x318;
+    const size_t SLOT_BLOCK_COUNT = 0x320;
+
+    std::vector<uint8_t> code;
+    code.reserve(0x200);
+    TrampAsm a(code);
+
+    /* ---- check allow flag ---- */
+    a.emit({0x0F, 0xB6, 0x05});       // movzx eax, byte [rip+SLOT_MODE]
+    a.ripDisp(SLOT_MODE);
+    a.emit({0x84, 0xC0});              // test al, al
+    a.jcc(0x85, "do_halt");            // jnz do_halt  (mode=1 → allow)
+
+    /* ---- read TickCountLow from KUSER_SHARED_DATA ---- */
+    a.emit({0x48, 0x8B, 0x05});       // mov rax, [rip+SLOT_KUSER]
+    a.ripDisp(SLOT_KUSER);             // rax = 0x7FFE0000
+    a.emit({0x8B, 0x00});              // mov eax, [rax]  ; TickCountLow (32-bit ms)
+
+    /* ---- compare with last_heartbeat (unsigned wrap-safe) ---- */
+    a.emit({0x8B, 0x0D});              // mov ecx, [rip+SLOT_HEARTBEAT]
+    a.ripDisp(SLOT_HEARTBEAT);         // ecx = last_heartbeat low 32 bits
+    a.emit({0x29, 0xC8});              // sub eax, ecx  (unsigned delta)
+    a.emit({0x3D, 0x98, 0x3A, 0x00, 0x00});  // cmp eax, 15000
+    a.jcc(0x87, "do_halt");            // ja do_halt  (delta > 15s → agent dead → allow)
+
+    /* ---- block: return immediately (JVM_Halt is void) ---- */
+    emitAuditIncrement(a, SLOT_BLOCK_COUNT);
+    a.emit({0xC3});                     // ret
+
+    /* ---- do_halt: replay original prologue, jump to JVM_Halt continuation ---- */
+    a.label("do_halt");
+    for (size_t i = 0; i < prologueLen; i++) code.push_back(savedPrologue[i]);
+    a.emit({0xFF, 0x25});              // jmp qword [rip+SLOT_JMP]
+    a.ripDisp(SLOT_JMP);
+
+    if (!a.resolve()) {
+        FVM_LOG("buildHaltBlockTrampoline: label resolve failed");
+        return {};
+    }
+    if (code.size() > SLOT_JMP) {
+        FVM_LOG("buildHaltBlockTrampoline: code too large (%zu bytes)", code.size());
+        return {};
+    }
+
+    std::vector<uint8_t> buf(kPageSize, 0xCC);
+    for (size_t i = 0; i < code.size(); i++) buf[i] = code[i];
+
+    writeU64(buf, SLOT_JMP, origPlusN);
+    buf[SLOT_MODE] = 0;  // block by default
+    buf[SLOT_AGENT_PID + 0] = static_cast<uint8_t>(GetCurrentProcessId());
+    buf[SLOT_AGENT_PID + 1] = static_cast<uint8_t>(GetCurrentProcessId() >> 8);
+    buf[SLOT_AGENT_PID + 2] = static_cast<uint8_t>(GetCurrentProcessId() >> 16);
+    buf[SLOT_AGENT_PID + 3] = static_cast<uint8_t>(GetCurrentProcessId() >> 24);
+    writeU64(buf, SLOT_HEARTBEAT, GetTickCount64());
+    writeU64(buf, SLOT_KUSER, 0x7FFE0000ULL);
+    writeU64(buf, SLOT_BLOCK_COUNT, 0);
+
+    return buf;
+}
+
+static int installHaltLockTrampoline(PatchState& state) {
+    if (!g_target.structMapReady) {
+        setError("not_bootstrapped");
+        return 0;
+    }
+    HANDLE proc = g_target.handle;
+
+    if (state.patched) {
+        /* Already hooked — just refresh the heartbeat so it doesn't look stale. */
+        uint64_t tick = GetTickCount64();
+        if (!writeRemoteMem(proc, state.trampolineAddr + 0x310, &tick, sizeof(tick))) {
+            setError("heartbeat_refresh_failed");
+            return 0;
+        }
+        /* Reset mode to block (may have been set to allow by an earlier
+         * uninstall attempt that only flipped the flag). */
+        uint8_t mode = 0;
+        writeRemoteMem(proc, state.trampolineAddr + 0x308, &mode, 1);
+        FVM_LOG("halt_lock: refreshed heartbeat + mode on existing trampoline @ 0x%llX",
+                (unsigned long long)state.trampolineAddr);
+        setError("ok");
+        return 1;
+    }
+
+    uint64_t addr = resolveJvmExport(proc, "JVM_Halt");
+    if (addr == 0) {
+        setError("jvm_halt_export_not_found");
+        return 0;
+    }
+    FVM_LOG("halt_lock: JVM_Halt @ 0x%llX", (unsigned long long)addr);
+
+    uint8_t saved[16] = {};
+    if (!readRemoteMem(proc, addr, saved, sizeof(saved))) {
+        setError("read_original_failed");
+        return 0;
+    }
+    FVM_LOG("halt_lock: original prologue: %02X %02X %02X %02X %02X",
+            saved[0], saved[1], saved[2], saved[3], saved[4]);
+
+    /* Follow JMP thunks (MSVC incremental linking) */
+    for (int hop = 0; hop < 2 && saved[0] == 0xE9; hop++) {
+        int32_t rel = (int32_t)saved[1]
+                    | ((int32_t)saved[2] << 8)
+                    | ((int32_t)saved[3] << 16)
+                    | ((int32_t)saved[4] << 24);
+        uint64_t realAddr = addr + 5 + (int64_t)rel;
+        FVM_LOG("halt_lock: prologue is JMP thunk, following 0x%llX -> 0x%llX",
+                (unsigned long long)addr, (unsigned long long)realAddr);
+        if (!readRemoteMem(proc, realAddr, saved, sizeof(saved))) {
+            setError("read_real_prologue_failed");
+            return 0;
+        }
+        FVM_LOG("halt_lock: real prologue: %02X %02X %02X %02X %02X",
+                saved[0], saved[1], saved[2], saved[3], saved[4]);
+        addr = realAddr;
+    }
+
+    /* Refuse dangerous starters */
+    uint8_t b0 = saved[0];
+    bool dangerous = (b0 == 0xE8) || (b0 == 0xE9) || (b0 == 0xEB) ||
+                     (b0 >= 0x70 && b0 <= 0x7F) || (b0 == 0xFF);
+    if (dangerous) {
+        setError("unsafe_prologue");
+        return 0;
+    }
+
+    size_t prologueLen = alignedPrologueLen(saved, sizeof(saved), 5);
+    if (prologueLen == 0) prologueLen = 5;
+    FVM_LOG("halt_lock: prologue copy length = %zu bytes", prologueLen);
+
+    const size_t kPage = 0x400;
+    uint64_t allocHint = findFreeRegionNear(proc, addr, kPage);
+    if (allocHint == 0) {
+        setError("no_nearby_free_region");
+        return 0;
+    }
+    void* allocated = VirtualAllocEx(proc, reinterpret_cast<LPVOID>(allocHint), kPage,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!allocated) {
+        setError("virtual_alloc_failed");
+        return 0;
+    }
+    uint64_t trampAddr = reinterpret_cast<uint64_t>(allocated);
+
+    int64_t delta = static_cast<int64_t>(trampAddr) - static_cast<int64_t>(addr + 5);
+    if (delta < static_cast<int64_t>(INT32_MIN) || delta > static_cast<int64_t>(INT32_MAX)) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("tramp_out_of_rel32_range");
+        return 0;
+    }
+    FVM_LOG("halt_lock: trampoline @ 0x%llX (delta=%lld)",
+            (unsigned long long)trampAddr, (long long)delta);
+
+    std::vector<uint8_t> image = buildHaltBlockTrampoline(saved, prologueLen, addr + prologueLen);
+    if (image.empty()) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("trampoline_build_failed");
+        return 0;
+    }
+    if (!writeRemoteMem(proc, trampAddr, image.data(), image.size())) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("trampoline_write_failed");
+        return 0;
+    }
+    FlushInstructionCache(proc, reinterpret_cast<LPCVOID>(trampAddr), image.size());
+
+    uint8_t patch[16];
+    patch[0] = 0xE9;
+    int32_t rel = static_cast<int32_t>(delta);
+    patch[1] = static_cast<uint8_t>(rel);
+    patch[2] = static_cast<uint8_t>(rel >> 8);
+    patch[3] = static_cast<uint8_t>(rel >> 16);
+    patch[4] = static_cast<uint8_t>(rel >> 24);
+    for (size_t i = 5; i < prologueLen; i++) patch[i] = 0x90;
+
+    if (!writeRemoteCode(proc, addr, patch, prologueLen)) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("write_patch_failed");
+        return 0;
+    }
+
+    uint8_t verify[16] = {};
+    readRemoteMem(proc, addr, verify, prologueLen);
+    if (memcmp(verify, patch, prologueLen) != 0) {
+        VirtualFreeEx(proc, allocated, 0, MEM_RELEASE);
+        setError("verify_failed");
+        return 0;
+    }
+
+    state.targetAddr = addr;
+    state.patchSize = prologueLen;
+    memcpy(state.original, saved, prologueLen);
+    state.patched = true;
+    state.trampolineAddr = trampAddr;
+    state.trampolineSize = kPage;
+    state.trampolineInstalled = true;
+
+    FVM_LOG("halt_lock: installed trampoline + E9 patch (verified) @ 0x%llX",
+            (unsigned long long)trampAddr);
+    setError("ok");
+    return 1;
+}
+
+static int uninstallHaltLockTrampoline(PatchState& state) {
+    if (g_target.handle == NULL) {
+        setError("no_target_handle");
+        return 0;
+    }
+    if (!state.patched || state.targetAddr == 0) {
+        setError("not_patched");
+        return 0;
+    }
+
+    HANDLE proc = g_target.handle;
+
+    /* Set allow flag first so any in-flight JVM_Halt call can proceed. */
+    uint8_t allow = 1;
+    writeRemoteMem(proc, state.trampolineAddr + 0x308, &allow, 1);
+
+    if (!writeRemoteCode(proc, state.targetAddr, state.original, state.patchSize)) {
+        setError("restore_failed");
+        return 0;
+    }
+
+    uint8_t verify[16] = {};
+    readRemoteMem(proc, state.targetAddr, verify, state.patchSize);
+    if (memcmp(verify, state.original, state.patchSize) != 0) {
+        setError("restore_verify_failed");
+        return 0;
+    }
+    state.patched = false;
+    FVM_LOG("halt_lock: restored original bytes (verified)");
+
+    if (state.trampolineInstalled && state.trampolineAddr != 0) {
+        VirtualFreeEx(proc, reinterpret_cast<LPVOID>(state.trampolineAddr), 0, MEM_RELEASE);
+        FVM_LOG("halt_lock: released trampoline @ 0x%llX",
+                (unsigned long long)state.trampolineAddr);
+        state.trampolineAddr = 0;
+        state.trampolineSize = 0;
+        state.trampolineInstalled = false;
+    }
+    setError("ok");
+    return 1;
+}
+
+extern "C" __declspec(dllexport) unsigned long long forgevm_install_halt_lock() {
+    int ok = installHaltLockTrampoline(g_jvmHaltPatch);
+    if (!ok) return 0ULL;
+    return g_jvmHaltPatch.trampolineAddr;
+}
+
+extern "C" __declspec(dllexport) int forgevm_uninstall_halt_lock() {
+    return uninstallHaltLockTrampoline(g_jvmHaltPatch);
+}
+
+extern "C" __declspec(dllexport) int forgevm_halt_lock_heartbeat() {
+    if (!g_jvmHaltPatch.patched || g_jvmHaltPatch.trampolineAddr == 0) return 0;
+    if (g_target.handle == NULL) return 0;
+    uint64_t tick = GetTickCount64();
+    if (!writeRemoteMem(g_target.handle, g_jvmHaltPatch.trampolineAddr + 0x310,
+                        &tick, sizeof(tick))) return 0;
+    return 1;
+}
+
+extern "C" __declspec(dllexport) int forgevm_halt_lock_allow() {
+    if (!g_jvmHaltPatch.patched || g_jvmHaltPatch.trampolineAddr == 0) return 0;
+    if (g_target.handle == NULL) return 0;
+    uint8_t allow = 1;
+    if (!writeRemoteMem(g_target.handle, g_jvmHaltPatch.trampolineAddr + 0x308,
+                        &allow, 1)) return 0;
+    return 1;
 }

@@ -6,6 +6,7 @@ import forgevm.jvm.NativeFilter;
 import forgevm.jvm.JvmtiFilter;
 import forgevm.jvm.ProcessFilter;
 import forgevm.jvm.RelaunchException;
+import forgevm.jvm.RelaunchSpec;
 import forgevm.memory.MemoryUtil;
 import forgevm.forge.ForgeManager;
 import forgevm.util.FvmLog;
@@ -110,12 +111,12 @@ public final class ForgeVM {
      * window lives in the persistent agent and survives relaunch automatically.
      *
      * @deprecated Use {@link #launch(ForgeVMOptions)} and set
-     * {@link ForgeVMOptions.Builder#statusWindow(boolean)} instead.
+     * {@link ForgeVMOptions.Builder#window(boolean)} instead.
      */
     @Deprecated(since = "0.6.10", forRemoval = false)
     public static LaunchResult launch(boolean withStatusWindow) {
         return launch(ForgeVMOptions.builder()
-                .statusWindow(withStatusWindow)
+                .window(withStatusWindow)
                 .build());
     }
 
@@ -291,6 +292,21 @@ public final class ForgeVM {
 
     // -- relaunch (kill + restart JVM with filtered command line) --
 
+    /**
+     * Relaunch from the supervisor-owned launch baseline using an immutable v2
+     * policy. The public operation intentionally remains named {@code relaunch};
+     * the spec selects the controlled implementation rather than the legacy
+     * current-command-line implementation.
+     *
+     * <p>On success this method never returns. If creation, verification or the
+     * requested handoff fails, the original JVM remains alive and a
+     * {@link RelaunchException} is thrown.</p>
+     */
+    public static void relaunch(RelaunchSpec spec) throws RelaunchException {
+        if (spec == null) throw new IllegalArgumentException("spec must not be null");
+        relaunchV2(spec);
+    }
+
     /** Relaunch the JVM, keeping all existing -javaagent/-agentpath args. Never returns on success. */
     public static void relaunch() throws RelaunchException {
         relaunchInternal(null, null, null, null);
@@ -402,6 +418,25 @@ public final class ForgeVM {
         }
     }
 
+    /**
+     * Signals the persistent supervisor that the trusted bootstrap policy has
+     * been applied in a replacement JVM. Intended for the trusted premain agent
+     * named by {@link RelaunchSpec}; ordinary application code has no ready-pipe
+     * property in a non-handoff JVM.
+     */
+    public static boolean signalRelaunchReady() {
+        String pipe = System.getProperty("forgevm.relaunch.readyPipe");
+        String nonce = System.getProperty("forgevm.relaunch.readyNonce");
+        if (pipe == null || pipe.isBlank() || nonce == null || nonce.isBlank()) return false;
+        try (RandomAccessFile ready = new RandomAccessFile(pipe, "rw")) {
+            ready.write((nonce + "\n").getBytes(StandardCharsets.UTF_8));
+            System.clearProperty("forgevm.relaunch.readyNonce");
+            return true;
+        } catch (IOException ignored) {
+            return false;
+        }
+    }
+
     private static void relaunchInternal(AgentFilter agentFilter, NativeFilter nativeFilter,
                                           JvmtiFilter jvmtiFilter, ProcessFilter processFilter) throws RelaunchException {
         AgentSession session = agentSession;
@@ -432,6 +467,93 @@ public final class ForgeVM {
         } catch (Throwable e) {
             throw new RelaunchException("relaunch_send_failed");
         }
+    }
+
+    private static void relaunchV2(RelaunchSpec spec) throws RelaunchException {
+        AgentSession session = agentSession;
+        if (session == null || !session.isAlive()) {
+            throw new RelaunchException("agent_not_active");
+        }
+        try {
+            String response = sendCommand(session, buildRelaunchV2Command(spec));
+            if (!isOkResponse(response)) {
+                String reason = "relaunch_rejected";
+                if (response != null && !response.isBlank()) {
+                    Map<String, String> fields = JsonUtils.parseFlatJsonObject(response);
+                    reason = fields.getOrDefault("reason", reason);
+                }
+                throw new RelaunchException(reason);
+            }
+            try {
+                Thread.sleep(Long.MAX_VALUE);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            throw new RelaunchException("jvm_not_killed");
+        } catch (RelaunchException e) {
+            throw e;
+        } catch (Throwable e) {
+            throw new RelaunchException("relaunch_send_failed");
+        }
+    }
+
+    private static String buildRelaunchV2Command(RelaunchSpec spec) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"cmd\":\"relaunch_v2\",\"protocol\":2");
+        sb.append(",\"pid\":").append(ProcessHandle.current().pid());
+        sb.append(",\"existingAgents\":\"")
+                .append(spec.existingAgentPolicy().name().toLowerCase())
+                .append('"');
+        sb.append(",\"sanitizeEnvironment\":").append(spec.sanitizeEnvironment());
+        sb.append(",\"rejectArgumentFiles\":").append(spec.rejectArgumentFiles());
+        sb.append(",\"handoffPoint\":\"")
+                .append(spec.handoffPoint().name().toLowerCase())
+                .append('"');
+        sb.append(",\"handoffTimeoutMs\":").append(spec.handoffTimeout().toMillis());
+        appendTrustedAgent(sb, "trustedNative", spec.trustedNativeAgent());
+        appendTrustedAgent(sb, "trustedJava", spec.trustedJavaAgent());
+        appendRelaunchFilter(sb, "agent", spec.agentFilter());
+        appendRelaunchFilter(sb, "native", spec.nativeFilter());
+        appendRelaunchFilter(sb, "jvmti", spec.jvmtiFilter());
+        appendRelaunchFilter(sb, "process", spec.processFilter());
+        return sb.append('}').toString();
+    }
+
+    private static void appendTrustedAgent(StringBuilder sb, String prefix, RelaunchSpec.TrustedAgent agent) {
+        sb.append(",\"has").append(Character.toUpperCase(prefix.charAt(0))).append(prefix.substring(1))
+                .append("\":").append(agent != null);
+        if (agent == null) return;
+        sb.append(",\"").append(prefix).append("Path\":\"")
+                .append(escapeJson(agent.path().toString())).append('"');
+        sb.append(",\"").append(prefix).append("Sha256\":\"")
+                .append(agent.sha256()).append('"');
+        sb.append(",\"").append(prefix).append("Options\":\"")
+                .append(escapeJson(agent.options())).append('"');
+    }
+
+    private static void appendRelaunchFilter(StringBuilder sb, String prefix, Object filter) {
+        String mode = null;
+        List<String> patterns = null;
+        if (filter instanceof AgentFilter value) {
+            mode = value.mode().name(); patterns = value.patterns();
+        } else if (filter instanceof NativeFilter value) {
+            mode = value.mode().name(); patterns = value.patterns();
+        } else if (filter instanceof JvmtiFilter value) {
+            mode = value.mode().name(); patterns = value.patterns();
+        } else if (filter instanceof ProcessFilter value) {
+            mode = value.mode().name(); patterns = value.patterns();
+        }
+        String cap = Character.toUpperCase(prefix.charAt(0)) + prefix.substring(1);
+        sb.append(",\"has").append(cap).append("Filter\":").append(filter != null);
+        if (filter == null) return;
+        sb.append(",\"").append(prefix).append("Mode\":\"")
+                .append(mode.toLowerCase()).append('"');
+        sb.append(",\"").append(prefix).append("Patterns\":[");
+        for (int i = 0; i < patterns.size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append('"').append(escapeJson(patterns.get(i))).append('"');
+        }
+        sb.append(']');
     }
 
     private static String buildRelaunchCommand(AgentFilter agentFilter, NativeFilter nativeFilter,
@@ -534,10 +656,10 @@ public final class ForgeVM {
          * this JVM while it was still SUSPENDED). */
         String handoffPid = System.getProperty(PROP_AGENT_HANDOFF_PID);
         if (handoffPid != null && !handoffPid.isBlank()) {
-            LaunchResult r = launchViaHandoff(handoffPid.trim());
-            if (r != null) return r;
-            /* Handoff failed - fall through to normal spawn as a degraded path.
-             * Logged inside launchViaHandoff. */
+            return launchViaHandoff(handoffPid.trim());
+        }
+        if (relaunchGeneration() > 0) {
+            return agentUnavailable("handoff_pid_missing", "");
         }
 
         Path dllPath = resolveNativeDllPath();
@@ -564,15 +686,13 @@ public final class ForgeVM {
                     option(chars('d', 'l', 'l'), dllPath.toAbsolutePath().toString()),
                     "--logdir=" + logDir
             ));
-            /* Optional live status window: requested via launch(options), or the
-             * -Dforgevm.window property as an external fallback. Enabled on the
-             * persistent (gen0) agent; later JVM generations reach it via
-             * handoff, so the flag belongs only on this fresh-spawn path. */
-            if (launchOptions.statusWindow() || System.getProperty("forgevm.window") != null) {
+            /* Optional live status window: requested via launch(options), the
+             * -Dforgevm.window property as an external fallback, or forced on
+             * when lockJvm is active. Enabled on the persistent (gen0) agent;
+             * later JVM generations reach it via handoff, so the flag belongs
+             * only on this fresh-spawn path. */
+            if (launchOptions.window() || System.getProperty("forgevm.window") != null) {
                 agentArgs.add("--window");
-            }
-            if (launchOptions.independentLifecycle()) {
-                agentArgs.add("--independent-lifecycle");
             }
             if (launchOptions.lockJvm()) {
                 agentArgs.add("--lock-jvm");
@@ -581,8 +701,8 @@ public final class ForgeVM {
 
             AgentSession session = new AgentSession(
                     process,
-                    new BufferedReader(new InputStreamReader(process.getInputStream())),
-                    new BufferedWriter(new OutputStreamWriter(process.getOutputStream()))
+                    new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8)),
+                    new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8))
             );
 
             String responseLine = sendCommand(session,
@@ -615,12 +735,30 @@ public final class ForgeVM {
 
     /** Connect to a pre-existing agent via the handoff named pipe.
      *  The pipe is created by the persistent agent at startup with name
-     *  {@code \\.\pipe\forgevm_cmd_<agent_pid>}. Returns a {@code LaunchResult}
-     *  on success (with {@code agentSession} populated), or null to signal
-     *  that the caller should fall back to spawning a fresh agent. */
+     *  {@code \\.\pipe\forgevm_cmd_<agent_pid>}. The short server-publication
+     *  race is retried; a relaunched JVM never spawns a second supervisor. */
     private static LaunchResult launchViaHandoff(String agentPid) {
         String pipePath = "\\\\.\\pipe\\forgevm_cmd_" + agentPid;
-        try {
+        Throwable lastFailure = null;
+        for (int attempt = 0; attempt < 100; attempt++) {
+            try {
+                return connectViaHandoff(pipePath);
+            } catch (Throwable ex) {
+                lastFailure = ex;
+                try {
+                    Thread.sleep(50L);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        String detail = lastFailure == null ? "unknown" : lastFailure.getClass().getSimpleName();
+        FvmLog.error("persistent-agent handoff failed after retries: " + detail);
+        return agentUnavailable("handoff_connect_failed:" + detail, pipePath);
+    }
+
+    private static LaunchResult connectViaHandoff(String pipePath) throws Exception {
             /* On Windows, named pipes can be opened with regular file I/O -
              * the kernel handles the pipe protocol transparently. We use
              * RandomAccessFile because it supports full-duplex on a single
@@ -658,11 +796,6 @@ public final class ForgeVM {
             registerAgentLockController(session);
             FvmLog.info("ForgeVM connected to persistent agent via " + pipePath);
             return result;
-        } catch (Throwable ex) {
-            FvmLog.warn("handoff failed (" + ex.getClass().getSimpleName() + "): " + ex.getMessage()
-                    + " - falling back to fresh agent spawn");
-            return null;
-        }
     }
 
     private static Process startProcessReflectively(List<String> command) throws Exception {

@@ -8,6 +8,7 @@
 #include <psapi.h>
 /* Toolhelp thread enumeration for the optional [JVM] health poller. */
 #include <tlhelp32.h>
+#include <bcrypt.h>
 
 #include <iostream>
 #include <sstream>
@@ -25,6 +26,8 @@
 /* For redirecting stdin/stdout to the handoff command pipe after old JVM dies. */
 #include <io.h>
 #include <fcntl.h>
+
+#pragma comment(lib, "bcrypt.lib")
 
 /* ============================================================
  * Agent-level file logging — unified with DLL into one file
@@ -63,7 +66,6 @@ static void agentLogInit(const std::string& logDir) {
  * loop. windowPublish is a no-op until the window is enabled at startup. */
 static std::atomic<bool>        g_windowEnabled{false};
 static std::atomic<bool>        g_jvmDiedPostMortem{false};  // target died; window kept for review
-static std::atomic<bool>        g_independentLifecycle{false};
 static std::atomic<bool>        g_jvmLockRequested{false};
 static std::mutex               g_windowQueueMutex;
 static std::vector<std::string> g_windowQueue;
@@ -104,6 +106,7 @@ typedef int(__cdecl* InitFn)();
 typedef const char* (__cdecl* LastErrorFn)();
 typedef int(__cdecl* ExitByPidFn)(unsigned long long, int);
 typedef int(__cdecl* BootstrapTargetFn)(unsigned long long);
+typedef int(__cdecl* BootstrapTargetWithHandleFn)(unsigned long long, void*);
 typedef unsigned long long(__cdecl* StructMapCountFn)();
 typedef int(__cdecl* PutFieldFn)(unsigned long long, const char*, const char*, const unsigned char*, unsigned long long);
 typedef int(__cdecl* PutFieldBatchFn)(const unsigned long long*, unsigned long long, const char*, const char*, const unsigned char*, unsigned long long);
@@ -120,6 +123,13 @@ typedef int(__cdecl* BanJvmtiFn)(int, const char*);
 typedef int(__cdecl* UnbanJvmtiFn)();
 typedef int(__cdecl* BanProcessCreateFn)(int, const char*);
 typedef int(__cdecl* UnbanProcessCreateFn)();
+typedef unsigned long long(__cdecl* InstallHaltLockFn)();
+typedef int(__cdecl* UninstallHaltLockFn)();
+typedef int(__cdecl* HaltLockHeartbeatFn)();
+typedef int(__cdecl* HaltLockAllowFn)();
+typedef unsigned long long(__cdecl* FilterAuditFn)(int);
+typedef int(__cdecl* InstallSelfTerminateGuardFn)();
+typedef int(__cdecl* VerifyHookIntegrityFn)();
 typedef int(__cdecl* ForgeClassPlanFn)(const char*, const char*, int, int, char*, int);
 typedef int(__cdecl* ForgeClassUnloadFn)(const char*, int);
 
@@ -131,6 +141,7 @@ struct NativeApi {
     LastErrorFn lastError = NULL;
     ExitByPidFn exitByPid = NULL;
     BootstrapTargetFn bootstrapTarget = NULL;
+    BootstrapTargetWithHandleFn bootstrapTargetWithHandle = NULL;
     StructMapCountFn structMapCount = NULL;
     StructMapCountFn typeMapCount = NULL;
     LastErrorFn compressionInfo = NULL;
@@ -154,6 +165,13 @@ struct NativeApi {
     UnbanProcessCreateFn unbanProcessCreate = NULL;
     ForgeClassPlanFn forgeClassPlan = NULL;
     ForgeClassUnloadFn forgeClassUnload = NULL;
+    InstallHaltLockFn installHaltLock = NULL;
+    UninstallHaltLockFn uninstallHaltLock = NULL;
+    HaltLockHeartbeatFn haltLockHeartbeat = NULL;
+    HaltLockAllowFn haltLockAllow = NULL;
+    FilterAuditFn filterAudit = NULL;
+    InstallSelfTerminateGuardFn installSelfTerminateGuard = NULL;
+    VerifyHookIntegrityFn verifyHookIntegrity = NULL;
 };
 
 struct AgentLockState {
@@ -162,10 +180,24 @@ struct AgentLockState {
     unsigned long long ownerPid = 0ULL;
 };
 
+/* Pre-authorized target-JVM termination handle. It is acquired before the
+ * target's DACL is tightened, so FVM retains its controlled exit path. */
+static std::mutex g_jvmControlMutex;
+static HANDLE g_jvmControlHandle = NULL;
+static DWORD g_jvmControlPid = 0;
 
-/* Self-DACL hardening: deny PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD
- * to Everyone on our own process object. Blocks same-user non-admin kills and injection.
- * Admin with TakeOwnership can still override. */
+/* PID of the target most recently bootstrapped by the post-relaunch or
+ * recovery watcher. Lets handleBootstrap skip a redundant OpenProcess
+ * call that would fail under the comprehensive DACL. */
+static std::atomic<DWORD> g_watchdogBootstrappedPid{0};
+
+
+/* Self-DACL hardening: deny the full set of dangerous access rights to
+ * Everyone on our own process object. This blocks same-user non-admin
+ * kills, injection, memory scanning, handle theft, and thread suspension.
+ * The agent operates via GetCurrentProcess() (pseudo-handle, bypasses DACL)
+ * so its own functionality is unaffected. Admin with TakeOwnership can
+ * still override. */
 static bool hardenSelfProcessDACL() {
     HANDLE hSelf = NULL;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(),
@@ -191,8 +223,18 @@ static bool hardenSelfProcessDACL() {
         return false;
     }
 
+    static const DWORD kSelfDeniedRights =
+        PROCESS_TERMINATE |
+        PROCESS_CREATE_THREAD |
+        PROCESS_VM_OPERATION |
+        PROCESS_VM_READ |
+        PROCESS_VM_WRITE |
+        PROCESS_DUP_HANDLE |
+        PROCESS_SUSPEND_RESUME |
+        WRITE_DAC;
+
     EXPLICIT_ACCESSW ea = {};
-    ea.grfAccessPermissions = PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD;
+    ea.grfAccessPermissions = kSelfDeniedRights;
     ea.grfAccessMode = DENY_ACCESS;
     ea.grfInheritance = NO_INHERITANCE;
     ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
@@ -213,21 +255,157 @@ static bool hardenSelfProcessDACL() {
     return ok;
 }
 
+/* Comprehensive process hardening: deny the full set of dangerous access
+ * rights to new handle opens on the target JVM. The agent retains a handle
+ * opened before this DACL change, so its own RPM/WPM/VirtualProtectEx
+ * operations are unaffected.
+ *
+ * Denied rights and their rationale:
+ *   PROCESS_TERMINATE      — TerminateProcess / NtTerminateProcess from outside
+ *   PROCESS_CREATE_THREAD  — CreateRemoteThread (shellcode injection)
+ *   PROCESS_VM_OPERATION   — VirtualProtectEx / VirtualAllocEx (memory tampering)
+ *   PROCESS_VM_READ        — ReadProcessMemory (hook scanning, handle discovery)
+ *   PROCESS_VM_WRITE       — WriteProcessMemory (direct byte patching)
+ *   PROCESS_DUP_HANDLE     — DuplicateHandle (stealing the agent's retained handle)
+ *   PROCESS_SUSPEND_RESUME — NtSuspendProcess / NtResumeProcess (thread freeze DoS)
+ *   WRITE_DAC              — SetSecurityInfo (removing these very protections)
+ *
+ * Boundary: handles that already existed before the DACL change, an
+ * administrator with TakeOwnership/SeDebugPrivilege, and kernel code are
+ * outside its protection model. */
+static bool lockJvmProcessDACL(HANDLE process, DWORD pid) {
+    PACL oldDacl = NULL;
+    PSECURITY_DESCRIPTOR securityDescriptor = NULL;
+    if (GetSecurityInfo(process, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                        NULL, NULL, &oldDacl, NULL, &securityDescriptor) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    PSID everyone = NULL;
+    SID_IDENTIFIER_AUTHORITY authority = SECURITY_WORLD_SID_AUTHORITY;
+    if (!AllocateAndInitializeSid(&authority, 1, SECURITY_WORLD_RID,
+                                  0, 0, 0, 0, 0, 0, 0, &everyone)) {
+        if (securityDescriptor) LocalFree(securityDescriptor);
+        return false;
+    }
+
+    static const DWORD kDeniedRights =
+        PROCESS_TERMINATE |
+        PROCESS_CREATE_THREAD |
+        PROCESS_VM_OPERATION |
+        PROCESS_VM_READ |
+        PROCESS_VM_WRITE |
+        PROCESS_DUP_HANDLE |
+        PROCESS_SUSPEND_RESUME |
+        WRITE_DAC;
+
+    EXPLICIT_ACCESSW denyAll = {};
+    denyAll.grfAccessPermissions = kDeniedRights;
+    denyAll.grfAccessMode = DENY_ACCESS;
+    denyAll.grfInheritance = NO_INHERITANCE;
+    denyAll.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    denyAll.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    denyAll.Trustee.ptstrName = reinterpret_cast<LPWSTR>(everyone);
+
+    PACL newDacl = NULL;
+    bool ok = false;
+    if (SetEntriesInAclW(1, &denyAll, oldDacl, &newDacl) == ERROR_SUCCESS) {
+        ok = SetSecurityInfo(process, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                             NULL, NULL, newDacl, NULL) == ERROR_SUCCESS;
+    }
+    if (newDacl) LocalFree(newDacl);
+    if (everyone) FreeSid(everyone);
+    if (securityDescriptor) LocalFree(securityDescriptor);
+    if (ok) AGENT_LOG("guard: comprehensive DACL applied to JVM pid=%lu (terminate/vm/createthread/suspend/duphandle/writedac denied)", pid);
+    return ok;
+}
+
+static void clearJvmControlHandle() {
+    std::lock_guard<std::mutex> guard(g_jvmControlMutex);
+    if (g_jvmControlHandle != NULL) CloseHandle(g_jvmControlHandle);
+    g_jvmControlHandle = NULL;
+    g_jvmControlPid = 0;
+    g_watchdogBootstrappedPid.store(0);
+}
+
+static bool retainAndLockJvm(HANDLE process, DWORD pid) {
+    HANDLE retained = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(), &retained,
+                         PROCESS_TERMINATE | SYNCHRONIZE, FALSE, 0)) {
+        AGENT_LOG("guard: unable to retain JVM control handle for pid=%lu: %lu", pid, GetLastError());
+        return false;
+    }
+    if (!lockJvmProcessDACL(process, pid)) {
+        CloseHandle(retained);
+        AGENT_LOG("guard: unable to lock JVM DACL for pid=%lu: %lu", pid, GetLastError());
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(g_jvmControlMutex);
+    if (g_jvmControlHandle != NULL) CloseHandle(g_jvmControlHandle);
+    g_jvmControlHandle = retained;
+    g_jvmControlPid = pid;
+    return true;
+}
+
+static bool restoreJvmControlHandle(HANDLE authorizedHandle, DWORD pid) {
+    HANDLE retained = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), authorizedHandle, GetCurrentProcess(), &retained,
+                         PROCESS_TERMINATE | SYNCHRONIZE, FALSE, 0)) return false;
+    std::lock_guard<std::mutex> guard(g_jvmControlMutex);
+    if (g_jvmControlHandle != NULL) CloseHandle(g_jvmControlHandle);
+    g_jvmControlHandle = retained;
+    g_jvmControlPid = pid;
+    return true;
+}
+
+static HANDLE duplicateJvmControlHandle(DWORD pid) {
+    std::lock_guard<std::mutex> guard(g_jvmControlMutex);
+    if (g_jvmControlHandle == NULL || g_jvmControlPid != pid) return NULL;
+    HANDLE duplicate = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), g_jvmControlHandle, GetCurrentProcess(), &duplicate,
+                         PROCESS_TERMINATE | SYNCHRONIZE, FALSE, 0)) return NULL;
+    return duplicate;
+}
+
 // Parent process watchdog: exits agent when parent JVM dies
 static std::atomic<DWORD> g_parentPid{0};
 /* Guard is intentionally opt-in: it is only armed by --lock-jvm, which Java
- * validates as requiring an independent lifecycle and the control window. */
+ * validates as requiring the control window. */
 static std::atomic<bool> g_guardMode{false};
 static std::atomic<bool> g_guardAuthorizedExit{false};
 static std::atomic<bool> g_guardRecoveryRunning{false};
+static std::atomic<unsigned long long> g_haltLockTrampolineAddr{0};
 static std::atomic<unsigned long long> g_guardGeneration{0};
 static std::mutex g_guardMutex;
 static std::wstring g_guardCommandLine;
-static std::vector<ULONGLONG> g_guardCrashTicks;
-static const ULONGLONG kGuardCrashWindowMs = 60000ULL;
-static const size_t kGuardCrashLimit = 5;
+/* Immutable launch source for relaunch v2. Captured once from the first JVM
+ * that bootstraps this supervisor and never replaced by handoff/recovery JVMs. */
+struct SealedLaunchBaseline {
+    std::wstring commandLine;
+    std::wstring workingDirectory;
+    std::vector<wchar_t> environment;
+    bool sealed = false;
+};
+static SealedLaunchBaseline g_launchBaseline;
+static std::atomic<unsigned long long> g_secureRelaunchGeneration{0};
+/* True while the original JVM is intentionally parked waiting for the trusted
+ * replacement's policy-applied handshake. Zero CPU in this interval is normal,
+ * not a deadlock/stall signal. */
+static std::atomic<bool> g_secureRelaunchPending{false};
+static std::vector<std::wstring> g_secureRecoveryTokens;
+static bool g_secureRecoveryEnvironmentSanitized = true;
+static std::string g_secureRelaunchPolicyFingerprint;
+/* Consecutive unexpected JVM deaths without a stable recovery in between.
+ * Reset on successful handoff bootstrap. Agent exits after kGuardMaxDeaths. */
+static std::atomic<int> g_guardConsecutiveDeaths{0};
+static const int kGuardMaxConsecutiveDeaths = 4;
+/* Bootstrap completion is not a stable recovery: hostile startup code can
+ * terminate the new JVM a few seconds after its hooks are installed. */
+static std::atomic<ULONGLONG> g_guardRecoveryStableSinceTick{0};
+static const ULONGLONG kGuardStableRecoveryMs = 30000ULL;
 
 static std::wstring queryProcessCommandLine(DWORD pid);
+static std::vector<wchar_t> captureEnvironmentBlock();
 static void autoRelaunchAfterCrash(DWORD deadPid);
 
 /* Set true by handleRelaunch after a successful CREATE_SUSPENDED + suspended-time
@@ -271,8 +449,17 @@ DWORD WINAPI parentWatchdogThread(LPVOID) {
             if (hParent) { CloseHandle(hParent); hParent = NULL; }
             lastPid = pid;
             if (pid != 0) {
-                hParent = OpenProcess(SYNCHRONIZE, FALSE, pid);
+                hParent = duplicateJvmControlHandle(pid);
+                if (hParent == NULL) hParent = OpenProcess(SYNCHRONIZE, FALSE, pid);
                 if (hParent == NULL) {
+                    DWORD error = GetLastError();
+                    if (g_guardMode.load() &&
+                        (error == ERROR_INVALID_PARAMETER || error == ERROR_NOT_FOUND)) {
+                        AGENT_LOG("guard: tracked JVM pid=%lu disappeared before watchdog handle: %lu",
+                                  pid, error);
+                        clearJvmControlHandle();
+                        autoRelaunchAfterCrash(pid);
+                    }
                     /* Can't open — could be transient (e.g. process just spawned
                      * and ACLs not stable yet). Retry next tick instead of
                      * exiting; only ExitProcess once we previously had a valid
@@ -291,6 +478,10 @@ DWORD WINAPI parentWatchdogThread(LPVOID) {
         if (r != WAIT_OBJECT_0) continue; /* still alive, loop */
 
         /* Parent process is gone. Decide whether to exit. */
+        DWORD observedExitCode = STILL_ACTIVE;
+        if (!GetExitCodeProcess(hParent, &observedExitCode)) {
+            observedExitCode = 0xFFFFFFFFUL;
+        }
         CloseHandle(hParent);
         hParent = NULL;
 
@@ -308,21 +499,24 @@ DWORD WINAPI parentWatchdogThread(LPVOID) {
         }
         if (g_guardMode.load() && !g_guardAuthorizedExit.load()) {
             /* The JVM died without the FVM relaunch handoff. The guard owns
-             * recovery and will either publish a new pid or fail closed. */
+             * recovery (up to kGuardMaxConsecutiveDeaths attempts) and will
+             * either publish a new pid or fail closed. */
+            AGENT_LOG("guard: JVM pid=%lu exited unexpectedly with code=0x%08lX", lastPid,
+                      observedExitCode);
+            clearJvmControlHandle();
             autoRelaunchAfterCrash(lastPid);
             lastPid = 0;
             continue;
         }
-        /* Truly orphaned. Normally we exit so no zombie agent lingers. But when
-         * the status window is up, the JVM's death is exactly what the operator
-         * wants to inspect — exiting would close the window before it can be
-         * read. So keep the agent (and window) alive for post-mortem; the
-         * operator closes the window to quit (statusWndProc handles WM_CLOSE). */
-        if (g_windowEnabled.load() && g_independentLifecycle.load()) {
-            windowPublish("[JVM] \xE2\x9A\xA0 target JVM (pid " + std::to_string(lastPid) +
-                          ") exited/crashed — agent kept alive for review, close window to quit");
+        /* JVM died without guard or relaunch. In window mode, log and exit
+         * cleanly (the operator had the window up for monitoring). Without a
+         * window, just exit immediately — no zombie agents. */
+        if (g_windowEnabled.load()) {
+            AGENT_LOG("watchdog: JVM pid=%lu exited — agent shutting down", lastPid);
+            windowPublish("[JVM] target JVM (pid " + std::to_string(lastPid) +
+                          ") exited — FVM shutting down");
             g_jvmDiedPostMortem.store(true);
-            return 0;   /* stop watching; UI thread keeps the process alive */
+            return 0;   /* stop watching; main() will exit cleanly */
         }
         ExitProcess(0);
     }
@@ -453,6 +647,8 @@ void printResult(const char* status,
                  const char* capability,
                  const std::string& dllPath,
                  const char* reason) {
+    AGENT_LOG("command result: status=%s capability=%s reason=%s",
+              status ? status : "", capability ? capability : "", reason ? reason : "");
     std::ostringstream oss;
     oss << "{\"status\":\"" << escapeJson(status)
         << "\",\"capability\":\"" << escapeJson(capability)
@@ -648,6 +844,7 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->lastError       = reinterpret_cast<LastErrorFn>(GetProcAddress(module, "forgevm_last_error"));
     api->exitByPid       = reinterpret_cast<ExitByPidFn>(GetProcAddress(module, "forgevm_exit_process"));
     api->bootstrapTarget     = reinterpret_cast<BootstrapTargetFn>(GetProcAddress(module, "forgevm_bootstrap_target"));
+    api->bootstrapTargetWithHandle = reinterpret_cast<BootstrapTargetWithHandleFn>(GetProcAddress(module, "forgevm_bootstrap_target_with_handle"));
     api->structMapCount  = reinterpret_cast<StructMapCountFn>(GetProcAddress(module, "forgevm_structmap_count"));
     api->typeMapCount    = reinterpret_cast<StructMapCountFn>(GetProcAddress(module, "forgevm_typemap_count"));
     api->compressionInfo = reinterpret_cast<LastErrorFn>(GetProcAddress(module, "forgevm_compression_info"));
@@ -671,6 +868,13 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->unbanProcessCreate = reinterpret_cast<UnbanProcessCreateFn>(GetProcAddress(module, "forgevm_unban_process_create"));
     api->forgeClassPlan   = reinterpret_cast<ForgeClassPlanFn>(GetProcAddress(module, "forgevm_forge_class_plan"));
     api->forgeClassUnload = reinterpret_cast<ForgeClassUnloadFn>(GetProcAddress(module, "forgevm_forge_class_unload"));
+    api->installHaltLock    = reinterpret_cast<InstallHaltLockFn>(GetProcAddress(module, "forgevm_install_halt_lock"));
+    api->uninstallHaltLock  = reinterpret_cast<UninstallHaltLockFn>(GetProcAddress(module, "forgevm_uninstall_halt_lock"));
+    api->haltLockHeartbeat  = reinterpret_cast<HaltLockHeartbeatFn>(GetProcAddress(module, "forgevm_halt_lock_heartbeat"));
+    api->haltLockAllow      = reinterpret_cast<HaltLockAllowFn>(GetProcAddress(module, "forgevm_halt_lock_allow"));
+    api->filterAudit        = reinterpret_cast<FilterAuditFn>(GetProcAddress(module, "forgevm_filter_audit"));
+    api->installSelfTerminateGuard = reinterpret_cast<InstallSelfTerminateGuardFn>(GetProcAddress(module, "forgevm_install_self_terminate_guard"));
+    api->verifyHookIntegrity      = reinterpret_cast<VerifyHookIntegrityFn>(GetProcAddress(module, "forgevm_verify_hook_integrity"));
 
     if (api->probe == NULL || api->init == NULL) { *reason = "missing_export"; return false; }
     return true;
@@ -708,8 +912,26 @@ void handleBootstrap(const NativeApi& api,
     unsigned long long pid = getJsonUnsignedField(line, "pid", 0ULL);
     if (pid != 0ULL) {
         g_parentPid.store(static_cast<DWORD>(pid));
+        std::wstring observedCommandLine = queryProcessCommandLine(static_cast<DWORD>(pid));
+        {
+            std::lock_guard<std::mutex> guard(g_guardMutex);
+            if (!g_launchBaseline.sealed && !observedCommandLine.empty()) {
+                g_launchBaseline.commandLine = observedCommandLine;
+                DWORD cwdLength = GetCurrentDirectoryW(0, NULL);
+                if (cwdLength > 0) {
+                    std::vector<wchar_t> cwd(cwdLength);
+                    if (GetCurrentDirectoryW(cwdLength, cwd.data()) > 0) {
+                        g_launchBaseline.workingDirectory.assign(cwd.data());
+                    }
+                }
+                g_launchBaseline.environment = captureEnvironmentBlock();
+                g_launchBaseline.sealed = true;
+                AGENT_LOG("relaunch-v2: sealed first-launch baseline (cmd=%zu, env=%zu)",
+                          g_launchBaseline.commandLine.size(), g_launchBaseline.environment.size());
+            }
+        }
         if (g_guardMode.load()) {
-            std::wstring cmd = queryProcessCommandLine(static_cast<DWORD>(pid));
+            std::wstring cmd = std::move(observedCommandLine);
             if (!cmd.empty()) {
                 std::lock_guard<std::mutex> guard(g_guardMutex);
                 g_guardCommandLine = std::move(cmd);
@@ -720,20 +942,78 @@ void handleBootstrap(const NativeApi& api,
         }
     }
     if (pid != 0ULL && api.bootstrapTarget != NULL) {
-        AGENT_LOG("bootstrap_target(pid=%llu)...", pid);
-        if (api.bootstrapTarget(pid) == 1) {
+        if (g_guardMode.load() && g_watchdogBootstrappedPid.load() == static_cast<DWORD>(pid)) {
             structMapReady = true;
-            AGENT_LOG("bootstrap_target OK: structMap ready");
+            AGENT_LOG("bootstrap_target skipped: pid=%llu already bootstrapped by recovery watcher", pid);
         } else {
-            std::string reason = copyReason(api, "bootstrap_target_failed");
-            AGENT_LOG("bootstrap_target FAILED: %s", reason.c_str());
-            printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
-            return;
+            AGENT_LOG("bootstrap_target(pid=%llu)...", pid);
+            if (api.bootstrapTarget(pid) == 1) {
+                structMapReady = true;
+                AGENT_LOG("bootstrap_target OK: structMap ready");
+            } else {
+                std::string reason = copyReason(api, "bootstrap_target_failed");
+                AGENT_LOG("bootstrap_target FAILED: %s", reason.c_str());
+                printResult("fallback", "UNAVAILABLE", dllPath, reason.c_str());
+                return;
+            }
         }
+    }
+    bool jvmLockActive = !g_guardMode.load();
+    if (pid != 0ULL && g_guardMode.load()) {
+        /* A handoff/recovered JVM was already locked before resume. Do not try
+         * to OpenProcess(PROCESS_TERMINATE) again: our own DACL correctly
+         * rejects that new handle and used to make this bootstrap falsely
+         * report UNAVAILABLE, causing Java to send the agent a shutdown. */
+        HANDLE retained = duplicateJvmControlHandle(static_cast<DWORD>(pid));
+        if (retained != NULL) {
+            CloseHandle(retained);
+            jvmLockActive = true;
+            AGENT_LOG("guard: reusing retained JVM control handle for pid=%llu", pid);
+        } else {
+            HANDLE control = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE | READ_CONTROL | WRITE_DAC,
+                                         FALSE, static_cast<DWORD>(pid));
+            if (control != NULL) {
+                jvmLockActive = retainAndLockJvm(control, static_cast<DWORD>(pid));
+                CloseHandle(control);
+            }
+            if (!jvmLockActive) {
+                /* Keep the agent and watchdog alive. A protection upgrade
+                 * failure must never be converted into an agent shutdown. */
+                AGENT_LOG("guard: JVM DACL lock unavailable for pid=%llu; watchdog remains active", pid);
+            }
+        }
+    }
+
+    /* Install JVM_Halt hook so Shutdown.halt() cannot bypass the DACL lock.
+     * FVM-authorized termination uses TerminateProcess on the retained handle
+     * and never touches JVM_Halt. */
+    bool haltLockInstalled = false;
+    if (jvmLockActive && api.installHaltLock != NULL) {
+        unsigned long long addr = api.installHaltLock();
+        if (addr != 0ULL) {
+            g_haltLockTrampolineAddr.store(addr);
+            haltLockInstalled = true;
+            AGENT_LOG("guard: JVM_Halt lock installed @ 0x%llX", addr);
+        } else {
+            AGENT_LOG("guard: JVM_Halt lock install failed: %s",
+                      api.lastError ? api.lastError() : "unknown");
+        }
+    }
+
+    bool selfTerminateGuardInstalled = false;
+    if (jvmLockActive && api.installSelfTerminateGuard != NULL) {
+        int result = api.installSelfTerminateGuard();
+        selfTerminateGuardInstalled = result == 1;
+        AGENT_LOG("guard: NtTerminateProcess in-target guard %s%s",
+                  selfTerminateGuardInstalled ? "installed" : "install failed",
+                  selfTerminateGuardInstalled ? "" : (api.lastError ? api.lastError() : ""));
     }
 
     std::vector<std::pair<std::string, std::string>> fields;
     fields.push_back({"structMapReady", structMapReady ? "true" : "false"});
+    fields.push_back({"jvmLockActive", jvmLockActive ? "true" : "false"});
+    fields.push_back({"haltLockInstalled", haltLockInstalled ? "true" : "false"});
+    fields.push_back({"selfTerminateGuardInstalled", selfTerminateGuardInstalled ? "true" : "false"});
     if (structMapReady && api.structMapCount != NULL) {
         auto count = api.structMapCount();
         fields.push_back({"structMapEntries", std::to_string(count)});
@@ -764,9 +1044,18 @@ void handleExitJvm(const NativeApi& api, const std::string& line, const std::str
     }
 
     bool ok = false;
-    if (api.exitByPid != NULL) {
+    /* Unlock JVM_Halt so in-process termination is not blocked. */
+    if (api.haltLockAllow != NULL) {
+        api.haltLockAllow();
+    }
+    HANDLE locked = duplicateJvmControlHandle(static_cast<DWORD>(pid));
+    if (locked != NULL) {
+        ok = TerminateProcess(locked, static_cast<UINT>(code)) == TRUE;
+        CloseHandle(locked);
+        clearJvmControlHandle();
+    } else if (!g_guardMode.load() && api.exitByPid != NULL) {
         ok = api.exitByPid(pid, static_cast<int>(code)) == 1;
-    } else {
+    } else if (!g_guardMode.load()) {
         HANDLE target = OpenProcess(PROCESS_TERMINATE, FALSE, static_cast<DWORD>(pid));
         if (target != NULL) {
             ok = TerminateProcess(target, static_cast<UINT>(code)) == TRUE;
@@ -1999,6 +2288,129 @@ static std::wstring queryProcessCommandLine(DWORD pid) {
     return result;
 }
 
+static std::vector<wchar_t> captureEnvironmentBlock() {
+    std::vector<wchar_t> out;
+    LPWCH block = GetEnvironmentStringsW();
+    if (block == NULL) return out;
+    const wchar_t* p = block;
+    while (*p != L'\0') {
+        size_t len = wcslen(p) + 1;
+        out.insert(out.end(), p, p + len);
+        p += len;
+    }
+    out.push_back(L'\0');
+    FreeEnvironmentStringsW(block);
+    return out;
+}
+
+static bool blockedJavaEnvironmentEntry(const wchar_t* entry) {
+    if (entry == NULL || entry[0] == L'=') return false;
+    const wchar_t* eq = wcschr(entry, L'=');
+    size_t keyLen = eq == NULL ? wcslen(entry) : static_cast<size_t>(eq - entry);
+    static const wchar_t* const blocked[] = {
+        L"JAVA_TOOL_OPTIONS", L"JDK_JAVA_OPTIONS", L"_JAVA_OPTIONS", L"CLASSPATH"
+    };
+    for (const wchar_t* key : blocked) {
+        if (keyLen == wcslen(key) && _wcsnicmp(entry, key, keyLen) == 0) return true;
+    }
+    return false;
+}
+
+static std::vector<wchar_t> sanitizeEnvironmentBlock(const std::vector<wchar_t>& source) {
+    std::vector<wchar_t> out;
+    const wchar_t* p = source.empty() ? NULL : source.data();
+    while (p != NULL && *p != L'\0') {
+        size_t len = wcslen(p) + 1;
+        if (!blockedJavaEnvironmentEntry(p)) out.insert(out.end(), p, p + len);
+        p += len;
+    }
+    out.push_back(L'\0');
+    return out;
+}
+
+static std::vector<std::wstring> tokenizeCmdLineWindows(const std::wstring& cmdline) {
+    std::vector<std::wstring> tokens;
+    int argc = 0;
+    wchar_t** argv = CommandLineToArgvW(cmdline.c_str(), &argc);
+    if (argv == NULL) return tokens;
+    for (int i = 0; i < argc; ++i) tokens.emplace_back(argv[i]);
+    LocalFree(argv);
+    return tokens;
+}
+
+/* Windows command-line quoting compatible with CommandLineToArgvW and the
+ * Microsoft C runtime parser, including backslashes immediately before quotes. */
+static std::wstring quoteWindowsArgument(const std::wstring& value) {
+    if (!value.empty() && value.find_first_of(L" \t\n\v\"") == std::wstring::npos) return value;
+    std::wstring out = L"\"";
+    size_t slashes = 0;
+    for (wchar_t ch : value) {
+        if (ch == L'\\') {
+            ++slashes;
+        } else if (ch == L'\"') {
+            out.append(slashes * 2 + 1, L'\\');
+            out.push_back(L'\"');
+            slashes = 0;
+        } else {
+            out.append(slashes, L'\\');
+            slashes = 0;
+            out.push_back(ch);
+        }
+    }
+    out.append(slashes * 2, L'\\');
+    out.push_back(L'\"');
+    return out;
+}
+
+static std::wstring joinWindowsCommandLine(const std::vector<std::wstring>& tokens) {
+    std::wstring result;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (i != 0) result.push_back(L' ');
+        result += quoteWindowsArgument(tokens[i]);
+    }
+    return result;
+}
+
+static std::string sha256FileHex(const std::wstring& path) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                              OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (file == INVALID_HANDLE_VALUE) return std::string();
+    BCRYPT_ALG_HANDLE algorithm = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    DWORD objectLength = 0, hashLength = 0, cb = 0;
+    std::vector<unsigned char> object;
+    std::vector<unsigned char> digest;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    if (status >= 0) status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+                                                reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength), &cb, 0);
+    if (status >= 0) status = BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
+                                                reinterpret_cast<PUCHAR>(&hashLength), sizeof(hashLength), &cb, 0);
+    if (status >= 0) {
+        object.resize(objectLength);
+        digest.resize(hashLength);
+        status = BCryptCreateHash(algorithm, &hash, object.data(), objectLength, NULL, 0, 0);
+    }
+    unsigned char buffer[64 * 1024];
+    while (status >= 0) {
+        DWORD read = 0;
+        if (!ReadFile(file, buffer, sizeof(buffer), &read, NULL)) { status = -1; break; }
+        if (read == 0) break;
+        status = BCryptHashData(hash, buffer, read, 0);
+    }
+    if (status >= 0) status = BCryptFinishHash(hash, digest.data(), hashLength, 0);
+    if (hash != NULL) BCryptDestroyHash(hash);
+    if (algorithm != NULL) BCryptCloseAlgorithmProvider(algorithm, 0);
+    CloseHandle(file);
+    if (status < 0 || digest.size() != 32) return std::string();
+    static const char hex[] = "0123456789abcdef";
+    std::string result(64, '0');
+    for (size_t i = 0; i < digest.size(); ++i) {
+        result[i * 2] = hex[digest[i] >> 4];
+        result[i * 2 + 1] = hex[digest[i] & 0x0F];
+    }
+    return result;
+}
+
 static std::vector<std::wstring> tokenizeCmdLine(const std::wstring& cmdline) {
     std::vector<std::wstring> tokens;
     size_t i = 0, n = cmdline.size();
@@ -2039,6 +2451,8 @@ static bool isForgevmRelaunchInjectedToken(const std::wstring& tok) {
          * forward stale or unrecognised state. */
         L"-Dforgevm.relaunched=",
         L"-Dforgevm.relaunch.remaining=",
+        L"-Dforgevm.relaunch.readyPipe=",
+        L"-Dforgevm.relaunch.readyNonce=",
     };
     for (const wchar_t* p : kPrefixes) {
         size_t len = wcslen(p);
@@ -2070,6 +2484,380 @@ static bool relaunchShouldKeepToken(const std::wstring& token,
         return filterAllows(nativeFlt, extractPath(token, kPfxLen));
     }
     return true;
+}
+
+static bool startsWithInsensitive(const std::wstring& value, const wchar_t* prefix) {
+    size_t len = wcslen(prefix);
+    return value.size() >= len && _wcsnicmp(value.c_str(), prefix, len) == 0;
+}
+
+static std::string relaunchPolicyFingerprint(std::string line) {
+    const std::string marker = "\"pid\":";
+    size_t start = line.find(marker);
+    if (start == std::string::npos) return line;
+    start += marker.size();
+    size_t end = start;
+    while (end < line.size() && line[end] >= '0' && line[end] <= '9') ++end;
+    line.replace(start, end - start, "0");
+    return line;
+}
+
+static std::string randomNonceHex() {
+    unsigned char bytes[16];
+    if (BCryptGenRandom(NULL, bytes, sizeof(bytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        return std::string();
+    }
+    static const char hex[] = "0123456789abcdef";
+    std::string result(sizeof(bytes) * 2, '0');
+    for (size_t i = 0; i < sizeof(bytes); ++i) {
+        result[i * 2] = hex[bytes[i] >> 4];
+        result[i * 2 + 1] = hex[bytes[i] & 15];
+    }
+    return result;
+}
+
+static bool verifyTrustedAgent(const std::string& pathUtf8, const std::string& expectedHash,
+                               std::wstring* pathWide, const char** reason) {
+    if (pathUtf8.empty() || expectedHash.size() != 64) {
+        *reason = "trusted_agent_spec_invalid";
+        return false;
+    }
+    *pathWide = toWide(pathUtf8);
+    if (pathWide->empty()) {
+        *reason = "trusted_agent_path_invalid";
+        return false;
+    }
+    std::string actual = sha256FileHex(*pathWide);
+    if (actual.empty()) {
+        *reason = "trusted_agent_unreadable";
+        return false;
+    }
+    std::string expected = expectedHash;
+    for (char& c : expected) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    if (actual != expected) {
+        *reason = "trusted_agent_hash_mismatch";
+        return false;
+    }
+    return true;
+}
+
+static bool waitForReadyPipe(HANDLE pipe, HANDLE process, OVERLAPPED* connect,
+                             const std::string& expectedNonce, DWORD timeoutMs) {
+    HANDLE waits[2] = { connect->hEvent, process };
+    DWORD wait = WaitForMultipleObjects(2, waits, FALSE, timeoutMs);
+    if (wait != WAIT_OBJECT_0) return false;
+    DWORD transferred = 0;
+    if (!GetOverlappedResult(pipe, connect, &transferred, FALSE)
+            && GetLastError() != ERROR_PIPE_CONNECTED) return false;
+    ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    char buffer[256];
+    while (GetTickCount64() < deadline) {
+        if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0) return false;
+        DWORD available = 0;
+        if (PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL) && available > 0) {
+            DWORD read = 0;
+            if (!ReadFile(pipe, buffer, static_cast<DWORD>(std::min<size_t>(available, sizeof(buffer) - 1)),
+                          &read, NULL)) return false;
+            buffer[read] = '\0';
+            std::string received(buffer, read);
+            while (!received.empty() && (received.back() == '\r' || received.back() == '\n')) received.pop_back();
+            return received == expectedNonce;
+        }
+        Sleep(10);
+    }
+    return false;
+}
+
+static bool installRelaunchFilters(const NativeApi& api, HANDLE process, DWORD pid,
+                                   bool installAgent, bool installNative,
+                                   bool installJvmti, bool installProcess) {
+    if (api.bootstrapTargetWithHandle == NULL
+            || api.bootstrapTargetWithHandle(static_cast<unsigned long long>(pid), process) != 1) {
+        return false;
+    }
+    g_watchdogBootstrappedPid.store(pid);
+    auto apply = [&](bool enabled, const LoadFilter& filter, auto fn) -> bool {
+        if (!enabled) return true;
+        if (fn == NULL) return false;
+        return fn(static_cast<int>(filter.mode), joinPatternsLF(filter).c_str()) == 1;
+    };
+    std::lock_guard<std::mutex> g(g_filterMutex);
+    return apply(installNative, g_nativeLoadFilter, api.banNativeLoad)
+        && apply(installAgent, g_javaAgentFilter, api.banJavaAgent)
+        && apply(installJvmti, g_jvmtiFilter, api.banJvmti)
+        && apply(installProcess, g_processCreateFilter, api.banProcessCreate);
+}
+
+static void handleRelaunchV2(const NativeApi& api, const std::string& line,
+                             const std::string& dllPath) {
+    unsigned long long pid64 = getJsonUnsignedField(line, "pid", 0ULL);
+    if (pid64 == 0ULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "missing_pid");
+        return;
+    }
+    DWORD oldPid = static_cast<DWORD>(pid64);
+    g_secureRelaunchPending.store(true);
+    struct RelaunchPendingReset {
+        ~RelaunchPendingReset() { g_secureRelaunchPending.store(false); }
+    } pendingReset;
+    std::string policyFingerprint = relaunchPolicyFingerprint(line);
+    std::wstring baselineCommand;
+    std::wstring baselineCwd;
+    std::vector<wchar_t> baselineEnvironment;
+    {
+        std::lock_guard<std::mutex> guard(g_guardMutex);
+        if (!g_launchBaseline.sealed) {
+            printResult("fallback", "UNAVAILABLE", dllPath, "launch_baseline_not_sealed");
+            return;
+        }
+        baselineCommand = g_launchBaseline.commandLine;
+        baselineCwd = g_launchBaseline.workingDirectory;
+        baselineEnvironment = g_launchBaseline.environment;
+        if (!g_secureRelaunchPolicyFingerprint.empty()
+                && g_secureRelaunchPolicyFingerprint != policyFingerprint) {
+            printResult("fallback", "UNAVAILABLE", dllPath, "relaunch_policy_already_sealed");
+            return;
+        }
+    }
+
+    std::vector<std::wstring> original = tokenizeCmdLineWindows(baselineCommand);
+    if (original.empty()) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "baseline_parse_failed");
+        return;
+    }
+    if (getJsonBoolField(line, "rejectArgumentFiles", true)) {
+        for (const std::wstring& token : original) {
+            if (!token.empty() && token[0] == L'@') {
+                printResult("fallback", "UNAVAILABLE", dllPath, "argument_file_rejected");
+                return;
+            }
+        }
+    }
+
+    bool hasAgentFilter = getJsonBoolField(line, "hasAgentFilter", false);
+    bool hasNativeFilter = getJsonBoolField(line, "hasNativeFilter", false);
+    bool hasJvmtiFilter = getJsonBoolField(line, "hasJvmtiFilter", false);
+    bool hasProcessFilter = getJsonBoolField(line, "hasProcessFilter", false);
+    LoadFilter agentFlt, nativeFlt, jvmtiFlt, processFlt;
+    auto parseFilter = [&](LoadFilter& filter, const char* modeKey, const char* patternsKey) {
+        std::string mode = getJsonStringField(line, modeKey);
+        filter.patterns = parseJsonStringArray(line, patternsKey);
+        filter.mode = mode == "whitelist" ? FilterMode::Whitelist : FilterMode::Blacklist;
+        filter.active = true;
+    };
+    if (hasAgentFilter) parseFilter(agentFlt, "agentMode", "agentPatterns");
+    if (hasNativeFilter) parseFilter(nativeFlt, "nativeMode", "nativePatterns");
+    if (hasJvmtiFilter) parseFilter(jvmtiFlt, "jvmtiMode", "jvmtiPatterns");
+    if (hasProcessFilter) parseFilter(processFlt, "processMode", "processPatterns");
+
+    std::string existingPolicy = getJsonStringField(line, "existingAgents");
+    bool dropAgents = existingPolicy == "drop_all";
+    bool filterAgents = existingPolicy == "filter";
+    std::vector<std::wstring> tokens;
+    tokens.push_back(original[0]);
+
+    std::wstring trustedNativePath, trustedJavaPath;
+    const char* verifyReason = NULL;
+    bool hasTrustedNative = getJsonBoolField(line, "hasTrustedNative", false);
+    bool hasTrustedJava = getJsonBoolField(line, "hasTrustedJava", false);
+    if (hasTrustedNative && !verifyTrustedAgent(getJsonStringField(line, "trustedNativePath"),
+            getJsonStringField(line, "trustedNativeSha256"), &trustedNativePath, &verifyReason)) {
+        printResult("fallback", "UNAVAILABLE", dllPath, verifyReason);
+        return;
+    }
+    if (hasTrustedJava && !verifyTrustedAgent(getJsonStringField(line, "trustedJavaPath"),
+            getJsonStringField(line, "trustedJavaSha256"), &trustedJavaPath, &verifyReason)) {
+        printResult("fallback", "UNAVAILABLE", dllPath, verifyReason);
+        return;
+    }
+
+    unsigned long long generation = g_secureRelaunchGeneration.load() + 1;
+    wchar_t property[160];
+    swprintf_s(property, ARRAYSIZE(property), L"-Dforgevm.agent.pid=%lu", GetCurrentProcessId());
+    tokens.push_back(property);
+    swprintf_s(property, ARRAYSIZE(property), L"-Dforgevm.relaunch.gen=%llu", generation);
+    tokens.push_back(property);
+
+    std::string handoff = getJsonStringField(line, "handoffPoint");
+    bool requireReady = handoff == "policy_applied";
+    std::string nonce;
+    std::wstring readyPipeName;
+    HANDLE readyPipe = INVALID_HANDLE_VALUE;
+    OVERLAPPED connect = {};
+    if (requireReady) {
+        nonce = randomNonceHex();
+        if (nonce.empty()) {
+            printResult("fallback", "UNAVAILABLE", dllPath, "nonce_generation_failed");
+            return;
+        }
+        readyPipeName = L"\\\\.\\pipe\\forgevm_ready_" + std::to_wstring(GetCurrentProcessId())
+                      + L"_" + toWide(nonce);
+        /* Java's RandomAccessFile opens a full-duplex handle even though it only
+         * writes the nonce. The server must therefore advertise DUPLEX access;
+         * INBOUND caused ERROR_ACCESS_DENIED/FileNotFoundException on Windows. */
+        readyPipe = CreateNamedPipeW(readyPipeName.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                                     1, 256, 256, 0, NULL);
+        if (readyPipe == INVALID_HANDLE_VALUE) {
+            printResult("fallback", "UNAVAILABLE", dllPath, "ready_pipe_create_failed");
+            return;
+        }
+        connect.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        BOOL connected = ConnectNamedPipe(readyPipe, &connect);
+        DWORD connectError = connected ? ERROR_SUCCESS : GetLastError();
+        if (connected) SetEvent(connect.hEvent);
+        if (!connected && connectError == ERROR_PIPE_CONNECTED) SetEvent(connect.hEvent);
+        else if (!connected && connectError != ERROR_IO_PENDING) {
+            CloseHandle(connect.hEvent); CloseHandle(readyPipe);
+            printResult("fallback", "UNAVAILABLE", dllPath, "ready_pipe_listen_failed");
+            return;
+        }
+        tokens.push_back(L"-Dforgevm.relaunch.readyPipe=" + readyPipeName);
+        tokens.push_back(L"-Dforgevm.relaunch.readyNonce=" + toWide(nonce));
+    }
+
+    if (hasTrustedNative) {
+        std::wstring option = L"-agentpath:" + trustedNativePath;
+        std::string args = getJsonStringField(line, "trustedNativeOptions");
+        if (!args.empty()) option += L"=" + toWide(args);
+        tokens.push_back(std::move(option));
+    }
+    if (hasTrustedJava) {
+        std::wstring option = L"-javaagent:" + trustedJavaPath;
+        std::string args = getJsonStringField(line, "trustedJavaOptions");
+        if (!args.empty()) option += L"=" + toWide(args);
+        tokens.push_back(std::move(option));
+    }
+
+    bool skipNextPatchValue = false;
+    for (size_t i = 1; i < original.size(); ++i) {
+        const std::wstring& token = original[i];
+        if (skipNextPatchValue) { skipNextPatchValue = false; continue; }
+        if (isForgevmRelaunchInjectedToken(token)) continue;
+        bool javaAgent = startsWithInsensitive(token, L"-javaagent:");
+        bool nativeAgent = startsWithInsensitive(token, L"-agentpath:");
+        bool agentLib = startsWithInsensitive(token, L"-agentlib:");
+        if (javaAgent || nativeAgent || agentLib) {
+            if (dropAgents) continue;
+            if (filterAgents) {
+                if (agentLib) continue;
+                if (!relaunchShouldKeepToken(token, hasAgentFilter, agentFlt,
+                                             hasNativeFilter, nativeFlt)) continue;
+            }
+        }
+        if (startsWithInsensitive(token, L"-Xbootclasspath")
+                || startsWithInsensitive(token, L"-Djava.system.class.loader=")
+                || startsWithInsensitive(token, L"--patch-module=")) continue;
+        if (_wcsicmp(token.c_str(), L"--patch-module") == 0) {
+            skipNextPatchValue = true;
+            continue;
+        }
+        tokens.push_back(token);
+    }
+
+    std::wstring commandLine = joinWindowsCommandLine(tokens);
+    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+    mutableCommand.push_back(L'\0');
+    std::vector<wchar_t> environment = getJsonBoolField(line, "sanitizeEnvironment", true)
+            ? sanitizeEnvironmentBlock(baselineEnvironment) : baselineEnvironment;
+    LPVOID environmentPtr = environment.empty() ? NULL : environment.data();
+
+    HANDLE oldJvm = duplicateJvmControlHandle(oldPid);
+    if (oldJvm == NULL && !g_guardMode.load()) {
+        oldJvm = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, oldPid);
+    }
+    if (oldJvm == NULL) {
+        if (connect.hEvent != NULL) CloseHandle(connect.hEvent);
+        if (readyPipe != INVALID_HANDLE_VALUE) CloseHandle(readyPipe);
+        printResult("fallback", "UNAVAILABLE", dllPath, "open_process_failed");
+        return;
+    }
+
+    STARTUPINFOW startup = {}; startup.cb = sizeof(startup);
+    PROCESS_INFORMATION child = {};
+    BOOL created = CreateProcessW(tokens[0].c_str(), mutableCommand.data(), NULL, NULL, FALSE,
+                                  CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                                      | (environmentPtr != NULL ? CREATE_UNICODE_ENVIRONMENT : 0),
+                                  environmentPtr,
+                                  baselineCwd.empty() ? NULL : baselineCwd.c_str(),
+                                  &startup, &child);
+    if (!created) {
+        CloseHandle(oldJvm);
+        if (connect.hEvent != NULL) CloseHandle(connect.hEvent);
+        if (readyPipe != INVALID_HANDLE_VALUE) CloseHandle(readyPipe);
+        printResult("fallback", "UNAVAILABLE", dllPath, "create_process_failed");
+        return;
+    }
+    if (g_guardMode.load() && !retainAndLockJvm(child.hProcess, child.dwProcessId)) {
+        TerminateProcess(child.hProcess, 0);
+        CloseHandle(child.hThread); CloseHandle(child.hProcess); CloseHandle(oldJvm);
+        if (connect.hEvent != NULL) CloseHandle(connect.hEvent);
+        if (readyPipe != INVALID_HANDLE_VALUE) CloseHandle(readyPipe);
+        printResult("fallback", "UNAVAILABLE", dllPath, "replacement_jvm_dacl_lock_failed");
+        return;
+    }
+
+    ResumeThread(child.hThread);
+    CloseHandle(child.hThread);
+    bool ready = true;
+    if (requireReady) {
+        DWORD timeout = static_cast<DWORD>(std::min<unsigned long long>(
+                getJsonUnsignedField(line, "handoffTimeoutMs", 30000ULL), 300000ULL));
+        ready = waitForReadyPipe(readyPipe, child.hProcess, &connect, nonce, timeout);
+    }
+    if (connect.hEvent != NULL) CloseHandle(connect.hEvent);
+    if (readyPipe != INVALID_HANDLE_VALUE) { DisconnectNamedPipe(readyPipe); CloseHandle(readyPipe); }
+    if (!ready) {
+        TerminateProcess(child.hProcess, 76);
+        if (g_guardMode.load()) restoreJvmControlHandle(oldJvm, oldPid);
+        CloseHandle(child.hProcess); CloseHandle(oldJvm);
+        printResult("fallback", "UNAVAILABLE", dllPath, "bootstrap_handoff_failed");
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        if (hasAgentFilter) g_javaAgentFilter = agentFlt;
+        if (hasNativeFilter) g_nativeLoadFilter = nativeFlt;
+        if (hasJvmtiFilter) g_jvmtiFilter = jvmtiFlt;
+        if (hasProcessFilter) g_processCreateFilter = processFlt;
+    }
+    if (!installRelaunchFilters(api, child.hProcess, child.dwProcessId,
+                                hasAgentFilter, hasNativeFilter, hasJvmtiFilter, hasProcessFilter)) {
+        TerminateProcess(child.hProcess, 77);
+        if (g_guardMode.load()) restoreJvmControlHandle(oldJvm, oldPid);
+        CloseHandle(child.hProcess); CloseHandle(oldJvm);
+        printResult("fallback", "UNAVAILABLE", dllPath, "replacement_guard_install_failed");
+        return;
+    }
+
+    g_secureRelaunchGeneration.store(generation);
+    {
+        std::lock_guard<std::mutex> guard(g_guardMutex);
+        g_secureRecoveryTokens.clear();
+        for (const std::wstring& token : tokens) {
+            if (!isForgevmRelaunchInjectedToken(token)) g_secureRecoveryTokens.push_back(token);
+        }
+        g_secureRecoveryEnvironmentSanitized = getJsonBoolField(line, "sanitizeEnvironment", true);
+        if (g_secureRelaunchPolicyFingerprint.empty()) {
+            g_secureRelaunchPolicyFingerprint = policyFingerprint;
+        }
+    }
+    g_parentPid.store(child.dwProcessId);
+    g_persistAfterEOF.store(true);
+    HANDLE liveness = NULL;
+    if (DuplicateHandle(GetCurrentProcess(), child.hProcess, GetCurrentProcess(), &liveness,
+                        SYNCHRONIZE, FALSE, 0)) {
+        HANDLE previous = g_relaunchNewJvm.exchange(liveness);
+        if (previous != NULL) CloseHandle(previous);
+    }
+    CloseHandle(child.hProcess);
+    printResult("ok", "FULL", dllPath, "relaunch_v2_committed");
+    if (g_agentLog != NULL) fflush(g_agentLog);
+    Sleep(25);
+    TerminateProcess(oldJvm, 0);
+    CloseHandle(oldJvm);
+    AGENT_LOG("relaunch-v2: committed generation=%llu newPid=%lu", generation, g_parentPid.load());
 }
 
 void handleRelaunch(const NativeApi& api, const std::string& line, const std::string& dllPath) {
@@ -2132,8 +2920,17 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
 
     std::wstring cmdLine = queryProcessCommandLine(static_cast<DWORD>(pid));
     if (cmdLine.empty()) {
-        AGENT_LOG("relaunch: WMI cmdline empty");
-        printResult("fallback", "UNAVAILABLE", dllPath, "wmi_cmdline_empty");
+        {
+            std::lock_guard<std::mutex> guard(g_guardMutex);
+            cmdLine = g_guardCommandLine;
+        }
+        if (!cmdLine.empty()) {
+            AGENT_LOG("relaunch: WMI cmdline empty, using cached command line (len=%zu)", cmdLine.size());
+        }
+    }
+    if (cmdLine.empty()) {
+        AGENT_LOG("relaunch: cmdline unavailable (WMI empty, no cache)");
+        printResult("fallback", "UNAVAILABLE", dllPath, "cmdline_unavailable");
         return;
     }
     AGENT_LOG("relaunch: cmdline len=%zu", cmdLine.size());
@@ -2182,7 +2979,10 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         newCmdLine += quoteIfNeeded(newTokens[i]);
     }
 
-    HANDLE hJvm = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    HANDLE hJvm = duplicateJvmControlHandle(static_cast<DWORD>(pid));
+    if (hJvm == NULL && !g_guardMode.load()) {
+        hJvm = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    }
     if (hJvm == NULL) {
         AGENT_LOG("relaunch: OpenProcess failed: %lu", GetLastError());
         printResult("fallback", "UNAVAILABLE", dllPath, "open_process_failed");
@@ -2213,6 +3013,16 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         CloseHandle(hJvm);
         g_parentPid.store(static_cast<DWORD>(pid));
         printResult("fallback", "UNAVAILABLE", dllPath, "create_process_failed");
+        return;
+    }
+    if (g_guardMode.load() && !retainAndLockJvm(pi.hProcess, pi.dwProcessId)) {
+        AGENT_LOG("relaunch: unable to lock replacement JVM pid=%lu", pi.dwProcessId);
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        CloseHandle(hJvm);
+        g_parentPid.store(static_cast<DWORD>(pid));
+        printResult("fallback", "UNAVAILABLE", dllPath, "replacement_jvm_dacl_lock_failed");
         return;
     }
     AGENT_LOG("relaunch: new process created suspended pid=%lu", pi.dwProcessId);
@@ -2337,9 +3147,10 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         }
         AGENT_LOG("post-relaunch watcher: jvm.dll detected in new JVM pid=%lu", newPid);
 
-        if (api->bootstrapTarget != NULL) {
-            if (api->bootstrapTarget(static_cast<unsigned long long>(newPid)) == 1) {
-                AGENT_LOG("post-relaunch watcher: bootstrap_target(%lu) ok", newPid);
+        if (api->bootstrapTargetWithHandle != NULL) {
+            if (api->bootstrapTargetWithHandle(static_cast<unsigned long long>(newPid), h) == 1) {
+                AGENT_LOG("post-relaunch watcher: bootstrap_target_with_handle(%lu) ok", newPid);
+                g_watchdogBootstrappedPid.store(newPid);
                 /* All three bans now match in-process against a resident pattern
                  * blob — no filter pipe. Snapshot each filter's mode + patterns
                  * and hand them to the DLL exports. */
@@ -2380,7 +3191,7 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
                               r, api->lastError ? api->lastError() : "");
                 }
             } else {
-                AGENT_LOG("post-relaunch watcher: bootstrap_target(%lu) failed: %s",
+                AGENT_LOG("post-relaunch watcher: bootstrap_target_with_handle(%lu) failed: %s",
                           newPid, api->lastError ? api->lastError() : "unknown");
             }
         }
@@ -2451,6 +3262,23 @@ static void guardReapplyActiveFilters(const NativeApi& api) {
     apply("banJavaAgent", javaAgent, api.banJavaAgent);
     apply("banJvmti", jvmti, api.banJvmti);
     apply("banProcessCreate", process, api.banProcessCreate);
+
+    /* Re-install JVM_Halt lock after recovery. */
+    if (g_guardMode.load() && api.installHaltLock != NULL) {
+        unsigned long long addr = api.installHaltLock();
+        if (addr != 0ULL) {
+            g_haltLockTrampolineAddr.store(addr);
+            AGENT_LOG("guard: JVM_Halt lock re-installed @ 0x%llX", addr);
+        } else {
+            AGENT_LOG("guard: JVM_Halt lock re-install failed: %s",
+                      api.lastError ? api.lastError() : "unknown");
+        }
+    }
+    if (g_guardMode.load() && api.installSelfTerminateGuard != NULL) {
+        int result = api.installSelfTerminateGuard();
+        AGENT_LOG("guard: NtTerminateProcess in-target guard reinstall result=%d reason=%s", result,
+                  api.lastError ? api.lastError() : "");
+    }
 }
 
 static DWORD WINAPI guardPostResumeWatcher(LPVOID param) {
@@ -2483,46 +3311,73 @@ static DWORD WINAPI guardPostResumeWatcher(LPVOID param) {
         CloseHandle(process);
         return 0;
     }
-    if (api->bootstrapTarget == NULL || api->bootstrapTarget(pid) != 1) {
+    if (api->bootstrapTargetWithHandle != NULL) {
+        if (api->bootstrapTargetWithHandle(static_cast<unsigned long long>(pid), process) != 1) {
+            AGENT_LOG("guard: bootstrap_target_with_handle(%lu) failed: %s", pid,
+                      api->lastError ? api->lastError() : "unknown");
+            CloseHandle(process);
+            return 0;
+        }
+    } else if (api->bootstrapTarget == NULL || api->bootstrapTarget(pid) != 1) {
         AGENT_LOG("guard: bootstrap_target(%lu) failed: %s", pid,
                   api->lastError ? api->lastError() : "unknown");
         CloseHandle(process);
         return 0;
     }
     guardReapplyActiveFilters(*api);
-    AGENT_LOG("guard: recovered JVM pid=%lu fully bootstrapped", pid);
-    windowPublish("[GUARD] JVM recovered and hooks reinstalled (pid " + std::to_string(pid) + ")");
+    /* Hook installation only proves that bootstrap completed. Keep the crash
+     * budget until this process survives the stable-recovery grace window. */
+    g_guardRecoveryStableSinceTick.store(GetTickCount64());
+    g_watchdogBootstrappedPid.store(pid);
+    AGENT_LOG("guard: recovery bootstrap completed for pid=%lu; hooks reinstalled, filter decisions pending audit", pid);
+    windowPublish("[GUARD] JVM restart bootstrapped; hooks reinstalled (pid " + std::to_string(pid) + ")");
     CloseHandle(process);
     return 0;
 }
 
 static void autoRelaunchAfterCrash(DWORD deadPid) {
     if (g_guardRecoveryRunning.exchange(true)) return;
+
+    /* Consecutive-death guard: if the JVM has died repeatedly without a stable
+     * recovery, stop after kGuardMaxConsecutiveDeaths attempts. Bootstrap alone
+     * does not reset this counter; the health poller requires 30s of lifetime. */
+    int deaths = g_guardConsecutiveDeaths.fetch_add(1) + 1;
+    if (deaths > kGuardMaxConsecutiveDeaths) {
+        AGENT_LOG("guard: %d consecutive JVM deaths — agent exiting", deaths);
+        windowPublish("[GUARD] " + std::to_string(deaths) +
+                      " consecutive JVM deaths; FVM stopping");
+        if (g_api != nullptr && g_api->haltLockAllow != NULL) {
+            g_api->haltLockAllow();
+        }
+        ExitProcess(75);
+    }
+    AGENT_LOG("guard: consecutive death %d of %d (pid=%lu)",
+              deaths, kGuardMaxConsecutiveDeaths, deadPid);
+
     std::wstring source;
     unsigned long long generation = 0;
+    std::vector<std::wstring> secureTokens;
+    bool secureEnvironmentSanitized = true;
     {
         std::lock_guard<std::mutex> guard(g_guardMutex);
-        ULONGLONG now = GetTickCount64();
-        g_guardCrashTicks.erase(
-            std::remove_if(g_guardCrashTicks.begin(), g_guardCrashTicks.end(),
-                           [now](ULONGLONG tick) { return now - tick > kGuardCrashWindowMs; }),
-            g_guardCrashTicks.end());
-        g_guardCrashTicks.push_back(now);
-        if (g_guardCrashTicks.size() >= kGuardCrashLimit) {
-            AGENT_LOG("guard_crash_loop: %zu abnormal JVM exits within 60 seconds; stopping FVM", g_guardCrashTicks.size());
-            windowPublish("[GUARD] crash loop detected (5 exits / 60s); JVM and FVM stopped");
-            ExitProcess(70);
-        }
         source = g_guardCommandLine;
-        generation = g_guardGeneration.fetch_add(1) + 1;
+        secureTokens = g_secureRecoveryTokens;
+        secureEnvironmentSanitized = g_secureRecoveryEnvironmentSanitized;
+        generation = secureTokens.empty()
+                ? g_guardGeneration.fetch_add(1) + 1
+                : g_secureRelaunchGeneration.fetch_add(1) + 1;
     }
-    if (source.empty() || g_api == nullptr) {
+    if ((source.empty() && secureTokens.empty()) || g_api == nullptr) {
         AGENT_LOG("guard: recovery unavailable (no cached command line or API)");
         windowPublish("[GUARD] recovery failed: no cached JVM command line; FVM stopped");
+        if (g_api != nullptr && g_api->haltLockAllow != NULL) {
+            g_api->haltLockAllow();
+        }
         ExitProcess(71);
     }
 
-    std::vector<std::wstring> oldTokens = tokenizeCmdLine(source);
+    std::vector<std::wstring> oldTokens = secureTokens.empty()
+            ? tokenizeCmdLineWindows(source) : secureTokens;
     if (oldTokens.empty()) {
         AGENT_LOG("guard: cached command line parse failed");
         ExitProcess(72);
@@ -2539,23 +3394,46 @@ static void autoRelaunchAfterCrash(DWORD deadPid) {
     for (size_t i = 1; i < oldTokens.size(); ++i) {
         if (!isForgevmRelaunchInjectedToken(oldTokens[i])) tokens.push_back(oldTokens[i]);
     }
-    std::wstring commandLine;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        if (i != 0) commandLine += L' ';
-        commandLine += quoteIfNeeded(tokens[i]);
-    }
+    std::wstring commandLine = joinWindowsCommandLine(tokens);
 
     std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
     mutableCommand.push_back(L'\0');
     STARTUPINFOW startup = {}; startup.cb = sizeof(startup);
     PROCESS_INFORMATION pi = {};
-    BOOL created = CreateProcessW(NULL, mutableCommand.data(), NULL, NULL, FALSE,
-                                  CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                                  NULL, NULL, &startup, &pi);
+    std::vector<wchar_t> recoveryEnvironment;
+    std::wstring recoveryCwd;
+    if (!secureTokens.empty()) {
+        std::lock_guard<std::mutex> guard(g_guardMutex);
+        recoveryEnvironment = secureEnvironmentSanitized
+                ? sanitizeEnvironmentBlock(g_launchBaseline.environment)
+                : g_launchBaseline.environment;
+        recoveryCwd = g_launchBaseline.workingDirectory;
+    }
+    LPVOID recoveryEnvironmentPtr = recoveryEnvironment.empty() ? NULL : recoveryEnvironment.data();
+    BOOL created = CreateProcessW(secureTokens.empty() ? NULL : tokens[0].c_str(),
+                                  mutableCommand.data(), NULL, NULL, FALSE,
+                                  CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                                      | (recoveryEnvironmentPtr != NULL ? CREATE_UNICODE_ENVIRONMENT : 0),
+                                  recoveryEnvironmentPtr,
+                                  recoveryCwd.empty() ? NULL : recoveryCwd.c_str(), &startup, &pi);
     if (!created) {
         AGENT_LOG("guard: CreateProcessW failed after pid=%lu death: %lu", deadPid, GetLastError());
         windowPublish("[GUARD] recovery CreateProcessW failed; FVM stopped");
+        if (g_api != nullptr && g_api->haltLockAllow != NULL) {
+            g_api->haltLockAllow();
+        }
         ExitProcess(73);
+    }
+    if (!retainAndLockJvm(pi.hProcess, pi.dwProcessId)) {
+        AGENT_LOG("guard: unable to lock recovered JVM pid=%lu", pi.dwProcessId);
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        windowPublish("[GUARD] recovery JVM lock failed; FVM stopped");
+        if (g_api != nullptr && g_api->haltLockAllow != NULL) {
+            g_api->haltLockAllow();
+        }
+        ExitProcess(74);
     }
 
     g_parentPid.store(pi.dwProcessId);
@@ -2655,6 +3533,8 @@ static bool dispatchCommand(const NativeApi& api, const std::string& dllPath,
         handleBanProcessCreate(api, line, dllPath);
     } else if (cmd == "unban_process_create") {
         handleUnbanProcessCreate(api, dllPath);
+    } else if (cmd == "relaunch_v2") {
+        handleRelaunchV2(api, line, dllPath);
     } else if (cmd == "relaunch") {
         handleRelaunch(api, line, dllPath);
     } else if (cmd == "shutdown") {
@@ -2705,6 +3585,10 @@ static DWORD WINAPI commandConnectionThread(LPVOID param) {
         }
         if (shutdownReq) {
             AGENT_LOG("command channel: shutdown received — exiting agent");
+            /* Release JVM_Halt lock so the JVM can self-terminate after agent exit. */
+            if (g_api != nullptr && g_api->haltLockAllow != NULL) {
+                g_api->haltLockAllow();
+            }
             DisconnectNamedPipe(pipe);
             CloseHandle(pipe);
             ExitProcess(0);
@@ -2817,12 +3701,21 @@ static bool stopTargetJvm(std::wstring* detail) {
         *detail = L"JVM: not attached";
         return true;
     }
-    HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+    HANDLE process = duplicateJvmControlHandle(pid);
+    if (process == NULL && !g_guardMode.load()) {
+        process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+    }
     if (process == NULL) {
         *detail = L"JVM: unable to open pid " + std::to_wstring(pid) +
                   L" (error " + std::to_wstring(GetLastError()) + L")";
         return false;
     }
+    /* Unlock JVM_Halt before terminating so a subsequent in-process halt
+     * (e.g. during shutdown hooks) is not blocked. */
+    if (g_api != nullptr && g_api->haltLockAllow != NULL) {
+        g_api->haltLockAllow();
+    }
+
     bool ok = TerminateProcess(process, 0) != FALSE;
     DWORD err = ok ? 0 : GetLastError();
     CloseHandle(process);
@@ -2833,6 +3726,7 @@ static bool stopTargetJvm(std::wstring* detail) {
     /* This is an operator-authorized exit: disable watchdog tracking before it
      * observes the process signal, so a future lock/guard cannot revive it. */
     g_guardAuthorizedExit.store(true);
+    clearJvmControlHandle();
     g_guardMode.store(false);
     g_jvmLockRequested.store(false);
     g_parentPid.store(0);
@@ -2879,14 +3773,26 @@ static void executeWindowCommand(HWND hwnd) {
     ShowWindow(g_commandSuggestions, SW_HIDE);
 
     if (command == L"/help") {
-        commandResultSet(L"/help\r\n/status\r\n/clear\r\n/stop\r\n/stop jvm\r\n/stop fvm");
+        commandResultSet(
+            L"ForgeVM commands\r\n\r\n"
+            L"/help\r\n"
+            L"  Show this command reference.\r\n\r\n"
+            L"/status\r\n"
+            L"  Show the tracked JVM PID, lifecycle mode, and guard state.\r\n\r\n"
+            L"/clear\r\n"
+            L"  Clear the left-side status stream.\r\n\r\n"
+            L"/stop jvm\r\n"
+            L"  Stop only the JVM. This is an authorized exit and disables guard.\r\n\r\n"
+            L"/stop fvm\r\n"
+            L"  Stop only the ForgeVM agent; the JVM continues without protection.\r\n\r\n"
+            L"/stop\r\n"
+            L"  Stop both the JVM and the ForgeVM agent.");
         windowPublish("[CMD] /help -> OK");
     } else if (command == L"/status") {
         DWORD pid = g_parentPid.load();
         std::wstring jvm = pid ? (std::wstring(L"running (pid ") + std::to_wstring(pid) + L")")
                                : std::wstring(L"not attached");
         std::wstring result = std::wstring(L"command: /status\r\nresult: OK\r\njvm: ") + jvm +
-            L"\r\nlifecycle: " + (g_independentLifecycle.load() ? L"independent" : L"dependent") +
             L"\r\njvm lock: " + (g_guardMode.load() ? L"enabled" : L"disabled") +
             L"\r\nwindow: enabled";
         commandResultSet(result);
@@ -2900,9 +3806,11 @@ static void executeWindowCommand(HWND hwnd) {
         bool ok = stopTargetJvm(&detail);
         commandResultSet(L"command: /stop jvm\r\nresult: " + std::wstring(ok ? L"OK" : L"FAILED") +
                          L"\r\n" + detail + L"\r\nfvm agent: " +
-                         (g_independentLifecycle.load() ? L"running" : L"stopping (dependent lifecycle)"));
+                         (g_guardMode.load() ? L"running" : L"stopping"));
         windowPublish(std::string("[CMD] /stop jvm -> ") + (ok ? "OK" : "FAILED"));
-        if (!g_independentLifecycle.load()) PostMessageW(hwnd, WM_FVM_STOP_AGENT, 0, 0);
+        /* In lockJvm mode the agent persists with its window after an authorized
+         * JVM stop. Without lockJvm, stopping the JVM also stops the agent. */
+        if (!g_guardMode.load()) PostMessageW(hwnd, WM_FVM_STOP_AGENT, 0, 0);
     } else if (command == L"/stop fvm") {
         commandResultSet(L"command: /stop fvm\r\nresult: OK\r\njvm: unchanged\r\nfvm agent: stopping");
         windowPublish("[CMD] /stop fvm -> OK");
@@ -3094,12 +4002,54 @@ static std::string threadName(DWORD tid) {
     return name;
 }
 
+/* Anti-suspend defense: when the health poller detects a CPU stall, this
+ * function enumerates all JVM threads and resumes any that are externally
+ * suspended. An adversary's guardian process can bypass the process-level
+ * PROCESS_SUSPEND_RESUME DACL by calling SuspendThread on individual threads
+ * (thread DACLs are independent of the process DACL). This reactive defense
+ * detects the resulting stall and reverses the suspension.
+ *
+ * JVM-internal suspensions (GC stack scanning, etc.) are brief (milliseconds);
+ * a 6-second stall is always external. ResumeThread is a no-op on threads
+ * that are not suspended, so calling it on all threads is safe. */
+static int resumeSuspendedJvmThreads(DWORD pid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te = {}; te.dwSize = sizeof(te);
+    int resumedCount = 0;
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid) continue;
+            HANDLE ht = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+            if (ht == NULL) continue;
+            DWORD prev = ResumeThread(ht);
+            if (prev != 0) {
+                ++resumedCount;
+                DWORD loops = 0;
+                while (prev > 1 && loops < 20) {
+                    prev = ResumeThread(ht);
+                    ++loops;
+                }
+            }
+            CloseHandle(ht);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return resumedCount;
+}
+
 static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
     const DWORD intervalMs = 1500;
     std::unordered_map<DWORD, ULONGLONG> prevCpu;
     DWORD trackedPid = 0;
     int spinTicks = 0, stallTicks = 0;
-    bool spinWarned = false, stallWarned = false;
+    int deadlockTicks = 0;
+    bool spinWarned = false, stallWarned = false, deadlockWarned = false;
+    bool protectedTerminationSeen = false;
+    unsigned long long lastNativeAllow = 0, lastNativeBlock = 0;
+    unsigned long long lastProcessAllow = 0, lastProcessBlock = 0;
+    unsigned long long lastHaltBlock = 0;
+    unsigned long long lastTerminateBlock = 0;
 
     for (;;) {
         Sleep(intervalMs);
@@ -3111,9 +4061,67 @@ static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
         if (pid != trackedPid) {
             prevCpu.clear();
             trackedPid = pid;
-            spinTicks = stallTicks = 0;
-            spinWarned = stallWarned = false;
+            spinTicks = stallTicks = deadlockTicks = 0;
+            spinWarned = stallWarned = deadlockWarned = false;
+            protectedTerminationSeen = false;
+            lastNativeAllow = lastNativeBlock = 0;
+            lastProcessAllow = lastProcessBlock = 0;
+            lastHaltBlock = 0;
+            lastTerminateBlock = 0;
             windowPublish("[JVM] tracking target pid=" + std::to_string(pid));
+        }
+
+        /* Write JVM_Halt lock heartbeat so the trampoline knows the agent is alive. */
+        if (g_guardMode.load() && g_api != nullptr && g_api->haltLockHeartbeat != NULL) {
+            g_api->haltLockHeartbeat();
+        }
+
+        /* Verify all inline hooks are still in place. An in-process adversary
+         * may attempt to restore original bytes at hook sites (unhooking).
+         * This detects tampering and re-applies the patch automatically. */
+        if (g_guardMode.load() && g_api != nullptr && g_api->verifyHookIntegrity != NULL) {
+            int repaired = g_api->verifyHookIntegrity();
+            if (repaired > 0) {
+                AGENT_LOG("guard: hook integrity check re-applied %d tampered hook(s)", repaired);
+                windowPublish("[FVM] hook integrity: " + std::to_string(repaired) +
+                              " hook(s) re-applied after tamper detection");
+            }
+        }
+
+        /* The filter trampolines cannot log or use IPC safely (they may execute
+         * under the Windows loader lock). Sample their private counters here so
+         * a test trace distinguishes an allowed child/DLL from a blocked one. */
+        if (g_api != nullptr && g_api->filterAudit != NULL) {
+            unsigned long long nativeAllow = g_api->filterAudit(0);
+            unsigned long long nativeBlock = g_api->filterAudit(1);
+            unsigned long long processAllow = g_api->filterAudit(2);
+            unsigned long long processBlock = g_api->filterAudit(3);
+            unsigned long long haltBlock = g_api->filterAudit(4);
+            unsigned long long terminateBlock = g_api->filterAudit(5);
+            if (haltBlock > lastHaltBlock || terminateBlock > lastTerminateBlock) {
+                protectedTerminationSeen = true;
+                AGENT_LOG("guard: protected in-process termination attempt observed "
+                          "(halt +%llu, terminate +%llu); automatic stall kill is suppressed",
+                          haltBlock - lastHaltBlock, terminateBlock - lastTerminateBlock);
+                windowPublish("[FVM] protected JVM termination attempt blocked; automatic stall kill suppressed");
+            }
+            if (nativeAllow != lastNativeAllow || nativeBlock != lastNativeBlock ||
+                processAllow != lastProcessAllow || processBlock != lastProcessBlock ||
+                haltBlock != lastHaltBlock || terminateBlock != lastTerminateBlock) {
+                AGENT_LOG("filter-audit: native allow=%llu block=%llu; process allow=%llu block=%llu; halt block=%llu; terminate block=%llu",
+                          nativeAllow, nativeBlock, processAllow, processBlock, haltBlock, terminateBlock);
+                windowPublish("[FVM] filter audit | dll A/B " + std::to_string(nativeAllow) + "/" +
+                              std::to_string(nativeBlock) + " | process A/B " +
+                              std::to_string(processAllow) + "/" + std::to_string(processBlock) +
+                              " | halt B " + std::to_string(haltBlock) +
+                              " | terminate B " + std::to_string(terminateBlock));
+                lastNativeAllow = nativeAllow;
+                lastNativeBlock = nativeBlock;
+                lastProcessAllow = processAllow;
+                lastProcessBlock = processBlock;
+                lastHaltBlock = haltBlock;
+                lastTerminateBlock = terminateBlock;
+            }
         }
 
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -3142,6 +4150,18 @@ static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
         }
         CloseHandle(snap);
         prevCpu.swap(curCpu);
+
+        /* Only continuous process lifetime constitutes a stable recovery.
+         * Rapid startup deaths therefore share one retry budget. */
+        ULONGLONG stableSince = g_guardRecoveryStableSinceTick.load();
+        if (stableSince != 0 && GetTickCount64() - stableSince >= kGuardStableRecoveryMs) {
+            int priorDeaths = g_guardConsecutiveDeaths.exchange(0);
+            g_guardRecoveryStableSinceTick.store(0);
+            if (priorDeaths > 0) {
+                AGENT_LOG("guard: recovered JVM pid=%lu stable for %llums; consecutive-death counter reset from %d",
+                          pid, kGuardStableRecoveryMs, priorDeaths);
+            }
+        }
 
         if (threadCount == 0) {
             windowPublish("[JVM] target pid=" + std::to_string(pid) + " not found (exited?)");
@@ -3175,14 +4195,59 @@ static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
             }
         } else { spinTicks = 0; spinWarned = false; }
 
-        /* Stall: process alive but essentially no CPU anywhere — possible deadlock. */
-        if (totalPctOfCore <= 1) {
+        /* Stall: process alive but essentially no CPU anywhere — possible deadlock
+         * or external thread suspension. After the first stall warning, attempt
+         * to resume any externally suspended threads. */
+        if (g_secureRelaunchPending.load()) {
+            stallTicks = 0;
+            stallWarned = false;
+            deadlockTicks = 0;
+            deadlockWarned = false;
+        } else if (totalPctOfCore <= 1) {
             if (++stallTicks >= 4 && !stallWarned) {
                 windowPublish("[JVM] ⚠ stall: no CPU activity for " +
                     std::to_string(stallTicks * intervalMs / 1000) + "s — possible deadlock");
                 stallWarned = true;
+                AGENT_LOG("guard: stall detected (pid=%lu, %d threads, 0%% CPU for %ds)",
+                          pid, threadCount, stallTicks * intervalMs / 1000);
             }
-        } else { stallTicks = 0; stallWarned = false; }
+            /* After the stall warning, try to resume suspended threads every tick.
+             * If threads were externally suspended, this reverses it. If it's a
+             * genuine Java-level deadlock, ResumeThread is a no-op (returns 0). */
+            if (stallWarned && g_guardMode.load()) {
+                int resumed = resumeSuspendedJvmThreads(pid);
+                if (resumed > 0) {
+                    AGENT_LOG("guard: anti-suspend: resumed %d externally suspended thread(s) in pid=%lu",
+                              resumed, pid);
+                    windowPublish("[FVM] anti-suspend: resumed " + std::to_string(resumed) +
+                                  " thread(s) — external SuspendThread attack detected");
+                    stallTicks = 0;
+                    stallWarned = false;
+                    deadlockTicks = 0;
+                    deadlockWarned = false;
+                } else {
+                    /* No threads were suspended, so this is not an external suspend.
+                     * CPU inactivity alone cannot distinguish a Java park from
+                     * a deadlock. Report the condition, but never translate this
+                     * heuristic into an FVM-authorized process termination. */
+                    if (++deadlockTicks >= 3 && !deadlockWarned) {
+                        AGENT_LOG("guard: prolonged zero-CPU stall observed (pid=%lu, %d ticks) — "
+                                  "automatic kill suppressed (protectedTermination=%d)",
+                                  pid, deadlockTicks, protectedTerminationSeen ? 1 : 0);
+                        windowPublish("[FVM] prolonged JVM stall observed; automatic kill suppressed");
+                        deadlockWarned = true;
+                    } else if (deadlockTicks == 1) {
+                        AGENT_LOG("guard: stall persists (pid=%lu, %d ticks) — no suspended threads found; "
+                                  "possible Java park/deadlock; observation only", pid, stallTicks);
+                    }
+                }
+            }
+        } else {
+            stallTicks = 0;
+            stallWarned = false;
+            deadlockTicks = 0;
+            deadlockWarned = false;
+        }
 
         windowPublish(line);
     }
@@ -3199,11 +4264,10 @@ static void startStatusWindow() {
 } // namespace
 
 int main(int argc, char** argv) {
-    // Harden own process: deny PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD
+    // Harden own process: deny terminate/vm/createthread/suspend/duphandle/writedac
     hardenSelfProcessDACL();
 
     bool serve = hasFlag("--serve", argc, argv);
-    g_independentLifecycle.store(hasFlag("--independent-lifecycle", argc, argv));
     g_jvmLockRequested.store(hasFlag("--lock-jvm", argc, argv));
     g_guardMode.store(g_jvmLockRequested.load());
 
@@ -3237,9 +4301,10 @@ int main(int argc, char** argv) {
               dllPath.c_str(), (int)serve, logDir.c_str());
 
     /* Optional live status window: enabled by the --window flag (passed by Java
-     * when the forgevm.window system property is set) or the FORGEVM_WINDOW
-     * environment variable. Debug/diagnostic only — off by default. */
+     * when the forgevm.window system property is set), the FORGEVM_WINDOW
+     * environment variable, or forced on when --lock-jvm is active. */
     bool wantWindow = hasFlag("--window", argc, argv)
+                   || hasFlag("--lock-jvm", argc, argv)
                    || GetEnvironmentVariableA("FORGEVM_WINDOW", NULL, 0) > 0;
     if (wantWindow) startStatusWindow();
 
@@ -3290,12 +4355,11 @@ int main(int argc, char** argv) {
         Sleep(100);
     }
 
-    /* If a relaunch armed persistence, our inherited stdin (from the old JVM)
-     * just EOF'd. Don't exit — wait for the new JVM's ForgeVM.launch() to
-     * connect to the handoff command pipe. Once the first client connects (or
-     * the new JVM dies / never maps jvm.dll, handled by acceptCommandPipeClient),
-     * serve it AND keep accepting further clients: each JVM classloader's
-     * ForgeVM holds its own independent command channel to this single agent. */
+    /* If a relaunch or guard recovery armed persistence, our inherited stdin
+     * (from the old JVM) just EOF'd. Don't exit — wait for the new JVM's
+     * ForgeVM.launch() to connect to the handoff command pipe. Once the first
+     * client connects (or the new JVM dies / never maps jvm.dll, handled by
+     * acceptCommandPipeClient), serve it AND keep accepting further clients. */
     /* A guard recovery is initiated by the watchdog, which may observe the
      * process signal a few milliseconds after this inherited stdin reaches
      * EOF. Wait for it so the recovered JVM can use the same handoff pipe. */
@@ -3318,14 +4382,17 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* If the status window is up, the JVM has just gone (stdin EOF) without a
-     * relaunch handoff — keep the agent alive so the window stays readable for
-     * post-mortem. The operator closes the window to quit (WM_CLOSE → ExitProcess
-     * once g_jvmDiedPostMortem is set by the watchdog). */
-    if (g_windowEnabled.load() && g_independentLifecycle.load()) {
+    /* JVM is gone without a relaunch handoff. In lockJvm mode the agent keeps
+     * its window open for post-mortem review (the operator closes the window to
+     * quit). Without lockJvm, the agent exits cleanly — no zombie agents. */
+    if (g_windowEnabled.load() && g_guardMode.load()) {
         g_jvmDiedPostMortem.store(true);
         windowPublish("[JVM] command stream ended — window kept open for review, close window to quit");
         for (;;) Sleep(1000);
+    }
+
+    if (g_windowEnabled.load()) {
+        AGENT_LOG("main: JVM command stream ended — agent shutting down");
     }
 
     if (api.module != NULL) FreeLibrary(api.module);

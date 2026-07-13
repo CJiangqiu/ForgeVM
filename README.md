@@ -68,7 +68,7 @@ import forgevm.core.ForgeVM;
 import forgevm.core.ForgeVMOptions;
 
 ForgeVM.LaunchResult result = ForgeVM.launch(ForgeVMOptions.builder()
-    .statusWindow(true)
+    .window(true)
     .build());
 
 if (!result.nativeDllActive()) {
@@ -86,23 +86,23 @@ if (!result.nativeDllActive()) {
 
 ```java
 ForgeVM.launch(ForgeVMOptions.builder()
-    .independentLifecycle(true) // JVM 结束后 agent 仍可存活
-    .statusWindow(true)         // 显示状态和命令窗口
-    .lockJvm(true)              // 非 FVM 授权退出时恢复 JVM
+    .window(true)   // 显示 FVM 实时状态和命令窗口
+    .lockJvm(true)  // 保护 JVM：DACL 终止锁 + halt 拦截 + 崩溃复活
     .build());
 ```
 
-三个选项的含义如下：
+两个选项的含义如下：
 
 | 选项 | 默认值 | 作用 |
 | --- | --- | --- |
-| `independentLifecycle` | `false` | 为 `false` 时，目标 JVM 退出后 agent 一并退出；为 `true` 时 agent 可跨 JVM 存活。 |
-| `statusWindow` | `false` | 打开 agent 的状态与命令窗口。 |
-| `lockJvm` | `false` | 开启 JVM 生命周期守护。它要求同时开启前两个选项。 |
+| `window` | `false` | 打开 agent 的状态与命令窗口。非 FVM relaunch 导致 JVM 消失时，agent 记录日志后干净退出。 |
+| `lockJvm` | `false` | 开启 JVM 生命周期守护，强制打开窗口。包含 DACL 终止权限锁、`Shutdown.halt()` 内进程拦截、以及崩溃后最多 4 次连续复活。 |
 
-开启 `lockJvm` 后，agent 会保存当前 JVM 的命令行。若 watchdog 发现 JVM 不是因 FVM 的正常重启或停止命令而结束，会重新创建 JVM，重新绑定 agent，并在 `jvm.dll` 可用后恢复已启用的 hook。
+开启 `lockJvm` 后，agent 会先保留一个仅供 FVM 使用的终止句柄，再拒绝后续句柄请求 `PROCESS_TERMINATE` 权限；同时 hook `jvm.dll!JVM_Halt` 阻断 Java 层 `Shutdown.halt()` 自尽路径。FVM 授权退出通过保留句柄的 `TerminateProcess`，不经过 `JVM_Halt`，不受影响。
 
-为了避免恶意模组用“启动—崩溃”耗尽资源，guard 使用 60 秒滑动窗口计数。第 5 次非授权死亡会记录 `guard_crash_loop` 并停止 FVM；不会再创建新的 JVM。
+若 JVM 仍因崩溃、已有终止句柄、管理员权限或内核级手段而结束，watchdog 会重新创建 JVM，重新绑定 agent，并在 `jvm.dll` 可用后恢复已启用的 hook。每次成功 bootstrap 后重置连续死亡计数器；连续 4 次复活失败则 agent 放行 halt hook、记录日志后退出。
+
+`window` 模式（不开启 `lockJvm`）：FVM relaunch 正常维持 agent 跨 JVM 存活。若 JVM 非 relaunch 场景下消失，agent 记录日志后干净退出，不残留僵尸进程。
 
 ## 窗口与命令
 
@@ -116,14 +116,14 @@ ForgeVM.launch(ForgeVMOptions.builder()
 
 | 命令 | 行为 |
 | --- | --- |
-| `/help` | 显示命令列表。 |
+| `/help` | 在右侧显示每条命令的说明。 |
 | `/status` | 显示 JVM PID、生命周期模式、窗口状态和 JVM 锁定状态。 |
 | `/clear` | 清空左侧状态流。 |
-| `/stop jvm` | 授权停止 JVM，并解除 guard；独立 agent 保留。 |
+| `/stop jvm` | 授权停止 JVM 并解除 guard。lockJvm 模式下 agent 保留窗口；仅 window 模式下 agent 一并退出。 |
 | `/stop fvm` | 只停止 agent，JVM 保持运行但不再受 FVM 保护。 |
 | `/stop` | 停止 JVM 与 agent。 |
 
-停止命令不要求二次确认。`/stop jvm` 是 guard 模式下的正常 JVM 退出通道；它会先写入授权退出状态，防止 watchdog 立即拉起一个新的 JVM。
+停止命令不要求二次确认。`/stop jvm` 是 guard 模式下的正常 JVM 退出通道；它会先写入授权退出状态并放行 halt hook，防止 watchdog 立即拉起一个新的 JVM。
 
 ## 安全拦截
 
@@ -355,7 +355,7 @@ import forgevm.core.ForgeVM;
 import forgevm.core.ForgeVMOptions;
 
 ForgeVM.LaunchResult result = ForgeVM.launch(ForgeVMOptions.builder()
-    .statusWindow(true)
+    .window(true)
     .build());
 
 if (!result.nativeDllActive()) {
@@ -371,19 +371,21 @@ if (!result.nativeDllActive()) {
 
 ```java
 ForgeVM.launch(ForgeVMOptions.builder()
-    .independentLifecycle(true)
-    .statusWindow(true)
+    .window(true)
     .lockJvm(true)
     .build());
 ```
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `independentLifecycle` | `false` | When false, the agent exits with its JVM. When true, it can survive a JVM exit. |
-| `statusWindow` | `false` | Opens the agent status and command window. |
-| `lockJvm` | `false` | Enables lifecycle protection. It requires both other options. |
+| `window` | `false` | Opens the agent status and command window. Agent exits cleanly (with a log entry) when the JVM disappears without a relaunch handoff. |
+| `lockJvm` | `false` | Protects the JVM lifecycle, forces the window on. Includes DACL termination lock, `Shutdown.halt()` interception, and up to 4 consecutive crash-recovery attempts. |
 
-With `lockJvm`, the agent retains the JVM command line. An exit not authorized by an FVM relaunch or stop command creates a replacement JVM, rebinds the agent, and restores enabled hooks after `jvm.dll` becomes available. A sliding 60-second window stops FVM after the fifth abnormal JVM exit instead of creating another JVM.
+With `lockJvm`, the agent retains an FVM-only termination handle, then denies `PROCESS_TERMINATE` to subsequently opened handles; it also hooks `jvm.dll!JVM_Halt` to block in-process `Shutdown.halt()`. FVM-authorized exits go through `TerminateProcess` on the retained handle, never touching `JVM_Halt`.
+
+If the JVM still exits through a crash, an existing handle, administrator privileges, or kernel-level code, the watchdog recreates it, rebinds the agent, and restores hooks once `jvm.dll` is available. Each successful bootstrap resets the consecutive-death counter. After 4 consecutive failed recoveries the agent releases the halt hook, logs the event, and exits.
+
+Window-only mode (without `lockJvm`): relaunch keeps the agent alive across JVM generations as normal. If the JVM disappears without a relaunch, the agent logs the event and exits — no zombie processes.
 
 ## Window and commands
 
@@ -391,14 +393,14 @@ The window has a continuous status stream on the left, full output for the lates
 
 | Command | Action |
 | --- | --- |
-| `/help` | Lists commands. |
+| `/help` | Shows a description for every command in the right pane. |
 | `/status` | Shows JVM PID, lifecycle mode, window, and guard state. |
 | `/clear` | Clears the left status stream. |
-| `/stop jvm` | Authorizes and stops the JVM, then disables guard; an independent agent remains. |
+| `/stop jvm` | Authorizes and stops the JVM, disables guard. In lockJvm mode the agent keeps its window; in window-only mode the agent exits too. |
 | `/stop fvm` | Stops only the agent; the JVM continues without FVM protection. |
 | `/stop` | Stops both JVM and agent. |
 
-`/stop jvm` is the normal JVM-exit path while guard is enabled. It sets the authorized-exit state before the process stops, so watchdog does not immediately recreate it.
+`/stop jvm` is the normal JVM-exit path while guard is enabled. It sets the authorized-exit state and releases the halt hook before the process stops, so watchdog does not immediately recreate it.
 
 ## Security interception
 

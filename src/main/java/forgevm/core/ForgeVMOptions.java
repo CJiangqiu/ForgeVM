@@ -10,17 +10,15 @@ package forgevm.core;
 public final class ForgeVMOptions {
     private static final ForgeVMOptions DEFAULT = builder().build();
 
-    private final boolean independentLifecycle;
-    private final boolean statusWindow;
+    private final boolean window;
     private final boolean lockJvm;
 
     private ForgeVMOptions(Builder builder) {
-        this.independentLifecycle = builder.independentLifecycle;
-        this.statusWindow = builder.statusWindow;
+        this.window = builder.window;
         this.lockJvm = builder.lockJvm;
     }
 
-    /** Default policy: no window and no independent agent lifecycle. */
+    /** Default policy: no window, no JVM protection. */
     public static ForgeVMOptions defaults() {
         return DEFAULT;
     }
@@ -29,53 +27,43 @@ public final class ForgeVMOptions {
         return new Builder();
     }
 
-    /** Whether the agent should remain alive after its target JVM exits. */
-    public boolean independentLifecycle() {
-        return independentLifecycle;
+    /**
+     * Whether to show the ForgeVM live status and command window.
+     * When enabled without {@link #lockJvm()}, the agent logs the JVM death
+     * and exits cleanly if the JVM disappears without a relaunch handoff.
+     * When {@link #lockJvm()} is active, the window is always enabled. */
+    public boolean window() {
+        return window || lockJvm;
     }
 
-    /** Whether to show the ForgeVM status and command window. */
-    public boolean statusWindow() {
-        return statusWindow;
-    }
-
-    /** Whether unauthorized JVM termination should be recovered by the agent. */
+    /**
+     * Whether the agent protects the JVM lifecycle: DACL termination lock,
+     * {@code Shutdown.halt()} interception, and guard recovery (up to 4
+     * consecutive attempts). Implies {@link #window()}. */
     public boolean lockJvm() {
         return lockJvm;
     }
 
     public static final class Builder {
-        private boolean independentLifecycle;
-        private boolean statusWindow;
+        private boolean window;
         private boolean lockJvm;
 
         private Builder() {
         }
 
-        public Builder independentLifecycle(boolean value) {
-            independentLifecycle = value;
+        /** Show the ForgeVM live status window. */
+        public Builder window(boolean value) {
+            window = value;
             return this;
         }
 
-        public Builder statusWindow(boolean value) {
-            statusWindow = value;
-            return this;
-        }
-
+        /** Protect the JVM from termination and attempt recovery on death. */
         public Builder lockJvm(boolean value) {
             lockJvm = value;
             return this;
         }
 
         public ForgeVMOptions build() {
-            if (lockJvm && !independentLifecycle) {
-                throw new IllegalStateException(
-                        "lockJvm requires independentLifecycle=true");
-            }
-            if (lockJvm && !statusWindow) {
-                throw new IllegalStateException(
-                        "lockJvm requires statusWindow=true so it can be stopped safely");
-            }
             return new ForgeVMOptions(this);
         }
     }
