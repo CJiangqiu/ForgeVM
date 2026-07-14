@@ -1036,12 +1036,13 @@ struct TrampAsm {
 /* Shared in-process substring matcher. Precondition on entry: [rsp+0x48] holds
  * the path buffer pointer and [rsp+0x50] holds the element count N. Reads the
  * resident mode byte at page+0x308 and the pattern blob at page+0x310
- * ([count:1] then per pattern [len:1][lowercased '\'→'/' bytes]; len 0 = "*").
- * Matching is case-insensitive ASCII substring; on completion it jumps to label
+ * ([count:1] then per pattern [len:1][flags:1][lowercased '\'→'/' bytes]; len 0 = "*").
+ * flags bit 0 anchors the start; bit 1 anchors the end. Matching is
+ * case-insensitive ASCII glob matching within those anchors; on completion it jumps to label
  * "allow" or "block", which the caller MUST define. `wide` reads 2-byte wchars
  * (non-ASCII wc skips the window); else 1-byte chars. Clobbers rax/rcx/rdx/r8/
- * r9/r10/r11 and scratch slots [rsp+0x40,0x58,0x60,0x68,0x70,0x78]. Label names
- * pat_loop/have_len/i_loop/j_loop/no_lower/no_slash/mismatch/decide/whitelist
+ * r9/r10/r11 and scratch slots [rsp+0x38,0x40,0x58,0x60,0x68,0x70,0x78]. Label names
+ * pat_loop/have_len/anchor_start/i_loop/j_loop/no_lower/no_slash/mismatch/anchor_end/decide/whitelist
  * are reserved — the caller must not reuse them. */
 static void emitSubstringMatcher(TrampAsm& a, bool wide) {
     const size_t SLOT_MODE = 0x308;
@@ -1066,7 +1067,9 @@ static void emitSubstringMatcher(TrampAsm& a, bool wide) {
     a.emit({0x48, 0x89, 0x44, 0x24, 0x68});     // mov [rsp+0x68], rax
     a.emit({0x4C, 0x8B, 0x54, 0x24, 0x58});     // mov r10, [rsp+0x58]
     a.emit({0x41, 0x0F, 0xB6, 0x0A});           // movzx ecx, byte [r10]  ; L
-    a.emit({0x49, 0x83, 0xC2, 0x01});           // add r10, 1
+    a.emit({0x41, 0x0F, 0xB6, 0x52, 0x01});     // movzx edx, byte [r10+1] ; flags
+    a.emit({0x48, 0x89, 0x54, 0x24, 0x38});     // mov [rsp+0x38], rdx
+    a.emit({0x49, 0x83, 0xC2, 0x02});           // add r10, 2
     a.emit({0x48, 0x89, 0x4C, 0x24, 0x60});     // mov [rsp+0x60], rcx    ; L
     a.emit({0x4C, 0x89, 0x54, 0x24, 0x70});     // mov [rsp+0x70], r10    ; pattern bytes
     a.emit({0x4C, 0x89, 0xD0});                 // mov rax, r10
@@ -1082,6 +1085,11 @@ static void emitSubstringMatcher(TrampAsm& a, bool wide) {
     a.jcc(0x82, "pat_loop");                    // jb (N<L → next pattern)
     a.emit({0x48, 0x29, 0xC8});                 // sub rax, rcx           ; maxStart
     a.emit({0x48, 0xFF, 0xC0});                 // inc rax                ; positions
+    a.emit({0x48, 0x8B, 0x54, 0x24, 0x38});     // mov rdx, [rsp+0x38]    ; flags
+    a.emit({0xF6, 0xC2, 0x01});                 // test dl, 1             ; anchored start?
+    a.jcc(0x84, "anchor_start");               // je anchor_start
+    a.emit({0xB8, 0x01, 0x00, 0x00, 0x00});     // mov eax, 1
+    a.label("anchor_start");
     a.emit({0x48, 0x89, 0x44, 0x24, 0x78});     // mov [rsp+0x78], rax
     a.emit({0x4C, 0x8B, 0x44, 0x24, 0x48});     // mov r8, [rsp+0x48]     ; cur = buffer
 
@@ -1121,6 +1129,15 @@ static void emitSubstringMatcher(TrampAsm& a, bool wide) {
     a.emit({0x49, 0x83, 0xC1, 0x01});           // add r9, 1
     a.emit({0x48, 0xFF, 0xC9});                 // dec rcx
     a.jcc(0x85, "j_loop");
+    a.emit({0x48, 0x8B, 0x54, 0x24, 0x38});     // mov rdx, [rsp+0x38]    ; flags
+    a.emit({0xF6, 0xC2, 0x02});                 // test dl, 2             ; anchored end?
+    a.jcc(0x84, "anchor_end");                 // je anchor_end
+    a.emit({0x48, 0x8B, 0x44, 0x24, 0x50});     // mov rax, [rsp+0x50]    ; N
+    if (wide) a.emit({0x48, 0xD1, 0xE0});       // shl rax, 1
+    a.emit({0x48, 0x03, 0x44, 0x24, 0x48});     // add rax, [rsp+0x48]
+    a.emit({0x4C, 0x39, 0xD0});                 // cmp rax, r10
+    a.jcc(0x85, "mismatch");                   // jne mismatch
+    a.label("anchor_end");
     a.emit({0xC6, 0x44, 0x24, 0x40, 0x01});     // matched=1
     a.jmp("decide");
     a.label("mismatch");
@@ -1250,17 +1267,18 @@ static size_t alignedPrologueLen(const uint8_t* p, size_t avail, size_t need) {
 }
 
 /* Serialize a filter (mode + patterns) into the trampoline data page at 0x310:
- *   [count:1] then per pattern [len:1][lowercased '\'→'/' normalized bytes].
+ *   [count:1] then per pattern [len:1][flags:1][lowercased '\'→'/' normalized bytes].
  * "*" → len 0 (match-all). Patterns with internal '*'/'?' are unsupported by the
- * in-process substring matcher and are skipped (logged). buf must be >= 0x400. */
-static void serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
+ * in-process substring matcher. Rules that cannot be represented are rejected
+ * so a caller never receives a partially applied policy. buf must be >= 0x400. */
+static bool serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
                                 const std::vector<std::string>& patterns);
 
 /* Java-agent filter trampoline (JVM_EnqueueOperation). In-process pattern match
  * on the narrow (char*) path argument — no pipe/IPC. Data layout:
  *   +0x300  qword  abs jump target (origPlusN)
  *   +0x308  byte   mode (0=None/block all, 1=Blacklist, 2=Whitelist)
- *   +0x310  pattern blob ([count:1] then per pattern [len:1][lowercased bytes])
+ *   +0x310  pattern blob ([count:1] then per pattern [len:1][flags:1][lowercased bytes])
  *
  * Entry saves rcx/rdx/r8/r9, allows when the path pointer is null, else measures
  * the string (capped 900) and runs emitSubstringMatcher. Block returns -1 (see
@@ -1301,7 +1319,7 @@ static std::vector<uint8_t> buildFilterTrampoline(const uint8_t* savedPrologue,
     a.emit({0x48, 0x31, 0xC9});                 // xor rcx, rcx
     a.label("nlen");
     a.emit({0x48, 0x81, 0xF9, 0x84, 0x03, 0x00, 0x00});  // cmp rcx, 0x384
-    a.jcc(0x83, "nlen_done");                   // jae nlen_done
+    a.jcc(0x83, "block");                       // jae block: unbounded path
     a.emit({0x41, 0x8A, 0x02});                 // mov al, [r10]
     a.emit({0x84, 0xC0});                       // test al, al
     a.jcc(0x84, "nlen_done");                   // je nlen_done
@@ -1346,7 +1364,7 @@ static std::vector<uint8_t> buildFilterTrampoline(const uint8_t* savedPrologue,
 
     writeU64(buf, SLOT_JMP, origPlusN);
     buf[SLOT_MODE] = static_cast<uint8_t>(mode);
-    serializeFilterBlob(buf, mode, patterns);
+    if (!serializeFilterBlob(buf, mode, patterns)) return {};
     return buf;
 }
 
@@ -1370,7 +1388,10 @@ static int installFilterTrampoline(PatchState& state,
         /* Already hooked — refresh the resident mode + pattern blob in place. */
         std::vector<uint8_t> data(0x400, 0xCC);
         data[0x308] = static_cast<uint8_t>(mode);
-        serializeFilterBlob(data, mode, patterns);
+        if (!serializeFilterBlob(data, mode, patterns)) {
+            setError("filter_rules_rejected");
+            return 0;
+        }
         if (!writeRemoteMem(proc, state.trampolineAddr + 0x308,
                             &data[0x308], 0x400 - 0x308)) {
             setError("blob_update_failed");
@@ -1587,7 +1608,7 @@ static uint64_t resolveNtdllExport(HANDLE proc, const char* exportName) {
  * Trampoline data layout (in-process matcher, no IPC):
  *   +0x300  qword  abs jump target (origPlusN or chain head)
  *   +0x308  byte   mode (0=None/block all, 1=Blacklist, 2=Whitelist)
- *   +0x310  pattern blob ([count:1] then per pattern [len:1][lowercased bytes])
+ *   +0x310  pattern blob ([count:1] then per pattern [len:1][flags:1][lowercased bytes])
  *
  * Control flow: a null UNICODE_STRING or Buffer falls through to allow.
  * Otherwise the wide name is matched directly against the resident pattern
@@ -1613,7 +1634,7 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
 
     const size_t SLOT_JMP  = 0x300;   // qword: absolute jump-on / chain target
     const size_t SLOT_MODE = 0x308;   // byte: 0=None(block all), 1=Blacklist, 2=Whitelist
-    const size_t SLOT_BLOB = 0x310;   // [count:1] then per pattern [len:1][bytes]
+    const size_t SLOT_BLOB = 0x310;   // [count:1] then per pattern [len:1][flags:1][bytes]
     const size_t SLOT_ALLOW_COUNT = 0x800;
     const size_t SLOT_BLOCK_COUNT = 0x808;
 
@@ -1640,7 +1661,7 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
     a.emit({0xD1, 0xE8});                       // shr eax, 1             ; N = wchar count
     a.emit({0x3D, 0x00, 0x04, 0x00, 0x00});     // cmp eax, 0x400
     a.jcc(0x86, "n_ok");                        // jbe n_ok
-    a.emit({0xB8, 0x00, 0x04, 0x00, 0x00});     // mov eax, 0x400         ; clamp N
+    a.jmp("block");                            // reject uninspectable path
     a.label("n_ok");
     a.emit({0x4C, 0x89, 0x44, 0x24, 0x48});     // mov [rsp+0x48], r8     ; buffer
     a.emit({0x48, 0x89, 0x44, 0x24, 0x50});     // mov [rsp+0x50], rax    ; N
@@ -1667,7 +1688,9 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
     a.emit({0x48, 0x89, 0x44, 0x24, 0x68});     // mov [rsp+0x68], rax
     a.emit({0x4C, 0x8B, 0x54, 0x24, 0x58});     // mov r10, [rsp+0x58]    ; → len byte
     a.emit({0x41, 0x0F, 0xB6, 0x0A});           // movzx ecx, byte [r10]  ; L
-    a.emit({0x49, 0x83, 0xC2, 0x01});           // add r10, 1             ; → pattern bytes
+    a.emit({0x41, 0x0F, 0xB6, 0x52, 0x01});     // movzx edx, byte [r10+1] ; flags
+    a.emit({0x48, 0x89, 0x54, 0x24, 0x38});     // mov [rsp+0x38], rdx
+    a.emit({0x49, 0x83, 0xC2, 0x02});           // add r10, 2             ; pattern bytes
     a.emit({0x48, 0x89, 0x4C, 0x24, 0x60});     // mov [rsp+0x60], rcx    ; L
     a.emit({0x4C, 0x89, 0x54, 0x24, 0x70});     // mov [rsp+0x70], r10    ; pattern bytes ptr
     a.emit({0x4C, 0x89, 0xD0});                 // mov rax, r10
@@ -1683,6 +1706,11 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
     a.jcc(0x82, "pat_loop");                    // jb pat_loop  (N<L → next pattern)
     a.emit({0x48, 0x29, 0xC8});                 // sub rax, rcx           ; maxStart = N-L
     a.emit({0x48, 0xFF, 0xC0});                 // inc rax                ; start position count
+    a.emit({0x48, 0x8B, 0x54, 0x24, 0x38});     // mov rdx, [rsp+0x38]    ; flags
+    a.emit({0xF6, 0xC2, 0x01});                 // test dl, 1             ; anchored start?
+    a.jcc(0x84, "anchor_start");               // je anchor_start
+    a.emit({0xB8, 0x01, 0x00, 0x00, 0x00});     // mov eax, 1
+    a.label("anchor_start");
     a.emit({0x48, 0x89, 0x44, 0x24, 0x78});     // mov [rsp+0x78], rax
     a.emit({0x4C, 0x8B, 0x44, 0x24, 0x48});     // mov r8, [rsp+0x48]     ; cur = buffer
 
@@ -1719,6 +1747,15 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
     a.emit({0x49, 0x83, 0xC1, 0x01});           // add r9, 1              ; next pattern byte
     a.emit({0x48, 0xFF, 0xC9});                 // dec rcx
     a.jcc(0x85, "j_loop");                       // jne j_loop
+    a.emit({0x48, 0x8B, 0x54, 0x24, 0x38});     // mov rdx, [rsp+0x38]    ; flags
+    a.emit({0xF6, 0xC2, 0x02});                 // test dl, 2             ; anchored end?
+    a.jcc(0x84, "anchor_end");                 // je anchor_end
+    a.emit({0x48, 0x8B, 0x44, 0x24, 0x50});     // mov rax, [rsp+0x50]    ; N
+    a.emit({0x48, 0xD1, 0xE0});                 // shl rax, 1
+    a.emit({0x48, 0x03, 0x44, 0x24, 0x48});     // add rax, [rsp+0x48]
+    a.emit({0x4C, 0x39, 0xD0});                 // cmp rax, r10
+    a.jcc(0x85, "mismatch");                   // jne mismatch
+    a.label("anchor_end");
     a.emit({0xC6, 0x44, 0x24, 0x40, 0x01});     // mov byte [rsp+0x40], 1 ; full match
     a.jmp("decide");
     a.label("mismatch");
@@ -1775,27 +1812,37 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
 
     writeU64(buf, SLOT_JMP, origPlusN);
     buf[SLOT_MODE] = static_cast<uint8_t>(mode);
-    serializeFilterBlob(buf, mode, patterns);
+    if (!serializeFilterBlob(buf, mode, patterns)) return {};
     writeU64(buf, SLOT_ALLOW_COUNT, 0);
     writeU64(buf, SLOT_BLOCK_COUNT, 0);
     return buf;
 }
 
-static void serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
+static bool serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
                                 const std::vector<std::string>& patterns) {
     const size_t kBlob = 0x310;
     const size_t kEnd  = 0x400;
+    if (mode < 0 || mode > 2 || buf.size() < kEnd) {
+        FVM_LOG("serializeFilterBlob: invalid mode or buffer");
+        return false;
+    }
     size_t pos = kBlob + 1;   // reserve count byte
     uint8_t count = 0;
     for (const auto& pat : patterns) {
-        if (count >= 255) break;
+        if (count >= 255) {
+            FVM_LOG("serializeFilterBlob: too many patterns");
+            return false;
+        }
         size_t s = 0, e = pat.size();
         while (s < e && pat[s] == '*') s++;
         while (e > s && pat[e - 1] == '*') e--;
+        const uint8_t flags = static_cast<uint8_t>((s == 0 ? 1 : 0) |
+                                                   (e == pat.size() ? 2 : 0));
         std::string core = pat.substr(s, e - s);
         bool matchAll = core.empty() && !pat.empty();   // "*" / "**" → match all
         if (!matchAll && core.empty()) {
-            continue;   // empty pattern matches nothing useful — skip
+            FVM_LOG("serializeFilterBlob: empty pattern rejected");
+            return false;
         }
         if (!matchAll && (core.find('*') != std::string::npos ||
                           core.find('?') != std::string::npos)) {
@@ -1807,7 +1854,8 @@ static void serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
             FVM_LOG("serializeFilterBlob: unsupported pattern '%s' -> fail closed",
                     pat.c_str());
             if (mode == 1) {
-                if (pos + 1 > kEnd) break;
+                if (pos + 2 > kEnd) return false;
+                buf[pos++] = 0;
                 buf[pos++] = 0;
                 count++;
                 break;
@@ -1815,8 +1863,9 @@ static void serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
             continue;
         }
         if (matchAll) {
-            if (pos + 1 > kEnd) break;
+            if (pos + 2 > kEnd) return false;
             buf[pos++] = 0;   // len 0 = match all
+            buf[pos++] = 0;
             count++;
             continue;
         }
@@ -1827,13 +1876,21 @@ static void serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
             if (c == '\\') c = '/';
             norm.push_back(static_cast<char>(c));
         }
-        if (norm.size() > 200) norm.resize(200);
-        if (pos + 1 + norm.size() > kEnd) break;
+        if (norm.size() > 200) {
+            FVM_LOG("serializeFilterBlob: pattern too long");
+            return false;
+        }
+        if (pos + 2 + norm.size() > kEnd) {
+            FVM_LOG("serializeFilterBlob: pattern blob full");
+            return false;
+        }
         buf[pos++] = static_cast<uint8_t>(norm.size());
+        buf[pos++] = flags;
         for (char c : norm) buf[pos++] = static_cast<uint8_t>(c);
         count++;
     }
     buf[kBlob] = count;
+    return true;
 }
 
 static int installLdrLoadDllFilter(PatchState& state, int mode,
@@ -1854,7 +1911,10 @@ static int installLdrLoadDllFilter(PatchState& state, int mode,
          * threads), so only the data region [0x308, 0x400) is rewritten. */
         std::vector<uint8_t> data(0x400, 0xCC);
         data[0x308] = static_cast<uint8_t>(mode);
-        serializeFilterBlob(data, mode, patterns);
+        if (!serializeFilterBlob(data, mode, patterns)) {
+            setError("filter_rules_rejected");
+            return 0;
+        }
         if (!writeRemoteMem(proc, state.trampolineAddr + 0x308,
                             &data[0x308], 0x400 - 0x308)) {
             setError("blob_update_failed");
@@ -2081,8 +2141,12 @@ static int installNtCreateSectionGuard();
 static int installNtCreateProcessExBlock();
 
 extern "C" __declspec(dllexport) int forgevm_ban_native_load(int mode, const char* patternsLF) {
-    int r = installLdrLoadDllFilter(g_nativeLoadPatch, mode, splitPatternsLF(patternsLF));
-    installNtCreateSectionGuard();
+    const bool sectionGuardAlreadyInstalled = g_sectionImagePatch.patched;
+    if (!installNtCreateSectionGuard()) return 0;
+    const int r = installLdrLoadDllFilter(g_nativeLoadPatch, mode, splitPatternsLF(patternsLF));
+    if (!r && !sectionGuardAlreadyInstalled) {
+        uninstallFilterTrampoline(g_sectionImagePatch, "rollback_section_image");
+    }
     return r;
 }
 
@@ -2756,7 +2820,7 @@ static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
     a.emit({0x41, 0xD1, 0xEB});                                // shr r11d, 1 ; wchar count
     a.emit({0x41, 0x81, 0xFB, 0x90, 0x01, 0x00, 0x00});        // cmp r11d, 400
     a.jcc(0x86, "len_ok");                                     // jbe len_ok
-    a.emit({0x41, 0xBB, 0x90, 0x01, 0x00, 0x00});              // mov r11d, 400
+    a.jmp("block");                                             // reject uninspectable path
     a.label("len_ok");
     a.emit({0x4C, 0x89, 0x54, 0x24, 0x48});                    // mov [rsp+0x48], r10 ; buffer
     a.emit({0x4C, 0x89, 0x5C, 0x24, 0x50});                    // mov [rsp+0x50], r11 ; N
@@ -2794,7 +2858,7 @@ static std::vector<uint8_t> buildNtCreateUserProcessTrampoline(
 
     writeU64(buf, SLOT_JMP, origPlusN);
     buf[SLOT_MODE] = static_cast<uint8_t>(mode);
-    serializeFilterBlob(buf, mode, patterns);
+    if (!serializeFilterBlob(buf, mode, patterns)) return {};
     writeU64(buf, SLOT_ALLOW_COUNT, 0);
     writeU64(buf, SLOT_BLOCK_COUNT, 0);
     return buf;
@@ -2812,7 +2876,10 @@ static int installNtCreateUserProcessFilter(PatchState& state, int mode,
         /* Already hooked — refresh the resident mode + pattern blob in place. */
         std::vector<uint8_t> data(0x400, 0xCC);
         data[0x308] = static_cast<uint8_t>(mode);
-        serializeFilterBlob(data, mode, patterns);
+        if (!serializeFilterBlob(data, mode, patterns)) {
+            setError("filter_rules_rejected");
+            return 0;
+        }
         if (!writeRemoteMem(proc, state.trampolineAddr + 0x308,
                             &data[0x308], 0x400 - 0x308)) {
             setError("blob_update_failed");
@@ -2933,8 +3000,12 @@ static int installNtCreateUserProcessFilter(PatchState& state, int mode,
 }
 
 extern "C" __declspec(dllexport) int forgevm_ban_process_create(int mode, const char* patternsLF) {
-    int r = installNtCreateUserProcessFilter(g_processCreatePatch, mode, splitPatternsLF(patternsLF));
-    installNtCreateProcessExBlock();
+    const bool createProcessExGuardAlreadyInstalled = g_createProcessExPatch.patched;
+    if (!installNtCreateProcessExBlock()) return 0;
+    const int r = installNtCreateUserProcessFilter(g_processCreatePatch, mode, splitPatternsLF(patternsLF));
+    if (!r && !createProcessExGuardAlreadyInstalled) {
+        uninstallFilterTrampoline(g_createProcessExPatch, "rollback_process_create_ex");
+    }
     return r;
 }
 
@@ -3066,7 +3137,7 @@ extern "C" __declspec(dllexport) unsigned long long forgevm_filter_audit(int kin
  * (e.g. through a pre-ban JVMTI agent or a DLL loaded in the filter
  * window) can restore the original bytes at the hook site, neutralising
  * the guard. This function reads the current bytes at every active hook
- * site, detects tampering (first byte != 0xE9), and re-applies the
+ * site, compares the complete expected patch, and re-applies the
  * original patch via writeRemoteCode.
  *
  * The agent calls this from the health poller thread on every tick,
@@ -3092,16 +3163,6 @@ extern "C" __declspec(dllexport) int forgevm_verify_hook_integrity() {
         if (!st->patched || st->targetAddr == 0 || st->trampolineAddr == 0 || st->patchSize == 0)
             continue;
 
-        uint8_t current[16] = {};
-        if (!readRemoteMem(g_target.handle, st->targetAddr, current, st->patchSize)) {
-            FVM_LOG("hook_integrity: read failed at 0x%llX, skipping",
-                    (unsigned long long)st->targetAddr);
-            continue;
-        }
-
-        if (current[0] == 0xE9)
-            continue;
-
         int64_t delta64 = static_cast<int64_t>(st->trampolineAddr) -
                           static_cast<int64_t>(st->targetAddr + 5);
         if (delta64 < INT32_MIN || delta64 > INT32_MAX) {
@@ -3114,6 +3175,14 @@ extern "C" __declspec(dllexport) int forgevm_verify_hook_integrity() {
         int32_t rel = static_cast<int32_t>(delta64);
         memcpy(patch + 1, &rel, sizeof(rel));
         for (size_t j = 5; j < st->patchSize; ++j) patch[j] = 0x90;
+
+        uint8_t current[16] = {};
+        if (!readRemoteMem(g_target.handle, st->targetAddr, current, st->patchSize)) {
+            FVM_LOG("hook_integrity: read failed at 0x%llX, skipping",
+                    (unsigned long long)st->targetAddr);
+            continue;
+        }
+        if (memcmp(current, patch, st->patchSize) == 0) continue;
 
         if (writeRemoteCode(g_target.handle, st->targetAddr, patch, st->patchSize)) {
             ++repaired;

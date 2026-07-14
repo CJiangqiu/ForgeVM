@@ -127,7 +127,9 @@ ForgeVM.launch(ForgeVMOptions.builder()
 
 ## 安全拦截
 
-ForgeVM 的拦截器维护在 agent 中。过滤器接受黑名单或白名单模式，匹配规则使用传入的路径/名称模式。拦截器应在不信任代码加载前安装；已经发生的加载、进程创建或 JVMTI 获取无法被追溯阻止。
+安全 API 会在目标 JVM 内安装 native hook，应在待控制操作发生前调用。它们控制后续请求，不提供对已执行代码、已创建进程或已取得 `jvmtiEnv*` 的通用回滚。
+
+路径规则不区分 ASCII 大小写。前导 `*` 表示允许任意前缀，尾随 `*` 表示允许任意后缀；未使用相应通配符时，路径起始或结尾会被锚定。例如 `*\\java.exe` 只匹配以 `\\java.exe` 结尾的路径，不匹配 `java.exe.payload`。内部 `*` 和 `?` 不能由驻留 native 匹配器表达；遇到此类规则时，`ban...` 调用失败，不会静默改写策略。
 
 ### Java agent
 
@@ -137,7 +139,7 @@ import forgevm.jvm.AgentFilter;
 ForgeVM.banJavaAgent(AgentFilter.Blacklist("*tool_musics_egg*"));
 ```
 
-无参 `banJavaAgent()` 会请求清理已加载 agent 并阻止后续 attach。带过滤器的版本只处理匹配项。清理已经加载的 agent 不是可逆操作；`unbanJavaAgent()` 只解除未来 attach 的阻止。
+无参 `banJavaAgent()` 会先请求处理已加载 agent，再阻止后续 attach；带过滤器的版本只处理匹配项。已有处理依赖 HotSpot 元数据和已知 `Instrumentation` 字段，清理部分引用与方法体。这是实现相关的隔离尝试，不能保证停止 agent 创建的线程、native 代码、保留引用或已经完成的类修改。`unbanJavaAgent()` 仅移除未来 attach 的拦截。
 
 ### native DLL、JVMTI 与子进程
 
@@ -153,37 +155,53 @@ ForgeVM.banProcessCreate(ProcessFilter.Blacklist("*java.exe", "*javaw.exe"));
 
 对应的解除 API 为 `unbanNativeLoad()`、`unbanJvmti()` 和 `unbanProcessCreate()`。
 
-| API | 拦截层 | 典型用途 |
+| API | native 拦截点 | 对后续请求的作用 |
 | --- | --- | --- |
-| `banNativeLoad` | `ntdll!LdrLoadDll` | 阻止 `System.load`、`System.loadLibrary` 等 native 加载。 |
-| `banJvmti` | `JavaVM::GetEnv` | 阻止 native 模块请求 JVMTI 环境。 |
-| `banProcessCreate` | `ntdll!NtCreateUserProcess` | 阻止 JVM 创建匹配的子进程，例如外部 `javaw` 重启器。 |
-| `banJavaAgent` | JVM agent/attach 路径 | 清理并阻止 Java agent。 |
+| `banNativeLoad` | `ntdll!LdrLoadDll`，以及 `NtCreateSection` 映像节 guard | 拒绝匹配的加载器 DLL 加载与映像节创建请求。 |
+| `banJvmti` | `JavaVM::GetEnv` | 拒绝请求接口为 JVMTI 的调用；调用方按返回地址所在 native 模块判定。 |
+| `banProcessCreate` | `ntdll!NtCreateUserProcess`，以及 `NtCreateProcessEx` guard | 拒绝匹配的子进程创建请求。 |
+| `banJavaAgent` | HotSpot `JVM_EnqueueOperation` | 拒绝符合当前策略的后续 Java agent 入队操作。 |
 
-过滤器是防护策略的一部分，不是权限系统。白名单过宽会重新引入伪装包名、重命名文件或中转进程绕过的空间；对 `java`、`javaw` 一类解释器路径的规则应明确覆盖实际部署路径。
+JNA 发起的 JVMTI 获取仍会经过 `JavaVM::GetEnv`。规则应匹配实际发起 native 调用的模块（通常为 JNA 的 native dispatch 库），而不是 Java 调用者所在的 jar。
+
+### 范围与边界
+
+ForgeVM 是同权限 Windows 用户态机制，不声称隔离已经在目标进程执行的 native 代码、直接系统调用、手动映射、既有进程句柄、管理员级控制或内核代码。若已确认进程受污染，可靠的重置方式是在不信任应用代码执行前安装策略并受控重启 JVM。
 
 ## JVM 重启
 
-`ForgeVM.relaunch(...)` 是由 FVM 授权的重启。agent 会读取当前命令行、按需移除 `-javaagent:` 或 `-agentpath:` 参数、创建新 JVM，并通过命名管道将新 JVM 交接给同一 agent。
+受控重启的主 API 是 `ForgeVM.relaunch(RelaunchSpec)`。它由 supervisor 使用首次启动时保存的启动基线构造替代 JVM，并将替代 JVM 交接给同一 ForgeVM agent。成功时当前 JVM 被终止，因此方法不会返回；创建、校验或交接失败时抛出 `RelaunchException`，当前 JVM 保持运行。
 
 ```java
-import forgevm.jvm.AgentFilter;
+import forgevm.jvm.JvmtiFilter;
 import forgevm.jvm.ProcessFilter;
+import forgevm.jvm.RelaunchSpec;
+
+import java.time.Duration;
 
 try {
-    ForgeVM.relaunch(
-        AgentFilter.Blacklist("*untrusted-agent*"),
-        ProcessFilter.Blacklist("*java.exe", "*javaw.exe")
-    );
+    RelaunchSpec spec = RelaunchSpec.builder()
+        .existingAgents(RelaunchSpec.ExistingAgentPolicy.DROP_ALL)
+        .jvmtiFilter(JvmtiFilter.Blacklist("*jnidispatch*"))
+        .processFilter(ProcessFilter.Blacklist("*javaw.exe"))
+        .handoff(RelaunchSpec.HandoffPoint.PROCESS_STARTED, Duration.ofSeconds(30))
+        .build();
+    ForgeVM.relaunch(spec); // 成功时不返回
 } catch (forgevm.jvm.RelaunchException e) {
-    // 仅在 agent 拒绝或创建新 JVM 失败时到达这里。
     throw new IllegalStateException("relaunch failed: " + e.getMessage(), e);
 }
 ```
 
-成功的 `relaunch` 不会返回：当前 JVM 会被终止，新 JVM 会重新执行应用启动流程。`ForgeVM.relaunchGeneration()` 可读取当前重启链代数。
+| 字段 | 语义 |
+| --- | --- |
+| `existingAgents(...)` | `DROP_ALL` 移除继承的 `-javaagent`、`-agentpath` 与 `-agentlib`；`FILTER` 使用提供的 `AgentFilter` / `NativeFilter` 筛选；`PRESERVE` 保留继承选项。 |
+| `trustedNativeAgent(...)` / `trustedJavaAgent(...)` | 在创建替代 JVM 前校验指定文件的 SHA-256，并在继承 agent 选项处理后插入该 agent。 |
+| 四种 `...Filter(...)` | 为替代 JVM 提供 Java agent、native load、JVMTI 获取和子进程创建策略；它们不撤销当前 JVM 中已经发生的对应操作。 |
+| `sanitizeEnvironment(...)` | 控制是否使用净化后的继承环境；默认开启。 |
+| `rejectArgumentFiles(...)` | 控制是否拒绝命令行中的 `@argument-file`；默认开启。 |
+| `handoff(...)` | `PROCESS_STARTED` 在替代进程启动后提交；`POLICY_APPLIED` 仅在受信任 Java agent 报告策略已应用后提交，且要求配置 `trustedJavaAgent`。 |
 
-重新启动会保留既有安全过滤器；调用时传入新的过滤器可替换对应策略。不要把业务内存状态当作会随重启保留，应该由应用自身的持久化或启动参数恢复。
+`ForgeVM.relaunch()` 及其接收过滤器的重载保留为简化 API。它们适用于只需传递过滤规则的场景；需要声明继承 agent、受信任 agent、环境或交接策略时，应使用 `RelaunchSpec`。`ForgeVM.relaunchGeneration()` 返回当前重启链代数。业务内存状态不会因重启自动保留，应由应用自身恢复。
 
 ## 内存字段操作
 
@@ -404,7 +422,18 @@ The window has a continuous status stream on the left, full output for the lates
 
 ## Security interception
 
-Install interception before untrusted code has an opportunity to load or execute. Filters use blacklist or whitelist modes; they do not retroactively undo a completed load, process creation, or JVMTI acquisition.
+The interception APIs install in-process native hooks in the target JVM. Install
+them before the operation to be controlled. They govern subsequent requests;
+they do not provide a general rollback mechanism for code, processes, or JVMTI
+environments that already exist.
+
+All path filters are case-insensitive. A leading `*` permits an arbitrary path
+prefix and a trailing `*` permits an arbitrary suffix. Without the respective
+wildcard, the beginning or end is anchored. For example, `*\\java.exe` matches
+paths ending in `\\java.exe`; it does not match `java.exe.payload`. Internal
+`*` and `?` wildcards are not represented by the resident native matcher. A
+rule that cannot be represented causes the `ban...` call to fail rather than
+silently applying a different rule.
 
 ```java
 import forgevm.jvm.AgentFilter;
@@ -418,34 +447,83 @@ ForgeVM.banJvmti(JvmtiFilter.Whitelist("*trusted-profiler*"));
 ForgeVM.banProcessCreate(ProcessFilter.Blacklist("*java.exe", "*javaw.exe"));
 ```
 
-| API | Interception layer | Typical purpose |
+| API | Native interception point | Effect on later requests |
 | --- | --- | --- |
-| `banJavaAgent` | JVM agent/attach path | Purge and block Java agents. |
-| `banNativeLoad` | `ntdll!LdrLoadDll` | Block native-library loading. |
-| `banJvmti` | `JavaVM::GetEnv` | Block JVMTI environment requests. |
-| `banProcessCreate` | `ntdll!NtCreateUserProcess` | Block matching child processes, including external Java restarters. |
+| `banJavaAgent` | HotSpot `JVM_EnqueueOperation` | Rejects subsequent Java-agent enqueue operations matching the active policy. |
+| `banNativeLoad` | `ntdll!LdrLoadDll`, with an `NtCreateSection` image-section guard | Rejects matching later loader-based native-library loads and image-section creation requests. |
+| `banJvmti` | `JavaVM::GetEnv` | Rejects later requests whose requested interface is JVMTI. The decision is made from the native module containing the call return address. |
+| `banProcessCreate` | `ntdll!NtCreateUserProcess`, with an `NtCreateProcessEx` guard | Rejects matching later child-process creation requests. |
 
-The matching `unbanJavaAgent()`, `unbanNativeLoad()`, `unbanJvmti()`, and `unbanProcessCreate()` methods remove future-request blocks where supported. Purging already loaded Java agents is not reversible.
+`unbanJavaAgent()`, `unbanNativeLoad()`, `unbanJvmti()`, and
+`unbanProcessCreate()` remove the corresponding future-request hooks when the
+native operation succeeds. They do not undo a previous Java-agent attach,
+loaded module, acquired `jvmtiEnv*`, or created child process.
+
+`banJavaAgent()` also invokes the existing-agent purge routine before installing
+the future-attach hook. That routine identifies a limited set of loaded agents
+by HotSpot metadata and known `Instrumentation` fields, then clears selected
+references and method bodies. It is an implementation-specific containment
+attempt, not a general Java-agent unload facility: it cannot guarantee removal
+of agent-created threads, native code, retained references, or class changes
+already applied by an agent.
+
+For JNA-based JVMTI acquisition, the `JavaVM::GetEnv` call is still intercepted.
+The policy must match the native module that performs the call (normally JNA's
+native dispatch library), rather than the Java archive containing the caller.
+
+### Scope and limitations
+
+ForgeVM is a Windows user-mode mechanism operating against a process of the
+same privilege level. It does not claim to provide containment against native
+code already executing in the target process, direct system calls, manual
+mapping, pre-existing process handles, administrator-level control, or kernel
+code. A known compromised process should be treated as contaminated. The
+reliable reset operation is a controlled relaunch with policies installed before
+untrusted application code is allowed to run.
 
 ## JVM relaunch
 
-`ForgeVM.relaunch(...)` is an FVM-authorized restart. The agent reads the active command line, optionally removes `-javaagent:` and `-agentpath:` arguments, creates the new JVM, and hands it back to the persistent agent through a named pipe.
+`ForgeVM.relaunch(RelaunchSpec)` is the primary controlled-relaunch API. The
+supervisor constructs the replacement JVM from the launch baseline captured at
+first startup and hands it to the same ForgeVM agent. On success the current JVM
+is terminated and the method does not return. Creation, verification, or
+handoff failure throws `RelaunchException` while the current JVM remains alive.
 
 ```java
-import forgevm.jvm.AgentFilter;
+import forgevm.jvm.JvmtiFilter;
 import forgevm.jvm.ProcessFilter;
+import forgevm.jvm.RelaunchSpec;
+
+import java.time.Duration;
 
 try {
-    ForgeVM.relaunch(
-        AgentFilter.Blacklist("*untrusted-agent*"),
-        ProcessFilter.Blacklist("*java.exe", "*javaw.exe")
-    );
+    RelaunchSpec spec = RelaunchSpec.builder()
+        .existingAgents(RelaunchSpec.ExistingAgentPolicy.DROP_ALL)
+        .jvmtiFilter(JvmtiFilter.Blacklist("*jnidispatch*"))
+        .processFilter(ProcessFilter.Blacklist("*javaw.exe"))
+        .handoff(RelaunchSpec.HandoffPoint.PROCESS_STARTED, Duration.ofSeconds(30))
+        .build();
+    ForgeVM.relaunch(spec); // does not return on success
 } catch (forgevm.jvm.RelaunchException e) {
     throw new IllegalStateException("relaunch failed: " + e.getMessage(), e);
 }
 ```
 
-A successful relaunch does not return: the current JVM is terminated and the new JVM follows its normal application startup path. Read `ForgeVM.relaunchGeneration()` to identify the generation in a relaunch chain. Existing active filters are preserved; passed filters replace the corresponding policy.
+| Field | Meaning |
+| --- | --- |
+| `existingAgents(...)` | `DROP_ALL` removes inherited `-javaagent`, `-agentpath`, and `-agentlib` options; `FILTER` evaluates inherited options using the supplied `AgentFilter` / `NativeFilter`; `PRESERVE` retains them. |
+| `trustedNativeAgent(...)` / `trustedJavaAgent(...)` | Verifies the specified file's SHA-256 before creating the replacement JVM, then inserts that agent after inherited agent-option processing. |
+| The four `...Filter(...)` methods | Supply Java-agent, native-load, JVMTI-acquisition, and child-process policies for the replacement JVM. They do not undo corresponding operations already completed in the current JVM. |
+| `sanitizeEnvironment(...)` | Selects a sanitized inherited environment; enabled by default. |
+| `rejectArgumentFiles(...)` | Rejects `@argument-file` command-line entries when enabled; enabled by default. |
+| `handoff(...)` | `PROCESS_STARTED` commits after replacement-process start. `POLICY_APPLIED` commits only after a trusted Java agent reports policy application and requires `trustedJavaAgent`. |
+
+`ForgeVM.relaunch()` and its filter-accepting overloads remain simplified APIs
+for cases that only need filter arguments. Use `RelaunchSpec` when inherited
+agents, trusted agents, environment handling, or handoff policy must be stated
+explicitly. `ForgeVM.relaunchGeneration()` returns the current relaunch-chain
+generation. Application memory state is not preserved automatically across a
+relaunch and must be restored by the application.
 
 ## Field memory operations
 

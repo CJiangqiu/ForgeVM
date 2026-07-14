@@ -1853,6 +1853,27 @@ std::string g_filterPipeName;
 static HANDLE g_commandPipeServer = INVALID_HANDLE_VALUE;
 static std::string g_commandPipeName;
 
+/* The command pipe is a control boundary, not a public local RPC endpoint.
+ * Every accepted client must be the JVM currently supervised by this agent.
+ * This does not attempt to distinguish code already injected into that JVM
+ * (which has the target's authority), but it prevents another local process
+ * from connecting by name and issuing policy-removal commands. */
+static bool isExpectedCommandPipeClient(HANDLE pipe) {
+    const DWORD expectedPid = g_parentPid.load();
+    DWORD clientPid = 0;
+    if (expectedPid == 0 || !GetNamedPipeClientProcessId(pipe, &clientPid)) {
+        AGENT_LOG("command pipe: unable to identify client (expected=%lu, err=%lu)",
+                  (unsigned long)expectedPid, (unsigned long)GetLastError());
+        return false;
+    }
+    if (clientPid != expectedPid) {
+        AGENT_LOG("command pipe: rejected client pid=%lu (expected=%lu)",
+                  (unsigned long)clientPid, (unsigned long)expectedPid);
+        return false;
+    }
+    return true;
+}
+
 static std::string buildCommandPipeName() {
     char buf[64];
     sprintf_s(buf, sizeof(buf), "\\\\.\\pipe\\forgevm_cmd_%lu",
@@ -1914,6 +1935,12 @@ static HANDLE acceptCommandPipeClient(HANDLE hJvmLiveness) {
             g_commandPipeServer = INVALID_HANDLE_VALUE;
             return NULL;
         }
+        if (!isExpectedCommandPipeClient(pipe)) {
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+            g_commandPipeServer = INVALID_HANDLE_VALUE;
+            return NULL;
+        }
         g_commandPipeServer = INVALID_HANDLE_VALUE;
         return pipe;
     }
@@ -1960,7 +1987,12 @@ static HANDLE acceptCommandPipeClient(HANDLE hJvmLiveness) {
 
     HANDLE result = NULL;
     if (connected && ctx.ok) {
-        result = pipe;
+        if (isExpectedCommandPipeClient(pipe)) {
+            result = pipe;
+        } else {
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+        }
     } else {
         CloseHandle(pipe);
     }
@@ -2054,18 +2086,15 @@ std::string ensureFilterPipeStarted() {
 }
 
 void handleBanJavaAgent(const NativeApi& api, const std::string& line, const std::string& dllPath) {
-    int mode;
-    std::string joined;
+    LoadFilter desired;
+    applyFilterFromJson(&desired, line);
+    const int mode = static_cast<int>(desired.mode);
+    const std::string joined = joinPatternsLF(desired);
+    const size_t patternCount = desired.patterns.size();
+    bool wasActive;
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
-        bool wasActive = g_javaAgentFilter.active;
-        applyFilterFromJson(&g_javaAgentFilter, line);
-        AGENT_LOG("ban_java_agent: mode=%s patterns=%zu%s",
-                  filterModeName(g_javaAgentFilter.mode),
-                  g_javaAgentFilter.patterns.size(),
-                  wasActive ? " (updated)" : "");
-        mode = static_cast<int>(g_javaAgentFilter.mode);
-        joined = joinPatternsLF(g_javaAgentFilter);
+        wasActive = g_javaAgentFilter.active;
     }
     if (api.banJavaAgent == NULL) {
         printResult("fallback", "UNAVAILABLE", dllPath, "ban_java_agent_not_exported");
@@ -2074,6 +2103,13 @@ void handleBanJavaAgent(const NativeApi& api, const std::string& line, const std
     /* In-process match: DLL installs the hook on first call, refreshes the
      * resident pattern blob in place on later calls — no filter pipe. */
     int r = api.banJavaAgent(mode, joined.c_str());
+    if (r) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_javaAgentFilter = std::move(desired);
+    }
+    AGENT_LOG("ban_java_agent: mode=%s patterns=%zu%s result=%d",
+              filterModeName(static_cast<FilterMode>(mode)), patternCount,
+              wasActive ? " (updated)" : "", r);
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
                 api.lastError ? api.lastError() : "unknown");
 }
@@ -2083,9 +2119,8 @@ void handleUnbanJavaAgent(const NativeApi& api, const std::string& dllPath) {
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
         wasActive = g_javaAgentFilter.active;
-        g_javaAgentFilter = LoadFilter{};
     }
-    AGENT_LOG("unban_java_agent: filter cleared (wasActive=%d)", (int)wasActive);
+    AGENT_LOG("unban_java_agent: requested (wasActive=%d)", (int)wasActive);
 
     if (!wasActive) {
         printResult("ok", "FULL", dllPath, "already_unbanned");
@@ -2096,23 +2131,24 @@ void handleUnbanJavaAgent(const NativeApi& api, const std::string& dllPath) {
         return;
     }
     int r = api.unbanJavaAgent();
+    if (r) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_javaAgentFilter = LoadFilter{};
+    }
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
                 api.lastError ? api.lastError() : "unknown");
 }
 
 void handleBanNativeLoad(const NativeApi& api, const std::string& line, const std::string& dllPath) {
-    int mode;
-    std::string joined;
+    LoadFilter desired;
+    applyFilterFromJson(&desired, line);
+    const int mode = static_cast<int>(desired.mode);
+    const std::string joined = joinPatternsLF(desired);
+    const size_t patternCount = desired.patterns.size();
+    bool wasActive;
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
-        bool wasActive = g_nativeLoadFilter.active;
-        applyFilterFromJson(&g_nativeLoadFilter, line);
-        AGENT_LOG("ban_native_load: mode=%s patterns=%zu%s",
-                  filterModeName(g_nativeLoadFilter.mode),
-                  g_nativeLoadFilter.patterns.size(),
-                  wasActive ? " (updated)" : "");
-        mode = static_cast<int>(g_nativeLoadFilter.mode);
-        joined = joinPatternsLF(g_nativeLoadFilter);
+        wasActive = g_nativeLoadFilter.active;
     }
     if (api.banNativeLoad == NULL) {
         printResult("fallback", "UNAVAILABLE", dllPath, "ban_native_load_not_exported");
@@ -2122,6 +2158,13 @@ void handleBanNativeLoad(const NativeApi& api, const std::string& line, const st
      * pattern blob in place on subsequent calls — both decided in-process, so
      * no filter pipe is involved. */
     int r = api.banNativeLoad(mode, joined.c_str());
+    if (r) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_nativeLoadFilter = std::move(desired);
+    }
+    AGENT_LOG("ban_native_load: mode=%s patterns=%zu%s result=%d",
+              filterModeName(static_cast<FilterMode>(mode)), patternCount,
+              wasActive ? " (updated)" : "", r);
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
                 api.lastError ? api.lastError() : "unknown");
 }
@@ -2131,9 +2174,8 @@ void handleUnbanNativeLoad(const NativeApi& api, const std::string& dllPath) {
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
         wasActive = g_nativeLoadFilter.active;
-        g_nativeLoadFilter = LoadFilter{};
     }
-    AGENT_LOG("unban_native_load: filter cleared (wasActive=%d)", (int)wasActive);
+    AGENT_LOG("unban_native_load: requested (wasActive=%d)", (int)wasActive);
 
     if (!wasActive) {
         printResult("ok", "FULL", dllPath, "already_unbanned");
@@ -2144,61 +2186,78 @@ void handleUnbanNativeLoad(const NativeApi& api, const std::string& dllPath) {
         return;
     }
     int r = api.unbanNativeLoad();
+    if (r) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_nativeLoadFilter = LoadFilter{};
+    }
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
                 api.lastError ? api.lastError() : "unknown");
 }
 
 void handleBanJvmti(const NativeApi& api, const std::string& line, const std::string& dllPath) {
-    int mode;
-    std::string joined;
-    {
-        std::lock_guard<std::mutex> g(g_filterMutex);
-        applyFilterFromJson(&g_jvmtiFilter, line);
-        mode = static_cast<int>(g_jvmtiFilter.mode);
-        joined = joinPatternsLF(g_jvmtiFilter);
-    }
+    LoadFilter desired;
+    applyFilterFromJson(&desired, line);
+    const int mode = static_cast<int>(desired.mode);
+    const std::string joined = joinPatternsLF(desired);
     if (api.banJvmti == NULL) {
         printResult("fallback", "UNAVAILABLE", dllPath, "ban_jvmti_not_exported");
         return;
     }
     int r = api.banJvmti(mode, joined.c_str());
+    if (r) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_jvmtiFilter = std::move(desired);
+    }
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
                 api.lastError ? api.lastError() : "unknown");
 }
 
 void handleUnbanJvmti(const NativeApi& api, const std::string& dllPath) {
+    bool wasActive;
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
-        g_jvmtiFilter = LoadFilter{};
+        wasActive = g_jvmtiFilter.active;
+    }
+    if (!wasActive) {
+        printResult("ok", "FULL", dllPath, "already_unbanned");
+        return;
     }
     if (api.unbanJvmti == NULL) {
         printResult("fallback", "UNAVAILABLE", dllPath, "unban_jvmti_not_exported");
         return;
     }
     int r = api.unbanJvmti();
+    if (r) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_jvmtiFilter = LoadFilter{};
+    }
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
                 api.lastError ? api.lastError() : "unknown");
 }
 
 void handleBanProcessCreate(const NativeApi& api, const std::string& line, const std::string& dllPath) {
-    int mode;
-    std::string joined;
+    LoadFilter desired;
+    applyFilterFromJson(&desired, line);
+    const int mode = static_cast<int>(desired.mode);
+    const std::string joined = joinPatternsLF(desired);
+    const size_t patternCount = desired.patterns.size();
+    bool wasActive;
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
-        bool wasActive = g_processCreateFilter.active;
-        applyFilterFromJson(&g_processCreateFilter, line);
-        AGENT_LOG("ban_process_create: mode=%s patterns=%zu%s",
-                  filterModeName(g_processCreateFilter.mode),
-                  g_processCreateFilter.patterns.size(),
-                  wasActive ? " (updated)" : "");
-        mode = static_cast<int>(g_processCreateFilter.mode);
-        joined = joinPatternsLF(g_processCreateFilter);
+        wasActive = g_processCreateFilter.active;
     }
     if (api.banProcessCreate == NULL) {
         printResult("fallback", "UNAVAILABLE", dllPath, "ban_process_create_not_exported");
         return;
     }
     int r = api.banProcessCreate(mode, joined.c_str());
+    if (r) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_processCreateFilter = std::move(desired);
+    }
+    AGENT_LOG("ban_process_create: mode=%s patterns=%zu%s result=%d",
+              filterModeName(static_cast<FilterMode>(mode)), patternCount,
+              wasActive ? " (updated)" : "", r);
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
                 api.lastError ? api.lastError() : "unknown");
 }
@@ -2208,9 +2267,8 @@ void handleUnbanProcessCreate(const NativeApi& api, const std::string& dllPath) 
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
         wasActive = g_processCreateFilter.active;
-        g_processCreateFilter = LoadFilter{};
     }
-    AGENT_LOG("unban_process_create: filter cleared (wasActive=%d)", (int)wasActive);
+    AGENT_LOG("unban_process_create: requested (wasActive=%d)", (int)wasActive);
 
     if (!wasActive) {
         printResult("ok", "FULL", dllPath, "already_unbanned");
@@ -2221,6 +2279,10 @@ void handleUnbanProcessCreate(const NativeApi& api, const std::string& dllPath) 
         return;
     }
     int r = api.unbanProcessCreate();
+    if (r) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_processCreateFilter = LoadFilter{};
+    }
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
                 api.lastError ? api.lastError() : "unknown");
 }
@@ -3567,6 +3629,11 @@ static bool readPipeLine(HANDLE pipe, std::string& out) {
  * written back over this pipe. */
 static DWORD WINAPI commandConnectionThread(LPVOID param) {
     HANDLE pipe = static_cast<HANDLE>(param);
+    if (!isExpectedCommandPipeClient(pipe)) {
+        DisconnectNamedPipe(pipe);
+        CloseHandle(pipe);
+        return 0;
+    }
     std::string line;
     while (readPipeLine(pipe, line)) {
         if (line.empty()) continue;
@@ -3624,6 +3691,11 @@ static void runCommandPipeServer(HANDLE firstPipe) {
         BOOL connected = ConnectNamedPipe(pipe, NULL)
                              ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
         if (!connected) {
+            CloseHandle(pipe);
+            continue;
+        }
+        if (!isExpectedCommandPipeClient(pipe)) {
+            DisconnectNamedPipe(pipe);
             CloseHandle(pipe);
             continue;
         }

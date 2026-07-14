@@ -7,8 +7,9 @@ import java.util.List;
  *
  * <p>Matching is performed against the library path passed to
  * {@code System.load} / {@code System.loadLibrary} / {@code Runtime.load*}.
- * Patterns are matched case-insensitively as path substrings; surrounding
- * {@code *} characters are accepted for readability. Unsupported internal
+ * Patterns are matched case-insensitively with {@code *} as a prefix/suffix
+ * wildcard: no leading {@code *} anchors the beginning and no trailing
+ * {@code *} anchors the end. Unsupported internal
  * wildcards fail closed in the native guard instead of being silently ignored.
  *
  * <pre>{@code
