@@ -4,6 +4,7 @@
 #include <shellapi.h>
 #include <string.h>
 #include <algorithm>
+#include <mutex>
 
 /* ============================================================
  * File-based logging implementation
@@ -641,11 +642,17 @@ namespace {
         uint64_t trampolineAddr = 0;
         size_t   trampolineSize = 0;
         bool     trampolineInstalled = false;
+        /* Immutable trampoline prefix.  Counters and JNI resolver caches live
+         * after this prefix and are intentionally excluded. */
+        std::vector<uint8_t> integrityPrefix;
     };
     extern PatchState g_javaAgentPatch;
     extern PatchState g_nativeLoadPatch;
     extern PatchState g_jvmtiPatch;
     extern PatchState g_processCreatePatch;
+    extern PatchState g_threadCreatePatch;
+    extern PatchState g_processJavaSourcePatch;
+    extern PatchState g_nativeJavaSourcePatch;
     extern PatchState g_terminatePatch;
     extern PatchState g_jvmHaltPatch;
     extern PatchState g_sectionImagePatch;
@@ -728,6 +735,9 @@ extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long
         g_jvmtiGetEnvAddr = 0;
         g_jvmtiGetEnvLocateFailed = false;
         g_processCreatePatch = PatchState{};
+        g_threadCreatePatch  = PatchState{};
+        g_processJavaSourcePatch = PatchState{};
+        g_nativeJavaSourcePatch  = PatchState{};
         g_terminatePatch     = PatchState{};
         g_jvmHaltPatch     = PatchState{};
         g_sectionImagePatch   = PatchState{};
@@ -777,6 +787,9 @@ extern "C" __declspec(dllexport) int forgevm_bootstrap_target_with_handle(unsign
         g_jvmtiGetEnvAddr = 0;
         g_jvmtiGetEnvLocateFailed = false;
         g_processCreatePatch = PatchState{};
+        g_threadCreatePatch  = PatchState{};
+        g_processJavaSourcePatch = PatchState{};
+        g_nativeJavaSourcePatch  = PatchState{};
         g_terminatePatch     = PatchState{};
         g_jvmHaltPatch     = PatchState{};
         g_sectionImagePatch   = PatchState{};
@@ -897,10 +910,14 @@ namespace {
     PatchState g_nativeLoadPatch;
     PatchState g_jvmtiPatch;
     PatchState g_processCreatePatch;
+    PatchState g_threadCreatePatch;
+    PatchState g_processJavaSourcePatch;
+    PatchState g_nativeJavaSourcePatch;
     PatchState g_terminatePatch;
     PatchState g_jvmHaltPatch;
     PatchState g_sectionImagePatch;
     PatchState g_createProcessExPatch;
+    std::mutex g_patchIntegrityMutex;
     uint64_t g_jvmtiGetEnvAddr = 0;
     bool g_jvmtiGetEnvLocateFailed = false;
 }
@@ -1044,9 +1061,9 @@ struct TrampAsm {
  * r9/r10/r11 and scratch slots [rsp+0x38,0x40,0x58,0x60,0x68,0x70,0x78]. Label names
  * pat_loop/have_len/anchor_start/i_loop/j_loop/no_lower/no_slash/mismatch/anchor_end/decide/whitelist
  * are reserved — the caller must not reuse them. */
-static void emitSubstringMatcher(TrampAsm& a, bool wide) {
-    const size_t SLOT_MODE = 0x308;
-    const size_t SLOT_BLOB = 0x310;
+static void emitSubstringMatcher(TrampAsm& a, bool wide,
+                                 size_t SLOT_MODE = 0x308,
+                                 size_t SLOT_BLOB = 0x310) {
 
     a.emit({0x0F, 0xB6, 0x05}); a.ripDisp(SLOT_MODE);  // movzx eax, byte [rip+mode]
     a.emit({0x84, 0xC0});                       // test al, al
@@ -1272,7 +1289,9 @@ static size_t alignedPrologueLen(const uint8_t* p, size_t avail, size_t need) {
  * in-process substring matcher. Rules that cannot be represented are rejected
  * so a caller never receives a partially applied policy. buf must be >= 0x400. */
 static bool serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
-                                const std::vector<std::string>& patterns);
+                                const std::vector<std::string>& patterns,
+                                size_t blobOffset = 0x310,
+                                size_t blobEnd = 0x400);
 
 /* Java-agent filter trampoline (JVM_EnqueueOperation). In-process pattern match
  * on the narrow (char*) path argument — no pipe/IPC. Data layout:
@@ -1386,6 +1405,7 @@ static int installFilterTrampoline(PatchState& state,
 
     if (state.patched) {
         /* Already hooked — refresh the resident mode + pattern blob in place. */
+        std::lock_guard<std::mutex> integrityGuard(g_patchIntegrityMutex);
         std::vector<uint8_t> data(0x400, 0xCC);
         data[0x308] = static_cast<uint8_t>(mode);
         if (!serializeFilterBlob(data, mode, patterns)) {
@@ -1522,7 +1542,6 @@ static int installFilterTrampoline(PatchState& state,
     state.trampolineAddr = trampAddr;
     state.trampolineSize = kPage;
     state.trampolineInstalled = true;
-
     FVM_LOG("%s: installed trampoline + E9 patch (verified)", logTag);
     setError("ok");
     return 1;
@@ -1819,9 +1838,9 @@ static std::vector<uint8_t> buildLdrLoadDllTrampoline(const uint8_t* savedProlog
 }
 
 static bool serializeFilterBlob(std::vector<uint8_t>& buf, int mode,
-                                const std::vector<std::string>& patterns) {
-    const size_t kBlob = 0x310;
-    const size_t kEnd  = 0x400;
+                                const std::vector<std::string>& patterns,
+                                size_t kBlob,
+                                size_t kEnd) {
     if (mode < 0 || mode > 2 || buf.size() < kEnd) {
         FVM_LOG("serializeFilterBlob: invalid mode or buffer");
         return false;
@@ -1909,6 +1928,7 @@ static int installLdrLoadDllFilter(PatchState& state, int mode,
         /* Already hooked — refresh the resident mode + pattern blob in place.
          * The trampoline code is unchanged (and may be executing on other
          * threads), so only the data region [0x308, 0x400) is rewritten. */
+        std::lock_guard<std::mutex> integrityGuard(g_patchIntegrityMutex);
         std::vector<uint8_t> data(0x400, 0xCC);
         data[0x308] = static_cast<uint8_t>(mode);
         if (!serializeFilterBlob(data, mode, patterns)) {
@@ -1919,6 +1939,10 @@ static int installLdrLoadDllFilter(PatchState& state, int mode,
                             &data[0x308], 0x400 - 0x308)) {
             setError("blob_update_failed");
             return 0;
+        }
+        if (state.integrityPrefix.size() >= 0x400) {
+            memcpy(state.integrityPrefix.data() + 0x308, data.data() + 0x308,
+                   0x400 - 0x308);
         }
         FVM_LOG("ban_native_load: refreshed resident pattern blob (mode=%d, %zu patterns)",
                 mode, patterns.size());
@@ -2100,10 +2124,11 @@ static int installLdrLoadDllFilter(PatchState& state, int mode,
     state.targetAddr = addr;
     state.patchSize = prologueLen;
     memcpy(state.original, saved, prologueLen);
-    state.patched = true;
     state.trampolineAddr = trampAddr;
     state.trampolineSize = kPage;
     state.trampolineInstalled = true;
+    state.integrityPrefix.assign(image.begin(), image.begin() + 0x800);
+    state.patched = true;
 
     FVM_LOG("ban_native_load: installed LdrLoadDll trampoline + E9 patch (verified)");
     setError("ok");
@@ -2124,7 +2149,27 @@ static std::vector<std::string> splitPatternsLF(const char* patternsLF) {
     return patterns;
 }
 
-extern "C" __declspec(dllexport) int forgevm_ban_java_agent(int mode, const char* patternsLF) {
+/* JVM_EnqueueOperation is entered by an OpenJDK remote-thread stub.  Its
+ * arguments contain the attach command, agent path/options, and a random pipe
+ * name, but no authenticated creator identity.  Never pretend that an
+ * origin-selective policy was installed by silently projecting it to a path
+ * rule; reject it until a provenance-bearing attach boundary is available. */
+static bool dualPolicyHasSource(const char* encodedPolicy);
+static bool dualPolicyValid(const char* encodedPolicy);
+static bool deriveFailClosedLowPolicy(int requestedMode, const char* patternsLF,
+                                      const char* encodedPolicy, int* lowMode,
+                                      std::vector<std::string>* lowPatterns);
+
+extern "C" __declspec(dllexport) int forgevm_ban_java_agent(int mode, const char* patternsLF,
+                                                             const char* encodedPolicy) {
+    if (!dualPolicyValid(encodedPolicy)) {
+        setError("malformed_dual_policy");
+        return 0;
+    }
+    if (dualPolicyHasSource(encodedPolicy)) {
+        setError("agent_source_unavailable");
+        return 0;
+    }
     return installFilterTrampoline(g_javaAgentPatch, "JVM_EnqueueOperation",
                                     /*pathInRdx=*/true, mode, splitPatternsLF(patternsLF),
                                     "ban_java_agent");
@@ -2139,21 +2184,54 @@ extern "C" __declspec(dllexport) int forgevm_unban_java_agent() {
  * trampoline against this resident pattern set — no per-load IPC. */
 static int installNtCreateSectionGuard();
 static int installNtCreateProcessExBlock();
+static int installJavaSourceFilter(PatchState& state, const char* exportName, int targetArg,
+                                   const std::string& policy, const char* logTag);
 
-extern "C" __declspec(dllexport) int forgevm_ban_native_load(int mode, const char* patternsLF) {
+extern "C" __declspec(dllexport) int forgevm_ban_native_load(int mode, const char* patternsLF,
+                                                              const char* encodedPolicy) {
+    if (!dualPolicyValid(encodedPolicy)) {
+        setError("malformed_dual_policy");
+        return 0;
+    }
+    const bool sourceAware = dualPolicyHasSource(encodedPolicy);
+    int lowMode = mode;
+    std::vector<std::string> lowPatterns;
+    if (!deriveFailClosedLowPolicy(mode, patternsLF, encodedPolicy,
+                                   &lowMode, &lowPatterns)) {
+        setError("low_policy_projection_failed");
+        return 0;
+    }
+    const bool sourceGuardAlreadyInstalled = g_nativeJavaSourcePatch.patched;
+    if (sourceAware) {
+        if (!installJavaSourceFilter(g_nativeJavaSourcePatch,
+                "Java_jdk_internal_loader_NativeLibraries_load", 9,
+                encodedPolicy, "native_source")) return 0;
+    } else if (g_nativeJavaSourcePatch.patched) {
+        if (!uninstallFilterTrampoline(g_nativeJavaSourcePatch, "unban_native_java_source")) return 0;
+    }
     const bool sectionGuardAlreadyInstalled = g_sectionImagePatch.patched;
     if (!installNtCreateSectionGuard()) return 0;
-    const int r = installLdrLoadDllFilter(g_nativeLoadPatch, mode, splitPatternsLF(patternsLF));
+    /* The low boundary must never become permissive merely because a Java
+     * source selector exists: direct JNA/FFI calls do not pass through
+     * NativeLibraries.load.  Project every rule conservatively so the native
+     * decision is a necessary condition of the high-level decision. */
+    const int r = installLdrLoadDllFilter(g_nativeLoadPatch, lowMode, lowPatterns);
     if (!r && !sectionGuardAlreadyInstalled) {
         uninstallFilterTrampoline(g_sectionImagePatch, "rollback_section_image");
+    }
+    if (!r && sourceAware && !sourceGuardAlreadyInstalled) {
+        uninstallFilterTrampoline(g_nativeJavaSourcePatch, "rollback_native_java_source");
     }
     return r;
 }
 
 extern "C" __declspec(dllexport) int forgevm_unban_native_load() {
-    uninstallFilterTrampoline(g_nativeLoadPatch, "unban_native_load");
-    uninstallFilterTrampoline(g_sectionImagePatch, "unban_section_image");
-    return 1;
+    int ok = uninstallFilterTrampoline(g_nativeLoadPatch, "unban_native_load");
+    ok &= uninstallFilterTrampoline(g_sectionImagePatch, "unban_section_image");
+    if (g_nativeJavaSourcePatch.patched) {
+        ok &= uninstallFilterTrampoline(g_nativeJavaSourcePatch, "unban_native_java_source");
+    }
+    return ok;
 }
 
 /* ============================================================
@@ -2417,6 +2495,64 @@ struct JvmtiModuleRule {
     bool allow = false;
 };
 
+struct DualFilterRule {
+    std::string name;
+    std::string source;
+    bool hasName = false;
+    bool hasSource = false;
+};
+
+static bool decodeBase64Url(const std::string& input, std::string* output) {
+    output->clear();
+    if (input == "-") return true;
+    uint32_t value = 0;
+    int bits = -8;
+    for (unsigned char c : input) {
+        int digit = -1;
+        if (c >= 'A' && c <= 'Z') digit = c - 'A';
+        else if (c >= 'a' && c <= 'z') digit = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') digit = c - '0' + 52;
+        else if (c == '-') digit = 62;
+        else if (c == '_') digit = 63;
+        else return false;
+        value = (value << 6) | digit;
+        bits += 6;
+        if (bits >= 0) {
+            output->push_back(static_cast<char>((value >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return true;
+}
+
+static bool parseDualPolicy(const char* encoded, int* mode,
+                            std::vector<DualFilterRule>* rules) {
+    rules->clear();
+    if (encoded == NULL || encoded[0] == '\0') return false;
+    std::string policy(encoded);
+    if (policy.size() < 6 || policy.compare(0, 3, "v2;") != 0 || policy[4] != ';') return false;
+    if (policy[3] != 'W' && policy[3] != 'B') return false;
+    *mode = policy[3] == 'W' ? 2 : 1;
+    size_t pos = 5;
+    while (pos <= policy.size()) {
+        size_t comma = policy.find(',', pos);
+        std::string item = policy.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        size_t dot = item.find('.');
+        if (dot == std::string::npos) return false;
+        DualFilterRule rule;
+        std::string left = item.substr(0, dot), right = item.substr(dot + 1);
+        rule.hasName = left != "-";
+        rule.hasSource = right != "-";
+        if ((rule.hasName && !decodeBase64Url(left, &rule.name)) ||
+            (rule.hasSource && !decodeBase64Url(right, &rule.source)) ||
+            (!rule.hasName && !rule.hasSource)) return false;
+        rules->push_back(std::move(rule));
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return !rules->empty();
+}
+
 static bool globMatchPath(const std::string& pattern, const std::string& text) {
     auto norm = [](unsigned char c) -> unsigned char {
         if (c >= 'A' && c <= 'Z') c = static_cast<unsigned char>(c - 'A' + 'a');
@@ -2549,6 +2685,7 @@ static uint64_t locateJavaVmGetEnv(HANDLE proc) {
 }
 
 static bool buildJvmtiModuleRules(int mode, const std::vector<std::string>& patterns,
+                                  const char* encodedPolicy,
                                   std::vector<JvmtiModuleRule>* out) {
     out->clear();
     HANDLE proc = g_target.handle;
@@ -2561,6 +2698,9 @@ static bool buildJvmtiModuleRules(int mode, const std::vector<std::string>& patt
         modules.resize(needed / sizeof(HMODULE) + 32);
     }
     modules.resize(needed / sizeof(HMODULE));
+    std::vector<DualFilterRule> dualRules;
+    int policyMode = mode;
+    bool hasDualPolicy = parseDualPolicy(encodedPolicy, &policyMode, &dualRules);
     for (HMODULE module : modules) {
         MODULEINFO mi = {};
         wchar_t path[32768] = {};
@@ -2568,8 +2708,18 @@ static bool buildJvmtiModuleRules(int mode, const std::vector<std::string>& patt
         if (GetModuleFileNameExW(proc, module, path, ARRAYSIZE(path)) == 0) continue;
         std::string utf8 = widePathToUtf8(path);
         bool matched = false;
-        for (const auto& pattern : patterns) {
-            if (globMatchPath(pattern, utf8)) { matched = true; break; }
+        if (hasDualPolicy) {
+            const std::string source = "module:" + utf8;
+            for (const auto& rule : dualRules) {
+                bool nameMatch = !rule.hasName || globMatchPath(rule.name, "jvmti");
+                bool sourceMatch = !rule.hasSource || globMatchPath(rule.source, source);
+                if (nameMatch && sourceMatch) { matched = true; break; }
+            }
+            mode = policyMode;
+        } else {
+            for (const auto& pattern : patterns) {
+                if (globMatchPath(pattern, utf8)) { matched = true; break; }
+            }
         }
         bool allow = mode == 0 ? false : (mode == 1 ? !matched : matched);
         uint64_t begin = reinterpret_cast<uint64_t>(mi.lpBaseOfDll);
@@ -2664,12 +2814,21 @@ static std::vector<uint8_t> buildJvmtiGetEnvTrampoline(const uint8_t* savedProlo
     return image;
 }
 
-static int installJvmtiFilter(int mode, const std::vector<std::string>& patterns) {
+static int installJvmtiFilter(int mode, const std::vector<std::string>& patterns,
+                              const char* encodedPolicy) {
     HANDLE proc = g_target.handle;
     if (proc == NULL || g_target.jvmDllBase == 0) { setError("no_target_handle"); return 0; }
+    if (encodedPolicy != NULL && encodedPolicy[0] != '\0') {
+        int parsedMode = mode;
+        std::vector<DualFilterRule> parsed;
+        if (!parseDualPolicy(encodedPolicy, &parsedMode, &parsed)) {
+            setError("malformed_dual_policy");
+            return 0;
+        }
+    }
 
     std::vector<JvmtiModuleRule> rules;
-    if (!buildJvmtiModuleRules(mode, patterns, &rules)) { setError("module_rules_failed"); return 0; }
+    if (!buildJvmtiModuleRules(mode, patterns, encodedPolicy, &rules)) { setError("module_rules_failed"); return 0; }
     if (rules.size() > 255) { setError("too_many_modules"); return 0; }
 
     if (g_jvmtiPatch.patched) {
@@ -2737,8 +2896,9 @@ static int installJvmtiFilter(int mode, const std::vector<std::string>& patterns
     return 1;
 }
 
-extern "C" __declspec(dllexport) int forgevm_ban_jvmti(int mode, const char* patternsLF) {
-    return installJvmtiFilter(mode, splitPatternsLF(patternsLF));
+extern "C" __declspec(dllexport) int forgevm_ban_jvmti(int mode, const char* patternsLF,
+                                                        const char* encodedPolicy) {
+    return installJvmtiFilter(mode, splitPatternsLF(patternsLF), encodedPolicy);
 }
 
 extern "C" __declspec(dllexport) int forgevm_unban_jvmti() {
@@ -2773,7 +2933,7 @@ extern "C" __declspec(dllexport) int forgevm_unban_jvmti() {
  * ordinary CreateProcess/ProcessBuilder request into an unconditional allow.
  *
  * The NT path may carry a \??\ prefix; substring matching on the full path
- * still works with patterns like *processproxy*. If the image name cannot be
+ * still works with substring patterns. If the image name cannot be
  * read, fail closed: allowing an unclassified process is a security bypass,
  * especially for a blacklist containing *java* / *javaw*. Data layout matches
  * the LdrLoadDll trampoline. Frame is `sub rsp, 0x4A8`; arg9 is at
@@ -2874,6 +3034,7 @@ static int installNtCreateUserProcessFilter(PatchState& state, int mode,
 
     if (state.patched) {
         /* Already hooked — refresh the resident mode + pattern blob in place. */
+        std::lock_guard<std::mutex> integrityGuard(g_patchIntegrityMutex);
         std::vector<uint8_t> data(0x400, 0xCC);
         data[0x308] = static_cast<uint8_t>(mode);
         if (!serializeFilterBlob(data, mode, patterns)) {
@@ -2887,6 +3048,10 @@ static int installNtCreateUserProcessFilter(PatchState& state, int mode,
         }
         FVM_LOG("ban_process_create: refreshed resident pattern blob (mode=%d, %zu patterns)",
                 mode, patterns.size());
+        if (state.integrityPrefix.size() >= 0x400) {
+            memcpy(state.integrityPrefix.data() + 0x308, data.data() + 0x308,
+                   0x400 - 0x308);
+        }
         setError("ok");
         return 1;
     }
@@ -2989,30 +3154,1032 @@ static int installNtCreateUserProcessFilter(PatchState& state, int mode,
     state.targetAddr = addr;
     state.patchSize = prologueLen;
     memcpy(state.original, saved, prologueLen);
-    state.patched = true;
     state.trampolineAddr = trampAddr;
     state.trampolineSize = kPage;
     state.trampolineInstalled = true;
 
     FVM_LOG("ban_process_create: installed NtCreateUserProcess trampoline + E9 patch (verified)");
+    state.integrityPrefix.assign(image.begin(), image.begin() + 0x800);
+    state.patched = true;
     setError("ok");
     return 1;
 }
 
-extern "C" __declspec(dllexport) int forgevm_ban_process_create(int mode, const char* patternsLF) {
+static bool dualPolicyHasSource(const char* encodedPolicy) {
+    if (encodedPolicy == NULL || encodedPolicy[0] == '\0') return false;
+    int mode = 0;
+    std::vector<DualFilterRule> rules;
+    if (!parseDualPolicy(encodedPolicy, &mode, &rules)) return false;
+    for (const auto& rule : rules) if (rule.hasSource) return true;
+    return false;
+}
+
+static bool dualPolicyValid(const char* encodedPolicy) {
+    if (encodedPolicy == NULL || encodedPolicy[0] == '\0') return true;
+    int mode = 0;
+    std::vector<DualFilterRule> rules;
+    return parseDualPolicy(encodedPolicy, &mode, &rules);
+}
+
+/* Build a conservative name projection for policy boundaries that have no reliable
+ * Java caller identity (LdrLoadDll and NtCreateUserProcess).
+ *
+ * Name+Source is projected to Name.  This can over-block in blacklist mode,
+ * but prevents a direct native call from bypassing every name-bearing rule.
+ * Source-only rules cannot be represented at this boundary and remain on the
+ * Java source hook; projecting a source-only blacklist to '*' would block
+ * unrelated bootstrap DLLs such as LWJGL before SourceResolver is visible. */
+static bool deriveFailClosedLowPolicy(int requestedMode, const char* patternsLF,
+                                      const char* encodedPolicy, int* lowMode,
+                                      std::vector<std::string>* lowPatterns) {
+    lowPatterns->clear();
+    if (encodedPolicy == NULL || encodedPolicy[0] == '\0') {
+        *lowMode = requestedMode;
+        *lowPatterns = splitPatternsLF(patternsLF);
+        return true;
+    }
+
+    std::vector<DualFilterRule> rules;
+    if (!parseDualPolicy(encodedPolicy, lowMode, &rules)) return false;
+    if (*lowMode != requestedMode) return false;
+
+    for (const DualFilterRule& rule : rules) {
+        if (rule.hasName) {
+            if (std::find(lowPatterns->begin(), lowPatterns->end(), rule.name) == lowPatterns->end()) {
+                lowPatterns->push_back(rule.name);
+            }
+        } else if (*lowMode == 2 &&
+                   std::find(lowPatterns->begin(), lowPatterns->end(), "*") == lowPatterns->end()) {
+            /* A source-only whitelist rule may authorize any name at the high
+             * hook.  The low boundary cannot narrow it without false blocks. */
+            lowPatterns->push_back("*");
+        }
+    }
+    return true;
+}
+
+static uint64_t resolveJavaExport(HANDLE proc, const char* exportName) {
+    uint64_t base = 0, size = 0, addr = 0;
+    if (!findModuleBase(proc, L"java.dll", &base, &size) || base == 0) return 0;
+    return parsePEExport(proc, base, exportName, &addr) ? addr : 0;
+}
+
+enum class JavaEntryKind { Clean, Rel32Jump, RipIndirectJump, MovAbsJump };
+
+struct JavaEntryPlan {
+    uint64_t patchAddr = 0;
+    uint64_t continueAddr = 0;
+    size_t patchSize = 0;
+    size_t replaySize = 0;
+    JavaEntryKind kind = JavaEntryKind::Clean;
+    uint8_t original[16] = {};
+};
+
+static const char* javaEntryKindName(JavaEntryKind kind) {
+    switch (kind) {
+        case JavaEntryKind::Clean: return "clean";
+        case JavaEntryKind::Rel32Jump: return "prehook-e9";
+        case JavaEntryKind::RipIndirectJump: return "prehook-ff25";
+        case JavaEntryKind::MovAbsJump: return "prehook-movabs";
+    }
+    return "unknown";
+}
+
+static void logRemoteAddressOwner(HANDLE proc, const char* tag, uint64_t address) {
+    HMODULE modules[1024] = {};
+    DWORD needed = 0;
+    if (!EnumProcessModulesEx(proc, modules, sizeof(modules), &needed, LIST_MODULES_ALL)) {
+        FVM_LOG("%s: target 0x%llX owner lookup failed: %lu", tag,
+                (unsigned long long)address, (unsigned long)GetLastError());
+        return;
+    }
+    DWORD count = std::min<DWORD>(needed / sizeof(HMODULE), 1024);
+    for (DWORD i = 0; i < count; ++i) {
+        MODULEINFO info{};
+        if (!GetModuleInformation(proc, modules[i], &info, sizeof(info))) continue;
+        uint64_t base = reinterpret_cast<uint64_t>(info.lpBaseOfDll);
+        if (address < base || address >= base + info.SizeOfImage) continue;
+        wchar_t pathW[MAX_PATH] = {};
+        char pathU8[MAX_PATH * 3] = {};
+        GetModuleFileNameExW(proc, modules[i], pathW, MAX_PATH);
+        WideCharToMultiByte(CP_UTF8, 0, pathW, -1, pathU8, sizeof(pathU8), nullptr, nullptr);
+        FVM_LOG("%s: chain target owner=%s base=0x%llX offset=0x%llX", tag,
+                pathU8, (unsigned long long)base,
+                (unsigned long long)(address - base));
+        return;
+    }
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        FVM_LOG("%s: chain target owner=(private/unmapped module) allocationBase=0x%llX protect=0x%lX",
+                tag, (unsigned long long)reinterpret_cast<uint64_t>(mbi.AllocationBase),
+                (unsigned long)mbi.Protect);
+    } else {
+        FVM_LOG("%s: chain target owner=(unresolved)", tag);
+    }
+}
+
+/* Analyse the live export bytes before patching. Clean prologues are replayed.
+ * Recognised third-party jump stubs are chained: the FVM trampoline runs first
+ * and its allow path jumps directly to the pre-existing hook target. Unknown
+ * control transfers remain fail-closed at installation time. */
+static bool planJavaEntryHook(HANDLE proc, uint64_t exportAddr, const char* logTag,
+                              JavaEntryPlan* out, std::string* reason) {
+    out->patchAddr = exportAddr;
+    if (!readRemoteMem(proc, exportAddr, out->original, sizeof(out->original))) {
+        *reason = "read_original_failed";
+        return false;
+    }
+    FVM_LOG("%s: live export bytes @ 0x%llX: "
+            "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+            logTag, (unsigned long long)exportAddr,
+            out->original[0], out->original[1], out->original[2], out->original[3],
+            out->original[4], out->original[5], out->original[6], out->original[7],
+            out->original[8], out->original[9], out->original[10], out->original[11],
+            out->original[12], out->original[13], out->original[14], out->original[15]);
+
+    if (out->original[0] == 0xE9) {
+        int32_t rel = 0;
+        memcpy(&rel, out->original + 1, sizeof(rel));
+        out->continueAddr = exportAddr + 5 + static_cast<int64_t>(rel);
+        out->patchSize = 5;
+        out->kind = JavaEntryKind::Rel32Jump;
+    } else if (out->original[0] == 0xFF && out->original[1] == 0x25) {
+        int32_t disp = 0;
+        memcpy(&disp, out->original + 2, sizeof(disp));
+        uint64_t pointerAddr = exportAddr + 6 + static_cast<int64_t>(disp);
+        if (!readRemoteMem(proc, pointerAddr, &out->continueAddr, sizeof(out->continueAddr))
+                || out->continueAddr == 0) {
+            *reason = "prehook_ff25_target_unreadable";
+            return false;
+        }
+        out->patchSize = 5;
+        out->kind = JavaEntryKind::RipIndirectJump;
+    } else {
+        bool movRax = out->original[0] == 0x48 && out->original[1] == 0xB8
+                && out->original[10] == 0xFF && out->original[11] == 0xE0;
+        bool movR10 = out->original[0] == 0x49 && out->original[1] == 0xBA
+                && out->original[10] == 0x41 && out->original[11] == 0xFF
+                && out->original[12] == 0xE2;
+        bool movR11 = out->original[0] == 0x49 && out->original[1] == 0xBB
+                && out->original[10] == 0x41 && out->original[11] == 0xFF
+                && out->original[12] == 0xE3;
+        if (movRax || movR10 || movR11) {
+            memcpy(&out->continueAddr, out->original + 2, sizeof(out->continueAddr));
+            if (out->continueAddr == 0) {
+                *reason = "prehook_movabs_target_zero";
+                return false;
+            }
+            out->patchSize = 5;
+            out->kind = JavaEntryKind::MovAbsJump;
+        } else {
+            size_t n = alignedPrologueLen(out->original, sizeof(out->original), 5);
+            if (n == 0 || n > sizeof(out->original)) {
+                *reason = "unsupported_prologue";
+                return false;
+            }
+            out->patchSize = n;
+            out->replaySize = n;
+            out->continueAddr = exportAddr + n;
+            out->kind = JavaEntryKind::Clean;
+        }
+    }
+
+    FVM_LOG("%s: entry plan kind=%s patchSize=%zu replaySize=%zu continue=0x%llX",
+            logTag, javaEntryKindName(out->kind), out->patchSize, out->replaySize,
+            (unsigned long long)out->continueAddr);
+    if (out->kind != JavaEntryKind::Clean) {
+        logRemoteAddressOwner(proc, logTag, out->continueAddr);
+    }
+    return true;
+}
+
+/* JNI entry guard used for operations whose low-level Windows sink has lost
+ * the originating Java frame. targetArg is 8 (r8) or 9 (r9), both jobject/
+ * jstring arguments under the Windows x64 JNI ABI. */
+static std::vector<uint8_t> buildJavaSourceTrampoline(const uint8_t* savedPrologue,
+                                                       size_t prologueLen,
+                                                       uint64_t origPlusN,
+                                                       int targetArg,
+                                                       const std::string& encodedPolicy,
+                                                       const char* message) {
+    const size_t kPage = 0x3000;
+    const size_t SLOT_JMP = 0x1000;
+    const size_t SLOT_CURRENT_THREAD = 0x1010;
+    const size_t SLOT_CURRENT_THREAD_DESC = 0x1030;
+    const size_t SLOT_GET_CONTEXT_LOADER = 0x1050;
+    const size_t SLOT_GET_CONTEXT_LOADER_DESC = 0x1080;
+    const size_t SLOT_CLASS_LOADER = 0x10B0;
+    const size_t SLOT_GET_SYSTEM = 0x10D0;
+    const size_t SLOT_GET_SYSTEM_DESC = 0x1100;
+    const size_t SLOT_LOAD_CLASS = 0x1130;
+    const size_t SLOT_LOAD_CLASS_DESC = 0x1150;
+    const size_t SLOT_RESOLVER_NAME = 0x1180;
+    const size_t SLOT_ALLOW_NAME = 0x11C0;
+    const size_t SLOT_ALLOW_DESC = 0x11E0;
+    const size_t SLOT_THREAD_CLASS = 0x1210;
+    const size_t SLOT_POLICY = 0x1230;
+    const size_t SLOT_POLICY_END = 0x2800;
+    const size_t SLOT_EXCEPTION = 0x2810;
+    const size_t SLOT_MESSAGE = 0x2840;
+    const size_t SLOT_ALLOW_COUNT = 0x2900;
+    const size_t SLOT_BLOCK_COUNT = 0x2908;
+    const size_t SLOT_ERROR_COUNT = 0x2910;
+    const size_t SLOT_RESOLVER_CLASS = 0x2918;   // JNI GlobalRef, atomically published
+    const uint32_t SAVE_ENV = 0x450, SAVE_OBJ = 0x458, SAVE_R8 = 0x460, SAVE_R9 = 0x468;
+
+    if (encodedPolicy.empty() || encodedPolicy.size() + 1 > SLOT_POLICY_END - SLOT_POLICY) return {};
+    std::vector<uint8_t> image(kPage, 0xCC), code;
+    code.reserve(SLOT_JMP);
+    TrampAsm a(code);
+    auto movRcxSaved = [&](uint32_t off) {
+        a.emit({0x48,0x8B,0x8C,0x24,(uint8_t)off,(uint8_t)(off>>8),(uint8_t)(off>>16),(uint8_t)(off>>24)});
+    };
+    auto callJni = [&](uint32_t off) {
+        a.emit({0x48,0x8B,0x01});
+        a.emit({0xFF,0x90,(uint8_t)off,(uint8_t)(off>>8),(uint8_t)(off>>16),(uint8_t)(off>>24)});
+    };
+
+    a.emit({0x48,0x81,0xEC,0x78,0x04,0x00,0x00});
+    a.emit({0x48,0x89,0x8C,0x24,0x50,0x04,0x00,0x00});
+    a.emit({0x48,0x89,0x94,0x24,0x58,0x04,0x00,0x00});
+    a.emit({0x4C,0x89,0x84,0x24,0x60,0x04,0x00,0x00});
+    a.emit({0x4C,0x89,0x8C,0x24,0x68,0x04,0x00,0x00});
+    if (targetArg == 8) a.emit({0x4C,0x8B,0x84,0x24,0x60,0x04,0x00,0x00});
+    else                a.emit({0x4C,0x8B,0x84,0x24,0x68,0x04,0x00,0x00});
+    a.emit({0x4D,0x85,0xC0});
+    a.jcc(0x84, "internal_error");
+    a.emit({0x4C,0x89,0x84,0x24,0x80,0x00,0x00,0x00}); // target jstring
+    a.emit({0xC6,0x84,0x24,0xE0,0x00,0x00,0x00,0x00}); // system-loader attempt flag
+
+    // A JNI GlobalRef survives native returns and is valid on every Java thread.
+    a.emit({0x48,0x8B,0x05}); a.ripDisp(SLOT_RESOLVER_CLASS);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x85,"cached_resolver_class");
+
+    // Resolve ForgeVM through the initiating Java thread's context loader.
+    // ModLauncher classes are commonly invisible to the system loader.
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8D,0x15}); a.ripDisp(SLOT_THREAD_CLASS);
+    callJni(6 * 8);                              // FindClass java/lang/Thread
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x48,0x89,0x84,0x24,0x88,0x00,0x00,0x00});
+
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8B,0x94,0x24,0x88,0x00,0x00,0x00});
+    a.emit({0x4C,0x8D,0x05}); a.ripDisp(SLOT_CURRENT_THREAD);
+    a.emit({0x4C,0x8D,0x0D}); a.ripDisp(SLOT_CURRENT_THREAD_DESC);
+    callJni(113 * 8);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x49,0x89,0xC0});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8B,0x94,0x24,0x88,0x00,0x00,0x00});
+    a.emit({0x4D,0x31,0xC9});
+    callJni(116 * 8);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x48,0x89,0x84,0x24,0x90,0x00,0x00,0x00}); // current Thread
+
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8B,0x94,0x24,0x88,0x00,0x00,0x00});
+    a.emit({0x4C,0x8D,0x05}); a.ripDisp(SLOT_GET_CONTEXT_LOADER);
+    a.emit({0x4C,0x8D,0x0D}); a.ripDisp(SLOT_GET_CONTEXT_LOADER_DESC);
+    callJni(33 * 8);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x49,0x89,0xC0});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8B,0x94,0x24,0x90,0x00,0x00,0x00});
+    a.emit({0x4D,0x31,0xC9});
+    callJni(36 * 8);
+    a.emit({0x48,0x89,0x84,0x24,0x98,0x00,0x00,0x00}); // context loader
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x85,"have_source_loader");
+
+    // A bootstrap thread can have no context loader. A non-null TCCL can also
+    // be unable to see ForgeVM; both cases retry once with the system loader.
+    a.label("load_system_source_loader");
+    a.emit({0xC6,0x84,0x24,0xE0,0x00,0x00,0x00,0x01});
+    movRcxSaved(SAVE_ENV);
+    callJni(17 * 8);                             // ExceptionClear
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8D,0x15}); a.ripDisp(SLOT_CLASS_LOADER);
+    callJni(6 * 8);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x48,0x89,0x84,0x24,0xA0,0x00,0x00,0x00});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8B,0x94,0x24,0xA0,0x00,0x00,0x00});
+    a.emit({0x4C,0x8D,0x05}); a.ripDisp(SLOT_GET_SYSTEM);
+    a.emit({0x4C,0x8D,0x0D}); a.ripDisp(SLOT_GET_SYSTEM_DESC);
+    callJni(113 * 8);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x49,0x89,0xC0});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8B,0x94,0x24,0xA0,0x00,0x00,0x00});
+    a.emit({0x4D,0x31,0xC9});
+    callJni(116 * 8);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x48,0x89,0x84,0x24,0x98,0x00,0x00,0x00});
+
+    a.label("have_source_loader");
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8B,0x94,0x24,0x98,0x00,0x00,0x00});
+    callJni(31 * 8);                             // actual loader class
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x48,0x89,0x84,0x24,0xA0,0x00,0x00,0x00});
+
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8B,0x94,0x24,0xA0,0x00,0x00,0x00});
+    a.emit({0x4C,0x8D,0x05}); a.ripDisp(SLOT_LOAD_CLASS);
+    a.emit({0x4C,0x8D,0x0D}); a.ripDisp(SLOT_LOAD_CLASS_DESC);
+    callJni(33 * 8);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x48,0x89,0x84,0x24,0xA8,0x00,0x00,0x00});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8D,0x15}); a.ripDisp(SLOT_RESOLVER_NAME);
+    callJni(167 * 8);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x48,0x89,0x84,0x24,0xB0,0x00,0x00,0x00});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8B,0x94,0x24,0x98,0x00,0x00,0x00});
+    a.emit({0x4C,0x8B,0x84,0x24,0xA8,0x00,0x00,0x00});
+    a.emit({0x4C,0x8D,0x8C,0x24,0xB0,0x00,0x00,0x00});
+    callJni(36 * 8);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x85,"publish_resolver_class");
+    a.emit({0x80,0xBC,0x24,0xE0,0x00,0x00,0x00,0x00}); // cmp attemptedSystem,0
+    a.jcc(0x85,"internal_error");
+    a.jmp("load_system_source_loader");
+
+    a.label("publish_resolver_class");
+    // Convert the local jclass to a process-wide JNI GlobalRef.
+    a.emit({0x48,0x89,0xC2});
+    movRcxSaved(SAVE_ENV);
+    callJni(21 * 8);                              // NewGlobalRef
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x49,0x89,0xC3});                    // r11 = candidate global ref
+    a.emit({0x31,0xC0});                         // cmpxchg expected = null
+    a.emit({0xF0,0x4C,0x0F,0xB1,0x1D}); a.ripDisp(SLOT_RESOLVER_CLASS);
+    a.jcc(0x84,"resolver_cache_won");
+    // Another thread won. Use its ref and release our redundant candidate.
+    a.emit({0x48,0x89,0x84,0x24,0xB8,0x00,0x00,0x00});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x4C,0x89,0xDA});                    // rdx = candidate
+    callJni(22 * 8);                              // DeleteGlobalRef
+    a.jmp("resolver_class_ready");
+
+    a.label("resolver_cache_won");
+    a.emit({0x4C,0x89,0x9C,0x24,0xB8,0x00,0x00,0x00});
+    a.jmp("resolver_class_ready");
+
+    a.label("cached_resolver_class");
+    a.emit({0x48,0x89,0x84,0x24,0xB8,0x00,0x00,0x00});
+
+    a.label("resolver_class_ready");
+
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8B,0x94,0x24,0xB8,0x00,0x00,0x00});
+    a.emit({0x4C,0x8D,0x05}); a.ripDisp(SLOT_ALLOW_NAME);
+    a.emit({0x4C,0x8D,0x0D}); a.ripDisp(SLOT_ALLOW_DESC);
+    callJni(113 * 8);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x48,0x89,0x84,0x24,0xC0,0x00,0x00,0x00});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8D,0x15}); a.ripDisp(SLOT_POLICY);
+    callJni(167 * 8);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error");
+    a.emit({0x48,0x89,0x84,0x24,0xC8,0x00,0x00,0x00});
+    a.emit({0x48,0x8B,0x84,0x24,0x80,0x00,0x00,0x00}); a.emit({0x48,0x89,0x84,0x24,0xD0,0x00,0x00,0x00});
+    a.emit({0x48,0x8B,0x84,0x24,0xC8,0x00,0x00,0x00}); a.emit({0x48,0x89,0x84,0x24,0xD8,0x00,0x00,0x00});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8B,0x94,0x24,0xB8,0x00,0x00,0x00});
+    a.emit({0x4C,0x8B,0x84,0x24,0xC0,0x00,0x00,0x00});
+    a.emit({0x4C,0x8D,0x8C,0x24,0xD0,0x00,0x00,0x00});
+    callJni(119 * 8);
+    a.emit({0x84,0xC0}); a.jcc(0x84,"block");
+
+    a.label("allow");
+    emitAuditIncrement(a, SLOT_ALLOW_COUNT);
+    a.jmp("call_original");
+
+    a.label("internal_error");
+    emitAuditIncrement(a, SLOT_ERROR_COUNT);
+    movRcxSaved(SAVE_ENV);
+    callJni(17 * 8);                             // ExceptionClear
+    /* During early JVM bootstrap ForgeVM's resolver class may not yet be
+     * visible.  The resident low hook still enforces every name-bearing rule;
+     * do not turn a transient attribution failure into a global DLL/process
+     * outage. */
+    a.jmp("call_original");
+
+    a.label("call_original");
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8B,0x94,0x24,0x58,0x04,0x00,0x00});
+    a.emit({0x4C,0x8B,0x84,0x24,0x60,0x04,0x00,0x00});
+    a.emit({0x4C,0x8B,0x8C,0x24,0x68,0x04,0x00,0x00});
+    a.emit({0x48,0x81,0xC4,0x78,0x04,0x00,0x00});
+    for (size_t i=0;i<prologueLen;++i) code.push_back(savedPrologue[i]);
+    a.emit({0xFF,0x25}); a.ripDisp(SLOT_JMP);
+
+    a.label("block");
+    emitAuditIncrement(a, SLOT_BLOCK_COUNT);
+    movRcxSaved(SAVE_ENV);
+    callJni(15 * 8);                             // ExceptionOccurred
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x85,"blocked_return");
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48,0x8D,0x15}); a.ripDisp(SLOT_EXCEPTION);
+    callJni(6 * 8);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"blocked_return");
+    a.emit({0x48,0x89,0xC2});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x4C,0x8D,0x05}); a.ripDisp(SLOT_MESSAGE);
+    callJni(14 * 8);
+    a.label("blocked_return");
+    a.emit({0x48,0x81,0xC4,0x78,0x04,0x00,0x00});
+    a.emit({0x31,0xC0}); a.emit({0xC3});
+
+    if (!a.resolve() || code.size() > SLOT_JMP) return {};
+    memcpy(image.data(), code.data(), code.size());
+    writeU64(image,SLOT_JMP,origPlusN);
+    auto copy = [&](size_t slot,const char* value){memcpy(image.data()+slot,value,strlen(value)+1);};
+    copy(SLOT_CURRENT_THREAD,"currentThread");
+    copy(SLOT_CURRENT_THREAD_DESC,"()Ljava/lang/Thread;");
+    copy(SLOT_GET_CONTEXT_LOADER,"getContextClassLoader");
+    copy(SLOT_GET_CONTEXT_LOADER_DESC,"()Ljava/lang/ClassLoader;");
+    copy(SLOT_CLASS_LOADER,"java/lang/ClassLoader");
+    copy(SLOT_GET_SYSTEM,"getSystemClassLoader");
+    copy(SLOT_GET_SYSTEM_DESC,"()Ljava/lang/ClassLoader;");
+    copy(SLOT_LOAD_CLASS,"loadClass");
+    copy(SLOT_LOAD_CLASS_DESC,"(Ljava/lang/String;)Ljava/lang/Class;");
+    copy(SLOT_RESOLVER_NAME,"forgevm.jvm.internal.SourceResolver");
+    copy(SLOT_ALLOW_NAME,targetArg == 8 ? "allowProcess" : "allow");
+    copy(SLOT_ALLOW_DESC,"(Ljava/lang/String;Ljava/lang/String;)Z");
+    copy(SLOT_THREAD_CLASS,"java/lang/Thread");
+    memcpy(image.data()+SLOT_POLICY,encodedPolicy.c_str(),encodedPolicy.size()+1);
+    copy(SLOT_EXCEPTION,"java/lang/SecurityException");
+    copy(SLOT_MESSAGE,message);
+    writeU64(image,SLOT_ALLOW_COUNT,0);
+    writeU64(image,SLOT_BLOCK_COUNT,0);
+    writeU64(image,SLOT_ERROR_COUNT,0);
+    writeU64(image,SLOT_RESOLVER_CLASS,0);
+    return image;
+}
+
+static int installJavaSourceFilter(PatchState& state, const char* exportName, int targetArg,
+                                   const std::string& policy, const char* logTag) {
+    auto fail = [&](const std::string& reason) -> int {
+        FVM_LOG("%s: install failed export=%s reason=%s", logTag, exportName, reason.c_str());
+        setError(reason);
+        return 0;
+    };
+    if (!g_target.structMapReady || g_target.handle == NULL) return fail("not_bootstrapped");
+    HANDLE proc = g_target.handle;
+    if (state.patched) {
+        std::lock_guard<std::mutex> integrityGuard(g_patchIntegrityMutex);
+        if (policy.size()+1 > 0x2800-0x1230) {
+            return fail("policy_refresh_failed");
+        }
+        std::vector<uint8_t> policyRegion(0x2800 - 0x1230, 0xCC);
+        memcpy(policyRegion.data(), policy.c_str(), policy.size() + 1);
+        if (!writeRemoteMem(proc, state.trampolineAddr + 0x1230,
+                            policyRegion.data(), policyRegion.size())) {
+            return fail("policy_refresh_failed");
+        }
+        if (state.integrityPrefix.size() >= 0x2800) {
+            memcpy(state.integrityPrefix.data() + 0x1230,
+                   policyRegion.data(), policyRegion.size());
+        }
+        setError("ok"); return 1;
+    }
+    uint64_t addr = resolveJavaExport(proc, exportName);
+    if (addr == 0) return fail(std::string("export_not_found:") + exportName);
+    JavaEntryPlan plan;
+    std::string planReason;
+    if (!planJavaEntryHook(proc, addr, logTag, &plan, &planReason)) return fail(planReason);
+
+    uint64_t hint=findFreeRegionNear(proc,plan.patchAddr,0x3000);
+    if(!hint)return fail("no_near_region");
+    void* mem=VirtualAllocEx(proc,(LPVOID)hint,0x3000,MEM_RESERVE|MEM_COMMIT,PAGE_EXECUTE_READWRITE);
+    if(!mem)return fail("trampoline_alloc_failed");
+    uint64_t tramp=(uint64_t)mem;int64_t d64=(int64_t)tramp-(int64_t)(plan.patchAddr+5);
+    if(d64<INT32_MIN||d64>INT32_MAX){VirtualFreeEx(proc,mem,0,MEM_RELEASE);return fail("trampoline_out_of_range");}
+    auto image=buildJavaSourceTrampoline(plan.original,plan.replaySize,plan.continueAddr,targetArg,policy,
+                                          "ForgeVM blocked request source");
+    if(image.empty()||!writeRemoteMem(proc,tramp,image.data(),image.size())){VirtualFreeEx(proc,mem,0,MEM_RELEASE);return fail("trampoline_write_failed");}
+    uint8_t patch[16]={0xE9};int32_t d=(int32_t)d64;memcpy(patch+1,&d,4);for(size_t i=5;i<plan.patchSize;++i)patch[i]=0x90;
+    if(!writeRemoteCode(proc,plan.patchAddr,patch,plan.patchSize)){VirtualFreeEx(proc,mem,0,MEM_RELEASE);return fail("patch_failed");}
+    uint8_t verify[16]={};if(!readRemoteMem(proc,plan.patchAddr,verify,plan.patchSize)||memcmp(verify,patch,plan.patchSize)!=0){writeRemoteCode(proc,plan.patchAddr,plan.original,plan.patchSize);VirtualFreeEx(proc,mem,0,MEM_RELEASE);return fail("verify_failed");}
+    state.targetAddr=plan.patchAddr;state.patchSize=plan.patchSize;memcpy(state.original,plan.original,plan.patchSize);
+    state.trampolineAddr=tramp;state.trampolineSize=0x3000;state.trampolineInstalled=true;
+    state.integrityPrefix.assign(image.begin(), image.begin() + 0x2900);
+    state.patched=true;
+    FVM_LOG("%s: installed Java source hook %s @ 0x%llX kind=%s",logTag,exportName,
+            (unsigned long long)tramp,javaEntryKindName(plan.kind));
+    setError("ok");return 1;
+}
+
+extern "C" __declspec(dllexport) int forgevm_ban_process_create(int mode, const char* patternsLF,
+                                                                 const char* encodedPolicy) {
+    if (!dualPolicyValid(encodedPolicy)) {
+        setError("malformed_dual_policy");
+        return 0;
+    }
+    const bool sourceAware = dualPolicyHasSource(encodedPolicy);
+    int lowMode = mode;
+    std::vector<std::string> lowPatterns;
+    if (!deriveFailClosedLowPolicy(mode, patternsLF, encodedPolicy,
+                                   &lowMode, &lowPatterns)) {
+        setError("low_policy_projection_failed");
+        return 0;
+    }
+    const bool sourceGuardAlreadyInstalled = g_processJavaSourcePatch.patched;
+    if (sourceAware) {
+        if (!installJavaSourceFilter(g_processJavaSourcePatch,
+                "Java_java_lang_ProcessImpl_create", 8,
+                encodedPolicy, "process_source")) return 0;
+    } else if (g_processJavaSourcePatch.patched) {
+        if (!uninstallFilterTrampoline(g_processJavaSourcePatch, "unban_process_java_source")) return 0;
+    }
     const bool createProcessExGuardAlreadyInstalled = g_createProcessExPatch.patched;
     if (!installNtCreateProcessExBlock()) return 0;
-    const int r = installNtCreateUserProcessFilter(g_processCreatePatch, mode, splitPatternsLF(patternsLF));
+    const int r = installNtCreateUserProcessFilter(g_processCreatePatch, lowMode, lowPatterns);
     if (!r && !createProcessExGuardAlreadyInstalled) {
         uninstallFilterTrampoline(g_createProcessExPatch, "rollback_process_create_ex");
+    }
+    if (!r && sourceAware && !sourceGuardAlreadyInstalled) {
+        uninstallFilterTrampoline(g_processJavaSourcePatch, "rollback_process_java_source");
     }
     return r;
 }
 
 extern "C" __declspec(dllexport) int forgevm_unban_process_create() {
-    uninstallFilterTrampoline(g_processCreatePatch, "unban_process_create");
-    uninstallFilterTrampoline(g_createProcessExPatch, "unban_process_create_ex");
+    int ok = uninstallFilterTrampoline(g_processCreatePatch, "unban_process_create");
+    ok &= uninstallFilterTrampoline(g_createProcessExPatch, "unban_process_create_ex");
+    if (g_processJavaSourcePatch.patched) {
+        ok &= uninstallFilterTrampoline(g_processJavaSourcePatch, "unban_process_java_source");
+    }
+    return ok;
+}
+
+/* ============================================================
+ * Java platform-thread creation filter
+ *
+ * JVM_StartThread is reached by Thread.start0 before HotSpot allocates the OS
+ * thread. Its first two arguments are JNIEnv* and the Thread jobject. The
+ * trampoline calls the stable JNI function table to obtain Thread.getName(),
+ * performs the same resident pattern match as the process guard, and silently
+ * returns on rejection. No IPC or agent round-trip is involved in the
+ * allow/block decision itself.
+ * ============================================================ */
+static std::vector<uint8_t> buildThreadStartTrampoline(const uint8_t* savedPrologue,
+                                                       size_t prologueLen,
+                                                       uint64_t origPlusN,
+                                                       int mode,
+                                                       const std::vector<std::string>& patterns,
+                                                       const std::string& encodedPolicy) {
+    const size_t kPage = 0x4000;
+    const size_t SLOT_JMP = 0x1000;
+    const size_t SLOT_MODE = 0x1008;
+    const size_t SLOT_BLOB = 0x1010;
+    const size_t SLOT_BLOB_END = 0x1800;
+    const size_t SLOT_CURRENT_THREAD = 0x1810;
+    const size_t SLOT_CURRENT_THREAD_DESC = 0x1830;
+    const size_t SLOT_GET_CONTEXT_LOADER = 0x1850;
+    const size_t SLOT_GET_CONTEXT_LOADER_DESC = 0x1880;
+    const size_t SLOT_CLASS_LOADER = 0x18B0;
+    const size_t SLOT_GET_SYSTEM = 0x18D0;
+    const size_t SLOT_GET_SYSTEM_DESC = 0x1900;
+    const size_t SLOT_LOAD_CLASS = 0x1930;
+    const size_t SLOT_LOAD_CLASS_DESC = 0x1950;
+    const size_t SLOT_RESOLVER_NAME = 0x1980;
+    const size_t SLOT_ALLOW_NAME = 0x19C0;
+    const size_t SLOT_ALLOW_DESC = 0x19E0;
+    const size_t SLOT_THREAD_CLASS = 0x1A10;
+    const size_t SLOT_POLICY = 0x1A30;
+    const size_t SLOT_POLICY_END = 0x3000;
+    const size_t SLOT_GET_NAME = 0x3070;
+    const size_t SLOT_GET_NAME_DESC = 0x3080;
+    const size_t SLOT_ALLOW_COUNT = 0x3100;
+    const size_t SLOT_BLOCK_COUNT = 0x3108;
+    const size_t SLOT_ERROR_COUNT = 0x3110;
+    const size_t SLOT_RESOLVER_CLASS = 0x3118;   // JNI GlobalRef, atomically published
+    const uint32_t SAVE_ENV = 0x850;
+
+    std::vector<uint8_t> buf(kPage, 0xCC);
+    std::vector<uint8_t> code;
+    code.reserve(SLOT_JMP);
+    TrampAsm a(code);
+
+    auto movRcxSaved = [&](uint32_t off) {
+        a.emit({0x48, 0x8B, 0x8C, 0x24,
+                (uint8_t)off, (uint8_t)(off >> 8), (uint8_t)(off >> 16), (uint8_t)(off >> 24)});
+    };
+    auto callJni = [&](uint32_t tableOffset) {
+        a.emit({0x48, 0x8B, 0x01});             // mov rax, [rcx] ; JNINativeInterface*
+        a.emit({0xFF, 0x90,
+                (uint8_t)tableOffset, (uint8_t)(tableOffset >> 8),
+                (uint8_t)(tableOffset >> 16), (uint8_t)(tableOffset >> 24)});
+    };
+    auto releaseUtf = [&]() {
+        movRcxSaved(SAVE_ENV);
+        a.emit({0x48, 0x8B, 0x94, 0x24, 0x80, 0x00, 0x00, 0x00}); // jstring
+        a.emit({0x4C, 0x8B, 0x44, 0x24, 0x48}); // mov r8,  [rsp+0x48] ; UTF chars
+        callJni(170 * 8);                        // ReleaseStringUTFChars
+    };
+
+    a.emit({0x48, 0x81, 0xEC, 0x78, 0x08, 0x00, 0x00});
+    a.emit({0x48, 0x89, 0x8C, 0x24, 0x50, 0x08, 0x00, 0x00});
+    a.emit({0x48, 0x89, 0x94, 0x24, 0x58, 0x08, 0x00, 0x00});
+    a.emit({0x4C, 0x89, 0x84, 0x24, 0x60, 0x08, 0x00, 0x00});
+    a.emit({0x4C, 0x89, 0x8C, 0x24, 0x68, 0x08, 0x00, 0x00});
+
+    // clazz = env->GetObjectClass(thread)
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x58, 0x08, 0x00, 0x00});
+    callJni(31 * 8);
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_no_chars");
+    a.emit({0x48, 0x89, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00});
+
+    // method = env->GetMethodID(clazz, "getName", "()Ljava/lang/String;")
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x80, 0x00, 0x00, 0x00});
+    a.emit({0x4C, 0x8D, 0x05}); a.ripDisp(SLOT_GET_NAME);
+    a.emit({0x4C, 0x8D, 0x0D}); a.ripDisp(SLOT_GET_NAME_DESC);
+    callJni(33 * 8);
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_no_chars");
+
+    // name = env->CallObjectMethodA(thread, method, NULL)
+    a.emit({0x49, 0x89, 0xC0});                 // mov r8, rax
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x58, 0x08, 0x00, 0x00});
+    a.emit({0x4D, 0x31, 0xC9});                 // xor r9, r9
+    callJni(36 * 8);
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_no_chars");
+    a.emit({0x48, 0x89, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00});
+
+    // N = env->GetStringUTFLength(name)
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x80, 0x00, 0x00, 0x00});
+    callJni(168 * 8);
+    a.emit({0x48, 0x63, 0xC0});                 // movsxd rax, eax
+    a.emit({0x48, 0x89, 0x44, 0x24, 0x50});
+    a.emit({0x48, 0x3D, 0x84, 0x03, 0x00, 0x00}); // cmp rax, 900
+    a.jcc(0x87, "internal_error_no_chars");     // ja: preserve JVM liveness
+
+    // chars = env->GetStringUTFChars(name, NULL)
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x80, 0x00, 0x00, 0x00});
+    a.emit({0x4D, 0x31, 0xC0});                 // xor r8, r8
+    callJni(169 * 8);
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_no_chars");
+    a.emit({0x48, 0x89, 0x44, 0x24, 0x48});
+
+    // A v2 policy is evaluated in Java so its source selector sees the real
+    // Thread.start() caller class and ProtectionDomain CodeSource. Legacy
+    // name-only policies keep using the allocation-free resident matcher.
+    a.emit({0x0F, 0xB6, 0x05}); a.ripDisp(SLOT_POLICY);
+    a.emit({0x84, 0xC0});
+    a.jcc(0x85, "source_policy");
+    emitSubstringMatcher(a, false, SLOT_MODE, SLOT_BLOB);
+
+    a.label("source_policy");
+    a.emit({0xC6,0x84,0x24,0xE0,0x00,0x00,0x00,0x00}); // system-loader attempt flag
+    a.emit({0x48,0x8B,0x05}); a.ripDisp(SLOT_RESOLVER_CLASS);
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x85,"thread_cached_resolver");
+
+    // Thread.currentThread(); use the initiating thread's context loader so
+    // Forge/ModLauncher-owned ForgeVM classes remain visible.
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8D, 0x15}); a.ripDisp(SLOT_THREAD_CLASS);
+    callJni(6 * 8);                              // FindClass java/lang/Thread
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_with_chars");
+    a.emit({0x48, 0x89, 0x84, 0x24, 0x88, 0x00, 0x00, 0x00});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x88, 0x00, 0x00, 0x00});
+    a.emit({0x4C, 0x8D, 0x05}); a.ripDisp(SLOT_CURRENT_THREAD);
+    a.emit({0x4C, 0x8D, 0x0D}); a.ripDisp(SLOT_CURRENT_THREAD_DESC);
+    callJni(113 * 8);                            // GetStaticMethodID
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_with_chars");
+    a.emit({0x49, 0x89, 0xC0});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x88, 0x00, 0x00, 0x00});
+    a.emit({0x4D, 0x31, 0xC9});
+    callJni(116 * 8);                            // CallStaticObjectMethodA
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_with_chars");
+    a.emit({0x48, 0x89, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00});
+
+    // currentThread.getContextClassLoader()
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x88, 0x00, 0x00, 0x00});
+    a.emit({0x4C, 0x8D, 0x05}); a.ripDisp(SLOT_GET_CONTEXT_LOADER);
+    a.emit({0x4C, 0x8D, 0x0D}); a.ripDisp(SLOT_GET_CONTEXT_LOADER_DESC);
+    callJni(33 * 8);                             // GetMethodID
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_with_chars");
+    a.emit({0x49, 0x89, 0xC0});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x90, 0x00, 0x00, 0x00});
+    a.emit({0x4D, 0x31, 0xC9});
+    callJni(36 * 8);                             // CallObjectMethodA
+    a.emit({0x48, 0x89, 0x84, 0x24, 0x98, 0x00, 0x00, 0x00});
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x85, "have_loader");
+
+    // Null or unsuitable context loader: retry once through the system loader.
+    a.label("thread_load_system_loader");
+    a.emit({0xC6,0x84,0x24,0xE0,0x00,0x00,0x00,0x01});
+    movRcxSaved(SAVE_ENV);
+    callJni(17 * 8);                             // clear possible SecurityException
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8D, 0x15}); a.ripDisp(SLOT_CLASS_LOADER);
+    callJni(6 * 8);                              // FindClass
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_with_chars");
+    a.emit({0x48, 0x89, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0xA0, 0x00, 0x00, 0x00});
+    a.emit({0x4C, 0x8D, 0x05}); a.ripDisp(SLOT_GET_SYSTEM);
+    a.emit({0x4C, 0x8D, 0x0D}); a.ripDisp(SLOT_GET_SYSTEM_DESC);
+    callJni(113 * 8);                            // GetStaticMethodID
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_with_chars");
+    a.emit({0x49, 0x89, 0xC0});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0xA0, 0x00, 0x00, 0x00});
+    a.emit({0x4D, 0x31, 0xC9});
+    callJni(116 * 8);                            // CallStaticObjectMethodA
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_with_chars");
+    a.emit({0x48, 0x89, 0x84, 0x24, 0x98, 0x00, 0x00, 0x00});
+
+    a.label("have_loader");
+    // Resolve loadClass on the actual loader class.
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x98, 0x00, 0x00, 0x00});
+    callJni(31 * 8);                             // GetObjectClass
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_with_chars");
+    a.emit({0x48, 0x89, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00});
+
+    // loader.loadClass("forgevm.jvm.internal.SourceResolver")
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0xA0, 0x00, 0x00, 0x00});
+    a.emit({0x4C, 0x8D, 0x05}); a.ripDisp(SLOT_LOAD_CLASS);
+    a.emit({0x4C, 0x8D, 0x0D}); a.ripDisp(SLOT_LOAD_CLASS_DESC);
+    callJni(33 * 8);                             // GetMethodID
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_with_chars");
+    a.emit({0x48, 0x89, 0x84, 0x24, 0xA8, 0x00, 0x00, 0x00});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8D, 0x15}); a.ripDisp(SLOT_RESOLVER_NAME);
+    callJni(167 * 8);                            // NewStringUTF
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_with_chars");
+    a.emit({0x48, 0x89, 0x84, 0x24, 0xB0, 0x00, 0x00, 0x00}); // jvalue[0].l
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x98, 0x00, 0x00, 0x00});
+    a.emit({0x4C, 0x8B, 0x84, 0x24, 0xA8, 0x00, 0x00, 0x00});
+    a.emit({0x4C, 0x8D, 0x8C, 0x24, 0xB0, 0x00, 0x00, 0x00});
+    callJni(36 * 8);                             // CallObjectMethodA
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x85, "thread_publish_resolver");
+    a.emit({0x80,0xBC,0x24,0xE0,0x00,0x00,0x00,0x00});
+    a.jcc(0x85, "internal_error_with_chars");
+    a.jmp("thread_load_system_loader");
+
+    a.label("thread_publish_resolver");
+    a.emit({0x48,0x89,0xC2});
+    movRcxSaved(SAVE_ENV);
+    callJni(21 * 8);                              // NewGlobalRef
+    a.emit({0x48,0x85,0xC0}); a.jcc(0x84,"internal_error_with_chars");
+    a.emit({0x49,0x89,0xC3});
+    a.emit({0x31,0xC0});
+    a.emit({0xF0,0x4C,0x0F,0xB1,0x1D}); a.ripDisp(SLOT_RESOLVER_CLASS);
+    a.jcc(0x84,"thread_resolver_cache_won");
+    a.emit({0x48,0x89,0x84,0x24,0xB8,0x00,0x00,0x00});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x4C,0x89,0xDA});
+    callJni(22 * 8);                              // DeleteGlobalRef
+    a.jmp("thread_resolver_ready");
+
+    a.label("thread_resolver_cache_won");
+    a.emit({0x4C,0x89,0x9C,0x24,0xB8,0x00,0x00,0x00});
+    a.jmp("thread_resolver_ready");
+
+    a.label("thread_cached_resolver");
+    a.emit({0x48,0x89,0x84,0x24,0xB8,0x00,0x00,0x00});
+
+    a.label("thread_resolver_ready");
+
+    // SourceResolver.allowThread(threadName, encodedPolicy)
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0xB8, 0x00, 0x00, 0x00});
+    a.emit({0x4C, 0x8D, 0x05}); a.ripDisp(SLOT_ALLOW_NAME);
+    a.emit({0x4C, 0x8D, 0x0D}); a.ripDisp(SLOT_ALLOW_DESC);
+    callJni(113 * 8);                            // GetStaticMethodID
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_with_chars");
+    a.emit({0x48, 0x89, 0x84, 0x24, 0xC0, 0x00, 0x00, 0x00});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8D, 0x15}); a.ripDisp(SLOT_POLICY);
+    callJni(167 * 8);                            // NewStringUTF(policy)
+    a.emit({0x48, 0x85, 0xC0});
+    a.jcc(0x84, "internal_error_with_chars");
+    a.emit({0x48, 0x89, 0x84, 0x24, 0xC8, 0x00, 0x00, 0x00});
+    a.emit({0x48, 0x8B, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00});
+    a.emit({0x48, 0x89, 0x84, 0x24, 0xD0, 0x00, 0x00, 0x00});
+    a.emit({0x48, 0x8B, 0x84, 0x24, 0xC8, 0x00, 0x00, 0x00});
+    a.emit({0x48, 0x89, 0x84, 0x24, 0xD8, 0x00, 0x00, 0x00});
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0xB8, 0x00, 0x00, 0x00});
+    a.emit({0x4C, 0x8B, 0x84, 0x24, 0xC0, 0x00, 0x00, 0x00});
+    a.emit({0x4C, 0x8D, 0x8C, 0x24, 0xD0, 0x00, 0x00, 0x00});
+    callJni(119 * 8);                            // CallStaticBooleanMethodA
+    a.emit({0x84, 0xC0});
+    a.jcc(0x85, "allow");
+    a.jmp("block");
+
+    a.label("allow");
+    emitAuditIncrement(a, SLOT_ALLOW_COUNT);
+    releaseUtf();
+    a.jmp("call_original");
+
+    a.label("internal_error_with_chars");
+    releaseUtf();
+    a.jmp("internal_error_clear");
+
+    a.label("internal_error_no_chars");
+    a.label("internal_error_clear");
+    // Resolver classes may be unavailable during early JVM bootstrap. Keep the
+    // thread hook non-fatal until the application class loader can resolve it.
+    emitAuditIncrement(a, SLOT_ERROR_COUNT);
+    movRcxSaved(SAVE_ENV);
+    callJni(17 * 8);                             // ExceptionClear
+    a.jmp("call_original");
+
+    a.label("call_original");
+    movRcxSaved(SAVE_ENV);
+    a.emit({0x48, 0x8B, 0x94, 0x24, 0x58, 0x08, 0x00, 0x00});
+    a.emit({0x4C, 0x8B, 0x84, 0x24, 0x60, 0x08, 0x00, 0x00});
+    a.emit({0x4C, 0x8B, 0x8C, 0x24, 0x68, 0x08, 0x00, 0x00});
+    a.emit({0x48, 0x81, 0xC4, 0x78, 0x08, 0x00, 0x00});
+    for (size_t i = 0; i < prologueLen; ++i) code.push_back(savedPrologue[i]);
+    a.emit({0xFF, 0x25}); a.ripDisp(SLOT_JMP);
+
+    a.label("block");
+    emitAuditIncrement(a, SLOT_BLOCK_COUNT);
+    releaseUtf();
+    a.jmp("silent_return");
+
+    a.label("silent_return");
+    // JNI lookup failures can leave a pending exception. The thread filter is
+    // deliberately non-throwing, so no hook-internal exception may escape into
+    // Thread.start() and terminate application/game control flow.
+    movRcxSaved(SAVE_ENV);
+    callJni(17 * 8);                             // ExceptionClear (safe with none pending)
+    a.emit({0x48, 0x81, 0xC4, 0x78, 0x08, 0x00, 0x00});
+    a.emit({0xC3});
+
+    if (!a.resolve() || code.size() > SLOT_JMP) {
+        FVM_LOG("thread_create: trampoline build/label failure (size=%zu)", code.size());
+        return {};
+    }
+    memcpy(buf.data(), code.data(), code.size());
+    writeU64(buf, SLOT_JMP, origPlusN);
+    buf[SLOT_MODE] = static_cast<uint8_t>(mode);
+    if (encodedPolicy.empty()) {
+        if (!serializeFilterBlob(buf, mode, patterns, SLOT_BLOB, SLOT_BLOB_END)) return {};
+    } else {
+        buf[SLOT_BLOB] = 0; // v2 is evaluated exclusively by SourceResolver
+    }
+    auto copyString = [&](size_t slot, const char* value) {
+        memcpy(buf.data() + slot, value, strlen(value) + 1);
+    };
+    copyString(SLOT_CURRENT_THREAD, "currentThread");
+    copyString(SLOT_CURRENT_THREAD_DESC, "()Ljava/lang/Thread;");
+    copyString(SLOT_GET_CONTEXT_LOADER, "getContextClassLoader");
+    copyString(SLOT_GET_CONTEXT_LOADER_DESC, "()Ljava/lang/ClassLoader;");
+    copyString(SLOT_CLASS_LOADER, "java/lang/ClassLoader");
+    copyString(SLOT_GET_SYSTEM, "getSystemClassLoader");
+    copyString(SLOT_GET_SYSTEM_DESC, "()Ljava/lang/ClassLoader;");
+    copyString(SLOT_LOAD_CLASS, "loadClass");
+    copyString(SLOT_LOAD_CLASS_DESC, "(Ljava/lang/String;)Ljava/lang/Class;");
+    copyString(SLOT_RESOLVER_NAME, "forgevm.jvm.internal.SourceResolver");
+    copyString(SLOT_ALLOW_NAME, "allowThread");
+    copyString(SLOT_ALLOW_DESC, "(Ljava/lang/String;Ljava/lang/String;)Z");
+    copyString(SLOT_THREAD_CLASS, "java/lang/Thread");
+    if (encodedPolicy.size() + 1 > SLOT_POLICY_END - SLOT_POLICY) return {};
+    memcpy(buf.data() + SLOT_POLICY, encodedPolicy.c_str(), encodedPolicy.size() + 1);
+    copyString(SLOT_GET_NAME, "getName");
+    copyString(SLOT_GET_NAME_DESC, "()Ljava/lang/String;");
+    writeU64(buf, SLOT_ALLOW_COUNT, 0);
+    writeU64(buf, SLOT_BLOCK_COUNT, 0);
+    writeU64(buf, SLOT_ERROR_COUNT, 0);
+    writeU64(buf, SLOT_RESOLVER_CLASS, 0);
+    return buf;
+}
+
+static int installThreadStartFilter(PatchState& state, int mode,
+                                    const std::vector<std::string>& patterns,
+                                    const std::string& encodedPolicy) {
+    if (!g_target.structMapReady) { setError("not_bootstrapped"); return 0; }
+    HANDLE proc = g_target.handle;
+    if (state.patched) {
+        std::vector<uint8_t> data(0x4000, 0xCC);
+        data[0x1008] = static_cast<uint8_t>(mode);
+        bool residentReady = true;
+        if (encodedPolicy.empty()) {
+            residentReady = serializeFilterBlob(data, mode, patterns, 0x1010, 0x1800);
+        } else {
+            data[0x1010] = 0;
+        }
+        if (encodedPolicy.size() + 1 > 0x3000 - 0x1A30 || !residentReady ||
+            !writeRemoteMem(proc, state.trampolineAddr + 0x1008,
+                            data.data() + 0x1008, 0x1800 - 0x1008) ||
+            !writeRemoteMem(proc, state.trampolineAddr + 0x1A30,
+                            encodedPolicy.c_str(), encodedPolicy.size() + 1)) {
+            setError("blob_update_failed");
+            return 0;
+        }
+        setError("ok");
+        return 1;
+    }
+
+    uint64_t addr = resolveJvmExport(proc, "JVM_StartThread");
+    if (addr == 0) { setError("export_not_found:JVM_StartThread"); return 0; }
+    uint8_t saved[16] = {};
+    if (!readRemoteMem(proc, addr, saved, sizeof(saved))) { setError("read_original_failed"); return 0; }
+    for (int hop = 0; hop < 2 && saved[0] == 0xE9; ++hop) {
+        int32_t rel = 0;
+        memcpy(&rel, saved + 1, sizeof(rel));
+        addr = addr + 5 + static_cast<int64_t>(rel);
+        if (!readRemoteMem(proc, addr, saved, sizeof(saved))) { setError("read_real_prologue_failed"); return 0; }
+    }
+    uint8_t b0 = saved[0];
+    if (b0 == 0xE8 || b0 == 0xE9 || b0 == 0xEB ||
+        (b0 >= 0x70 && b0 <= 0x7F) || b0 == 0xFF) {
+        setError("unsafe_prologue");
+        return 0;
+    }
+    size_t prologueLen = alignedPrologueLen(saved, sizeof(saved), 5);
+    if (prologueLen == 0) prologueLen = 5;
+    uint64_t hint = findFreeRegionNear(proc, addr, 0x4000);
+    if (hint == 0) { setError("no_nearby_free_region"); return 0; }
+    void* mem = VirtualAllocEx(proc, reinterpret_cast<LPVOID>(hint), 0x4000,
+                               MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!mem) { setError("virtual_alloc_failed"); return 0; }
+    uint64_t tramp = reinterpret_cast<uint64_t>(mem);
+    int64_t delta64 = static_cast<int64_t>(tramp) - static_cast<int64_t>(addr + 5);
+    if (delta64 < INT32_MIN || delta64 > INT32_MAX) {
+        VirtualFreeEx(proc, mem, 0, MEM_RELEASE); setError("tramp_out_of_rel32_range"); return 0;
+    }
+    std::vector<uint8_t> image = buildThreadStartTrampoline(
+        saved, prologueLen, addr + prologueLen, mode, patterns, encodedPolicy);
+    if (image.empty() || !writeRemoteMem(proc, tramp, image.data(), image.size())) {
+        VirtualFreeEx(proc, mem, 0, MEM_RELEASE); setError("trampoline_write_failed"); return 0;
+    }
+    FlushInstructionCache(proc, mem, image.size());
+    uint8_t patch[16] = {0xE9};
+    int32_t delta = static_cast<int32_t>(delta64);
+    memcpy(patch + 1, &delta, sizeof(delta));
+    for (size_t i = 5; i < prologueLen; ++i) patch[i] = 0x90;
+    if (!writeRemoteCode(proc, addr, patch, prologueLen)) {
+        VirtualFreeEx(proc, mem, 0, MEM_RELEASE); setError("write_patch_failed"); return 0;
+    }
+    uint8_t verify[16] = {};
+    if (!readRemoteMem(proc, addr, verify, prologueLen) ||
+        memcmp(verify, patch, prologueLen) != 0) {
+        writeRemoteCode(proc, addr, saved, prologueLen);
+        VirtualFreeEx(proc, mem, 0, MEM_RELEASE);
+        setError("verify_failed");
+        return 0;
+    }
+    state.targetAddr = addr;
+    state.patchSize = prologueLen;
+    memcpy(state.original, saved, prologueLen);
+    state.patched = true;
+    state.trampolineAddr = tramp;
+    state.trampolineSize = 0x4000;
+    state.trampolineInstalled = true;
+    FVM_LOG("thread_create: installed JVM_StartThread trampoline @ 0x%llX",
+            (unsigned long long)tramp);
+    setError("ok");
     return 1;
+}
+
+extern "C" __declspec(dllexport) int forgevm_ban_thread_create(int mode, const char* patternsLF,
+                                                                const char* encodedPolicy) {
+    if (!dualPolicyValid(encodedPolicy)) {
+        setError("malformed_dual_policy");
+        return 0;
+    }
+    return installThreadStartFilter(g_threadCreatePatch, mode, splitPatternsLF(patternsLF),
+                                    encodedPolicy == NULL ? std::string() : std::string(encodedPolicy));
+}
+
+extern "C" __declspec(dllexport) int forgevm_unban_thread_create() {
+    return uninstallFilterTrampoline(g_threadCreatePatch, "unban_thread_create");
 }
 
 /* ============================================================
@@ -3106,7 +4273,11 @@ extern "C" __declspec(dllexport) int forgevm_install_self_terminate_guard() {
 /* Return one in-process filter decision counter:
  *   0 native-load allow, 1 native-load block,
  *   2 process-create allow, 3 process-create block,
- *   4 JVM_Halt blocked, 5 NtTerminateProcess(self) blocked.
+ *   4 JVM_Halt blocked, 5 NtTerminateProcess(self) blocked,
+ *   6 thread-create allow, 7 thread-create block,
+ *   8 thread-filter internal errors (bootstrap-compatible fail-open),
+ *   9..11 native Java-source allow/block/internal-error,
+ *   12..14 process Java-source allow/block/internal-error.
  * Zero also covers an uninstalled filter; callers treat the counters as a
  * best-effort diagnostic, never as an enforcement decision. */
 extern "C" __declspec(dllexport) unsigned long long forgevm_filter_audit(int kind) {
@@ -3119,6 +4290,15 @@ extern "C" __declspec(dllexport) unsigned long long forgevm_filter_audit(int kin
         case 3: state = &g_processCreatePatch; slot = 0x808; break;
         case 4: state = &g_jvmHaltPatch;        slot = 0x320; break;
         case 5: state = &g_terminatePatch;      slot = 0x320; break;
+        case 6: state = &g_threadCreatePatch;   slot = 0x3100; break;
+        case 7: state = &g_threadCreatePatch;   slot = 0x3108; break;
+        case 8: state = &g_threadCreatePatch;   slot = 0x3110; break;
+        case 9:  state = &g_nativeJavaSourcePatch;  slot = 0x2900; break;
+        case 10: state = &g_nativeJavaSourcePatch;  slot = 0x2908; break;
+        case 11: state = &g_nativeJavaSourcePatch;  slot = 0x2910; break;
+        case 12: state = &g_processJavaSourcePatch; slot = 0x2900; break;
+        case 13: state = &g_processJavaSourcePatch; slot = 0x2908; break;
+        case 14: state = &g_processJavaSourcePatch; slot = 0x2910; break;
         default: return 0;
     }
     if (state == NULL || !state->patched || state->trampolineAddr == 0 ||
@@ -3138,19 +4318,26 @@ extern "C" __declspec(dllexport) unsigned long long forgevm_filter_audit(int kin
  * window) can restore the original bytes at the hook site, neutralising
  * the guard. This function reads the current bytes at every active hook
  * site, compares the complete expected patch, and re-applies the
- * original patch via writeRemoteCode.
+ * original patch via writeRemoteCode.  Security-sensitive trampolines also
+ * retain an immutable prefix snapshot in the agent process.  If that body is
+ * modified, continuing would execute attacker-selected policy code, so the
+ * target is terminated fail-closed instead of attempting a racy live rewrite.
  *
  * The agent calls this from the health poller thread on every tick,
  * giving a maximum detection-to-repair window of ~1.5 s.
  * ============================================================ */
 extern "C" __declspec(dllexport) int forgevm_verify_hook_integrity() {
     if (g_target.handle == NULL) { setError("no_target_handle"); return -1; }
+    std::lock_guard<std::mutex> integrityGuard(g_patchIntegrityMutex);
 
     PatchState* patches[] = {
         &g_terminatePatch,
         &g_jvmHaltPatch,
         &g_nativeLoadPatch,
         &g_processCreatePatch,
+        &g_threadCreatePatch,
+        &g_processJavaSourcePatch,
+        &g_nativeJavaSourcePatch,
         &g_javaAgentPatch,
         &g_jvmtiPatch,
         &g_sectionImagePatch,
@@ -3162,6 +4349,25 @@ extern "C" __declspec(dllexport) int forgevm_verify_hook_integrity() {
         PatchState* st = patches[i];
         if (!st->patched || st->targetAddr == 0 || st->trampolineAddr == 0 || st->patchSize == 0)
             continue;
+
+        if (!st->integrityPrefix.empty()) {
+            std::vector<uint8_t> currentPrefix(st->integrityPrefix.size());
+            if (!readRemoteMem(g_target.handle, st->trampolineAddr,
+                               currentPrefix.data(), currentPrefix.size())) {
+                FVM_LOG("hook_integrity: trampoline unreadable at 0x%llX; terminating target fail-closed",
+                        (unsigned long long)st->trampolineAddr);
+                setError("trampoline_integrity_unreadable");
+                TerminateProcess(g_target.handle, ERROR_ACCESS_DENIED);
+                return -2;
+            }
+            if (currentPrefix != st->integrityPrefix) {
+                FVM_LOG("hook_integrity: FATAL trampoline tamper at 0x%llX; terminating target fail-closed",
+                        (unsigned long long)st->trampolineAddr);
+                setError("trampoline_integrity_violation");
+                TerminateProcess(g_target.handle, ERROR_ACCESS_DENIED);
+                return -2;
+            }
+        }
 
         int64_t delta64 = static_cast<int64_t>(st->trampolineAddr) -
                           static_cast<int64_t>(st->targetAddr + 5);
@@ -3178,9 +4384,11 @@ extern "C" __declspec(dllexport) int forgevm_verify_hook_integrity() {
 
         uint8_t current[16] = {};
         if (!readRemoteMem(g_target.handle, st->targetAddr, current, st->patchSize)) {
-            FVM_LOG("hook_integrity: read failed at 0x%llX, skipping",
+            FVM_LOG("hook_integrity: hook entry unreadable at 0x%llX; terminating target fail-closed",
                     (unsigned long long)st->targetAddr);
-            continue;
+            setError("hook_integrity_unreadable");
+            TerminateProcess(g_target.handle, ERROR_ACCESS_DENIED);
+            return -2;
         }
         if (memcmp(current, patch, st->patchSize) == 0) continue;
 
@@ -3189,8 +4397,11 @@ extern "C" __declspec(dllexport) int forgevm_verify_hook_integrity() {
             FVM_LOG("hook_integrity: RE-APPLIED hook at 0x%llX (was tampered, patchSize=%zu)",
                     (unsigned long long)st->targetAddr, st->patchSize);
         } else {
-            FVM_LOG("hook_integrity: FAILED to re-apply hook at 0x%llX",
+            FVM_LOG("hook_integrity: FAILED to re-apply hook at 0x%llX; terminating target fail-closed",
                     (unsigned long long)st->targetAddr);
+            setError("hook_integrity_repair_failed");
+            TerminateProcess(g_target.handle, ERROR_ACCESS_DENIED);
+            return -2;
         }
     }
 

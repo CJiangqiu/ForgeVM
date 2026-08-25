@@ -6,16 +6,19 @@ import java.util.List;
  * Filter for native modules requesting a JVMTI environment from the target VM.
  * Matching uses a case-insensitive full-path glob against the native module
  * containing the {@code JavaVM::GetEnv} call site.
+ * Explicit source selectors use {@code module:<full-path>}; the name dimension
+ * is the intercepted interface name {@code jvmti}. Legacy string patterns keep
+ * their original source-module meaning.
  */
 public final class JvmtiFilter {
     public enum Mode { BLACKLIST, WHITELIST }
 
     private final Mode mode;
-    private final List<String> patterns;
+    private final List<InterceptionRule> rules;
 
-    private JvmtiFilter(Mode mode, List<String> patterns) {
+    private JvmtiFilter(Mode mode, List<InterceptionRule> rules) {
         this.mode = mode;
-        this.patterns = patterns;
+        this.rules = rules;
     }
 
     /** Block callers whose module path matches any pattern. */
@@ -28,18 +31,19 @@ public final class JvmtiFilter {
         return build(Mode.WHITELIST, patterns);
     }
 
+    public static JvmtiFilter Blacklist(InterceptionRule first, InterceptionRule... rest) {
+        return new JvmtiFilter(Mode.BLACKLIST, FilterRuleSupport.explicit(first, rest));
+    }
+
+    public static JvmtiFilter Whitelist(InterceptionRule first, InterceptionRule... rest) {
+        return new JvmtiFilter(Mode.WHITELIST, FilterRuleSupport.explicit(first, rest));
+    }
+
     public Mode mode() { return mode; }
-    public List<String> patterns() { return patterns; }
+    public List<InterceptionRule> rules() { return rules; }
+    public List<String> patterns() { return FilterRuleSupport.legacyPatterns(rules); }
 
     private static JvmtiFilter build(Mode mode, String[] patterns) {
-        if (patterns == null || patterns.length == 0) {
-            throw new IllegalArgumentException("patterns must not be empty");
-        }
-        for (String p : patterns) {
-            if (p == null || p.isBlank()) {
-                throw new IllegalArgumentException("pattern must not be null or blank");
-            }
-        }
-        return new JvmtiFilter(mode, List.of(patterns));
+        return new JvmtiFilter(mode, FilterRuleSupport.sources(patterns));
     }
 }

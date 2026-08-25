@@ -50,6 +50,7 @@ public final class RelaunchSpec {
     private final NativeFilter nativeFilter;
     private final JvmtiFilter jvmtiFilter;
     private final ProcessFilter processFilter;
+    private final ThreadFilter threadFilter;
     private final boolean sanitizeEnvironment;
     private final boolean rejectArgumentFiles;
     private final HandoffPoint handoffPoint;
@@ -63,6 +64,7 @@ public final class RelaunchSpec {
         nativeFilter = builder.nativeFilter;
         jvmtiFilter = builder.jvmtiFilter;
         processFilter = builder.processFilter;
+        threadFilter = builder.threadFilter;
         sanitizeEnvironment = builder.sanitizeEnvironment;
         rejectArgumentFiles = builder.rejectArgumentFiles;
         handoffPoint = builder.handoffPoint;
@@ -88,6 +90,7 @@ public final class RelaunchSpec {
     public NativeFilter nativeFilter() { return nativeFilter; }
     public JvmtiFilter jvmtiFilter() { return jvmtiFilter; }
     public ProcessFilter processFilter() { return processFilter; }
+    public ThreadFilter threadFilter() { return threadFilter; }
     public boolean sanitizeEnvironment() { return sanitizeEnvironment; }
     public boolean rejectArgumentFiles() { return rejectArgumentFiles; }
     public HandoffPoint handoffPoint() { return handoffPoint; }
@@ -101,6 +104,7 @@ public final class RelaunchSpec {
         private NativeFilter nativeFilter;
         private JvmtiFilter jvmtiFilter;
         private ProcessFilter processFilter;
+        private ThreadFilter threadFilter;
         private boolean sanitizeEnvironment = true;
         private boolean rejectArgumentFiles = true;
         private HandoffPoint handoffPoint = HandoffPoint.POLICY_APPLIED;
@@ -128,6 +132,7 @@ public final class RelaunchSpec {
         public Builder nativeFilter(NativeFilter value) { nativeFilter = value; return this; }
         public Builder jvmtiFilter(JvmtiFilter value) { jvmtiFilter = value; return this; }
         public Builder processFilter(ProcessFilter value) { processFilter = value; return this; }
+        public Builder threadFilter(ThreadFilter value) { threadFilter = value; return this; }
         public Builder sanitizeEnvironment(boolean value) { sanitizeEnvironment = value; return this; }
         public Builder rejectArgumentFiles(boolean value) { rejectArgumentFiles = value; return this; }
 

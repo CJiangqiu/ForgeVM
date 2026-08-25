@@ -22,17 +22,22 @@ import java.util.List;
  * // multiple patterns:
  * ForgeVM.banNativeLoad(NativeFilter.Blacklist("*hack*", "*inject*"));
  * }</pre>
+ *
+ * <p>Explicit source selectors match the first non-bootstrap Java caller as
+ * {@code class:...}, {@code module:...}, or {@code code:...}. A rule containing
+ * both selectors requires both the library name/path and caller source to
+ * match.</p>
  */
 public final class NativeFilter {
 
     public enum Mode { BLACKLIST, WHITELIST }
 
     private final Mode mode;
-    private final List<String> patterns;
+    private final List<InterceptionRule> rules;
 
-    private NativeFilter(Mode mode, List<String> patterns) {
+    private NativeFilter(Mode mode, List<InterceptionRule> rules) {
         this.mode = mode;
-        this.patterns = patterns;
+        this.rules = rules;
     }
 
     /** Block libraries matching any of the given patterns. Allow everything else. */
@@ -45,18 +50,19 @@ public final class NativeFilter {
         return build(Mode.WHITELIST, patterns);
     }
 
+    public static NativeFilter Blacklist(InterceptionRule first, InterceptionRule... rest) {
+        return new NativeFilter(Mode.BLACKLIST, FilterRuleSupport.explicit(first, rest));
+    }
+
+    public static NativeFilter Whitelist(InterceptionRule first, InterceptionRule... rest) {
+        return new NativeFilter(Mode.WHITELIST, FilterRuleSupport.explicit(first, rest));
+    }
+
     public Mode mode() { return mode; }
-    public List<String> patterns() { return patterns; }
+    public List<InterceptionRule> rules() { return rules; }
+    public List<String> patterns() { return FilterRuleSupport.legacyPatterns(rules); }
 
     private static NativeFilter build(Mode mode, String[] patterns) {
-        if (patterns == null || patterns.length == 0) {
-            throw new IllegalArgumentException("patterns must not be empty");
-        }
-        for (String p : patterns) {
-            if (p == null || p.isBlank()) {
-                throw new IllegalArgumentException("pattern must not be null or blank");
-            }
-        }
-        return new NativeFilter(mode, List.of(patterns));
+        return new NativeFilter(mode, FilterRuleSupport.names(patterns));
     }
 }

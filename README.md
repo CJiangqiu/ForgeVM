@@ -131,6 +131,35 @@ ForgeVM.launch(ForgeVMOptions.builder()
 
 路径规则不区分 ASCII 大小写。前导 `*` 表示允许任意前缀，尾随 `*` 表示允许任意后缀；未使用相应通配符时，路径起始或结尾会被锚定。例如 `*\\java.exe` 只匹配以 `\\java.exe` 结尾的路径，不匹配 `java.exe.payload`。内部 `*` 和 `?` 不能由驻留 native 匹配器表达；遇到此类规则时，`ban...` 调用失败，不会静默改写策略。
 
+`NativeFilter`、`JvmtiFilter`、`ProcessFilter` 和 `ThreadFilter` 共享
+`InterceptionRule`：`Name(...)` 匹配目标名，`Source(...)` 匹配来源，
+`NameAndSource(...)` 要求同一条规则的两个维度同时匹配；多条规则之间为 OR。
+黑名单命中任一规则即拒绝，白名单必须命中至少一条规则才允许。例如：
+
+```java
+import forgevm.jvm.InterceptionRule;
+
+ForgeVM.banThreadCreate(ThreadFilter.Blacklist(
+    InterceptionRule.NameAndSource("pool-*-thread-*", "code:*untrusted-plugin.jar")
+));
+```
+
+线程、native load 与子进程的来源是跳过明确的 FVM/JDK 桥接帧后首个 Java 调用者（包括 bootstrap 加载的非桥接类），可匹配
+`class:包.类`、`module:模块名` 或 `code:<CodeSource URL>`。当动态定义的直接调用类没有可信
+`CodeSource` 时会报告 `provenance:code-unavailable`，并沿同步调用栈查找最近的可信物理发起者，追加
+`initiator-class:`、`initiator-module:` 与 `initiator-code:`。这些 token 与直接来源保持区分，
+不会把外层发起者的路径伪装成动态类自身的 `code:`；也不会用可被恶意 ClassLoader 伪造的
+`getResource()` URL 冒充来源 JAR。策略可以组合 `class:`、`code:` 和 `initiator-code:`
+覆盖包名伪装与空 ProtectionDomain 两种情况。JVMTI 来源为
+`module:<native 模块完整路径>`。`AgentFilter` 只公开名字/agent 路径过滤：Windows
+的 `JVM_EnqueueOperation` 不携带可认证的 attach 发起者或来源 JAR 身份，因此这里
+没有 `InterceptionRule` 重载，也不宣称支持来源过滤。
+需要 Java caller 来源的 native/process/thread hook 会缓存首次成功解析的 resolver JNI
+GlobalRef；初始化时依次尝试当前线程 context classloader 和 system classloader。JNI 或
+类加载器或 JNI 解析故障会以 `source A/B/E` 或 `internal_error` 记入 agent 审计。
+JVM 早期启动阶段 resolver 尚不可见时会临时放行高层来源判断，但 native/process 的
+Name 规则仍由底层 hook 强制执行。
+
 ### Java agent
 
 ```java
@@ -141,28 +170,43 @@ ForgeVM.banJavaAgent(AgentFilter.Blacklist("*tool_musics_egg*"));
 
 无参 `banJavaAgent()` 会先请求处理已加载 agent，再阻止后续 attach；带过滤器的版本只处理匹配项。已有处理依赖 HotSpot 元数据和已知 `Instrumentation` 字段，清理部分引用与方法体。这是实现相关的隔离尝试，不能保证停止 agent 创建的线程、native 代码、保留引用或已经完成的类修改。`unbanJavaAgent()` 仅移除未来 attach 的拦截。
 
-### native DLL、JVMTI 与子进程
+### native DLL、JVMTI、子进程与线程
 
 ```java
 import forgevm.jvm.JvmtiFilter;
 import forgevm.jvm.NativeFilter;
 import forgevm.jvm.ProcessFilter;
+import forgevm.jvm.ThreadFilter;
 
 ForgeVM.banNativeLoad(NativeFilter.Blacklist("*cheat*", "*inject*"));
 ForgeVM.banJvmti(JvmtiFilter.Whitelist("*trusted-profiler*"));
 ForgeVM.banProcessCreate(ProcessFilter.Blacklist("*java.exe", "*javaw.exe"));
+ForgeVM.banThreadCreate(ThreadFilter.Whitelist("main", "server-*", "fvm-*"));
 ```
 
-对应的解除 API 为 `unbanNativeLoad()`、`unbanJvmti()` 和 `unbanProcessCreate()`。
+对应的解除 API 为 `unbanNativeLoad()`、`unbanJvmti()`、`unbanProcessCreate()` 和 `unbanThreadCreate()`。
+所有 boolean 拦截 API 的最近一次结构化结果可通过
+`ForgeVM.lastInterceptionResult()` 读取；失败原因也会写入 `fvm-java.log` 与 agent 日志。
 
 | API | native 拦截点 | 对后续请求的作用 |
 | --- | --- | --- |
 | `banNativeLoad` | `ntdll!LdrLoadDll`，以及 `NtCreateSection` 映像节 guard | 拒绝匹配的加载器 DLL 加载与映像节创建请求。 |
 | `banJvmti` | `JavaVM::GetEnv` | 拒绝请求接口为 JVMTI 的调用；调用方按返回地址所在 native 模块判定。 |
 | `banProcessCreate` | `ntdll!NtCreateUserProcess`，以及 `NtCreateProcessEx` guard | 拒绝匹配的子进程创建请求。 |
+| `banThreadCreate` | HotSpot `JVM_StartThread` | 在线程实际创建前按 `Thread.getName()` 静默丢弃平台线程启动；`Thread.start()` 不抛出拦截异常，且不创建 native 线程。无参版本拒绝所有后续启动。 |
+
+启用 name/source v2 线程策略时，每个被拒绝的线程都会在 `ForgeVM/logs/fvm-java.log` 中记录 `THREAD BLOCK`，包含线程名、解析到的 caller class/module/code source、策略模式和命中规则。
+来源解析首次成功后缓存 resolver；首次解析若 context classloader 不可用或不可见则回退到 system classloader。JNI/类加载器内部错误会在 agent 审计中累加 `internal_error`，并在 resolver 可用前保持启动兼容。
 | `banJavaAgent` | HotSpot `JVM_EnqueueOperation` | 拒绝符合当前策略的后续 Java agent 入队操作。 |
 
 JNA 发起的 JVMTI 获取仍会经过 `JavaVM::GetEnv`。规则应匹配实际发起 native 调用的模块（通常为 JNA 的 native dispatch 库），而不是 Java 调用者所在的 jar。
+
+native/process 的来源规则同时保留底层名称投影，以覆盖绕过 Java 桥接层的
+JNA/FFI/直接 Win32 调用：`Name+Source` 在底层投影为 `Name`，所有 Name-only 规则也
+始终保留。纯 Source 规则无法在不携带 Java 身份的 NT 边界可靠表达，只在高层来源 hook
+执行，不能将它投影成全拦截，否则会阻断 LWJGL 等正常启动依赖。
+
+线程规则匹配 Java 平台线程名称，不是 jar 文件名。白名单适合在不受信任 jar 执行前固定允许的服务线程前缀；黑名单适合拦截已知恶意命名。线程名称可由调用方选择，因此面对完全不受信任代码时应优先使用白名单或无参的全拦截。过滤器不终止已有线程；强制异步终止已有 JVM 线程可能破坏锁和 HotSpot 内部状态，因此该 API 只在安全的创建边界拒绝新线程。虚拟线程复用载体线程，不会为每个虚拟线程经过 `JVM_StartThread`，不属于此 OS 线程耗尽防护的范围。
 
 ### 范围与边界
 
@@ -176,6 +220,7 @@ ForgeVM 是同权限 Windows 用户态机制，不声称隔离已经在目标进
 import forgevm.jvm.JvmtiFilter;
 import forgevm.jvm.ProcessFilter;
 import forgevm.jvm.RelaunchSpec;
+import forgevm.jvm.ThreadFilter;
 
 import java.time.Duration;
 
@@ -184,6 +229,7 @@ try {
         .existingAgents(RelaunchSpec.ExistingAgentPolicy.DROP_ALL)
         .jvmtiFilter(JvmtiFilter.Blacklist("*jnidispatch*"))
         .processFilter(ProcessFilter.Blacklist("*javaw.exe"))
+        .threadFilter(ThreadFilter.Whitelist("main", "server-*", "fvm-*"))
         .handoff(RelaunchSpec.HandoffPoint.PROCESS_STARTED, Duration.ofSeconds(30))
         .build();
     ForgeVM.relaunch(spec); // 成功时不返回
@@ -196,7 +242,7 @@ try {
 | --- | --- |
 | `existingAgents(...)` | `DROP_ALL` 移除继承的 `-javaagent`、`-agentpath` 与 `-agentlib`；`FILTER` 使用提供的 `AgentFilter` / `NativeFilter` 筛选；`PRESERVE` 保留继承选项。 |
 | `trustedNativeAgent(...)` / `trustedJavaAgent(...)` | 在创建替代 JVM 前校验指定文件的 SHA-256，并在继承 agent 选项处理后插入该 agent。 |
-| 四种 `...Filter(...)` | 为替代 JVM 提供 Java agent、native load、JVMTI 获取和子进程创建策略；它们不撤销当前 JVM 中已经发生的对应操作。 |
+| 五种 `...Filter(...)` | 为替代 JVM 提供 Java agent、native load、JVMTI 获取、子进程创建和平台线程创建策略；它们不撤销当前 JVM 中已经发生的对应操作。 |
 | `sanitizeEnvironment(...)` | 控制是否使用净化后的继承环境；默认开启。 |
 | `rejectArgumentFiles(...)` | 控制是否拒绝命令行中的 `@argument-file`；默认开启。 |
 | `handoff(...)` | `PROCESS_STARTED` 在替代进程启动后提交；`POLICY_APPLIED` 仅在受信任 Java agent 报告策略已应用后提交，且要求配置 `trustedJavaAgent`。 |
@@ -435,16 +481,53 @@ paths ending in `\\java.exe`; it does not match `java.exe.payload`. Internal
 rule that cannot be represented causes the `ban...` call to fail rather than
 silently applying a different rule.
 
+`NativeFilter`, `JvmtiFilter`, `ProcessFilter`, and `ThreadFilter` use the same
+`InterceptionRule` model: `Name(...)` selects the target, `Source(...)` selects
+its origin, and `NameAndSource(...)` requires both dimensions of that rule to
+match. Rules are ORed; a blacklist rejects any match, whereas a whitelist
+permits only a match.
+
+```java
+import forgevm.jvm.InterceptionRule;
+
+ForgeVM.banThreadCreate(ThreadFilter.Blacklist(
+    InterceptionRule.NameAndSource("pool-*-thread-*", "code:*untrusted-plugin.jar")
+));
+```
+
+Thread, native-load, and child-process sources identify the first Java caller
+after known FVM/JDK bridge frames, including non-bridge bootstrap-loaded classes,
+as `class:...`, `module:...`, or `code:<CodeSource URL>`. If that direct caller
+has no trustworthy CodeSource, ForgeVM reports `provenance:code-unavailable` and
+walks outward through the synchronous call chain to append the nearest trusted
+physical initiator as `initiator-class:`, `initiator-module:`, and
+`initiator-code:`. These tokens remain distinct from direct origin, and ForgeVM
+never promotes a spoofable `ClassLoader.getResource()` URL to source-JAR
+identity. Policies can combine `class:`, `code:`, and `initiator-code:` to cover
+package spoofing and null ProtectionDomains. JVMTI uses
+`module:<full native-module path>`. `AgentFilter` exposes only name/agent-path
+patterns. Windows `JVM_EnqueueOperation` does not carry an authenticated attach
+creator or source-JAR identity, so no `InterceptionRule` overload or source
+filtering claim is published for agents.
+Native/process/thread hooks cache the first successfully resolved bridge as a JNI
+GlobalRef. Initialization tries the current thread's context loader and then the
+system loader. JNI or class-loader failures appear as `source A/B/E` or
+`internal_error` in the agent audit. During early bootstrap, before the resolver
+is visible, high-level source evaluation temporarily allows the request while
+resident low-level name rules remain enforced.
+
 ```java
 import forgevm.jvm.AgentFilter;
 import forgevm.jvm.JvmtiFilter;
 import forgevm.jvm.NativeFilter;
 import forgevm.jvm.ProcessFilter;
+import forgevm.jvm.ThreadFilter;
 
 ForgeVM.banJavaAgent(AgentFilter.Blacklist("*tool_musics_egg*"));
 ForgeVM.banNativeLoad(NativeFilter.Blacklist("*cheat*", "*inject*"));
 ForgeVM.banJvmti(JvmtiFilter.Whitelist("*trusted-profiler*"));
 ForgeVM.banProcessCreate(ProcessFilter.Blacklist("*java.exe", "*javaw.exe"));
+ForgeVM.banThreadCreate(ThreadFilter.Whitelist("main", "server-*", "fvm-*"));
 ```
 
 | API | Native interception point | Effect on later requests |
@@ -453,11 +536,23 @@ ForgeVM.banProcessCreate(ProcessFilter.Blacklist("*java.exe", "*javaw.exe"));
 | `banNativeLoad` | `ntdll!LdrLoadDll`, with an `NtCreateSection` image-section guard | Rejects matching later loader-based native-library loads and image-section creation requests. |
 | `banJvmti` | `JavaVM::GetEnv` | Rejects later requests whose requested interface is JVMTI. The decision is made from the native module containing the call return address. |
 | `banProcessCreate` | `ntdll!NtCreateUserProcess`, with an `NtCreateProcessEx` guard | Rejects matching later child-process creation requests. |
+| `banThreadCreate` | HotSpot `JVM_StartThread` | Silently discards matching platform-thread starts before native creation. `Thread.start()` receives no interception exception and no native thread is created. The no-argument form blocks all later starts. |
 
-`unbanJavaAgent()`, `unbanNativeLoad()`, `unbanJvmti()`, and
-`unbanProcessCreate()` remove the corresponding future-request hooks when the
+With a name/source v2 thread policy, every rejected start writes a `THREAD BLOCK` record to `ForgeVM/logs/fvm-java.log`, including the thread name, resolved caller class/module/code source, policy mode, and matched rule.
+Source resolution first uses the initiating thread's context class loader and falls back to the system class loader when it is null. JNI/class-loader infrastructure failures increment the agent audit's `internal_error` counter and preserve bootstrap compatibility until the resolver becomes visible.
+
+Native/process source policies retain a low-level name projection for JNA/FFI or
+direct Win32 calls that bypass the Java bridge. `Name+Source` projects to `Name`,
+and every Name-only rule remains resident. A Source-only rule cannot be safely
+represented at an NT boundary that carries no Java identity, so it remains on
+the high-level source hook rather than becoming a deny-all rule that breaks LWJGL.
+
+`unbanJavaAgent()`, `unbanNativeLoad()`, `unbanJvmti()`,
+`unbanProcessCreate()`, and `unbanThreadCreate()` remove the corresponding future-request hooks when the
 native operation succeeds. They do not undo a previous Java-agent attach,
 loaded module, acquired `jvmtiEnv*`, or created child process.
+The most recent structured boolean-filter result, including its native reason,
+is available through `ForgeVM.lastInterceptionResult()` and failures are logged.
 
 `banJavaAgent()` also invokes the existing-agent purge routine before installing
 the future-attach hook. That routine identifies a limited set of loaded agents
@@ -466,6 +561,13 @@ references and method bodies. It is an implementation-specific containment
 attempt, not a general Java-agent unload facility: it cannot guarantee removal
 of agent-created threads, native code, retained references, or class changes
 already applied by an agent.
+
+Thread rules match Java platform-thread names, not JAR paths. Prefer a whitelist
+or the no-argument block-all form for fully untrusted code because a caller can
+choose its thread name. Existing threads are deliberately not terminated:
+asynchronous JVM-thread termination can corrupt locks and HotSpot state. Virtual
+threads multiplex carrier threads and do not pass through `JVM_StartThread` once
+per virtual thread, so they are outside this OS-thread exhaustion guard.
 
 For JNA-based JVMTI acquisition, the `JavaVM::GetEnv` call is still intercepted.
 The policy must match the native module that performs the call (normally JNA's
@@ -493,6 +595,7 @@ handoff failure throws `RelaunchException` while the current JVM remains alive.
 import forgevm.jvm.JvmtiFilter;
 import forgevm.jvm.ProcessFilter;
 import forgevm.jvm.RelaunchSpec;
+import forgevm.jvm.ThreadFilter;
 
 import java.time.Duration;
 
@@ -501,6 +604,7 @@ try {
         .existingAgents(RelaunchSpec.ExistingAgentPolicy.DROP_ALL)
         .jvmtiFilter(JvmtiFilter.Blacklist("*jnidispatch*"))
         .processFilter(ProcessFilter.Blacklist("*javaw.exe"))
+        .threadFilter(ThreadFilter.Whitelist("main", "server-*", "fvm-*"))
         .handoff(RelaunchSpec.HandoffPoint.PROCESS_STARTED, Duration.ofSeconds(30))
         .build();
     ForgeVM.relaunch(spec); // does not return on success
@@ -513,7 +617,7 @@ try {
 | --- | --- |
 | `existingAgents(...)` | `DROP_ALL` removes inherited `-javaagent`, `-agentpath`, and `-agentlib` options; `FILTER` evaluates inherited options using the supplied `AgentFilter` / `NativeFilter`; `PRESERVE` retains them. |
 | `trustedNativeAgent(...)` / `trustedJavaAgent(...)` | Verifies the specified file's SHA-256 before creating the replacement JVM, then inserts that agent after inherited agent-option processing. |
-| The four `...Filter(...)` methods | Supply Java-agent, native-load, JVMTI-acquisition, and child-process policies for the replacement JVM. They do not undo corresponding operations already completed in the current JVM. |
+| The five `...Filter(...)` methods | Supply Java-agent, native-load, JVMTI-acquisition, child-process, and platform-thread policies for the replacement JVM. They do not undo corresponding operations already completed in the current JVM. |
 | `sanitizeEnvironment(...)` | Selects a sanitized inherited environment; enabled by default. |
 | `rejectArgumentFiles(...)` | Rejects `@argument-file` command-line entries when enabled; enabled by default. |
 | `handoff(...)` | `PROCESS_STARTED` commits after replacement-process start. `POLICY_APPLIED` commits only after a trusted Java agent reports policy application and requires `trustedJavaAgent`. |

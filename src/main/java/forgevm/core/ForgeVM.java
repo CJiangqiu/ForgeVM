@@ -5,6 +5,9 @@ import forgevm.jvm.JvmControl;
 import forgevm.jvm.NativeFilter;
 import forgevm.jvm.JvmtiFilter;
 import forgevm.jvm.ProcessFilter;
+import forgevm.jvm.ThreadFilter;
+import forgevm.jvm.InterceptionPolicyCodec;
+import forgevm.jvm.InterceptionRule;
 import forgevm.jvm.RelaunchException;
 import forgevm.jvm.RelaunchSpec;
 import forgevm.memory.MemoryUtil;
@@ -37,11 +40,14 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class ForgeVM {
     private static final String ENV_AGENT_EXE_PATH = "FORGEVM_AGENT_EXE_PATH";
     private static final String PROP_AGENT_EXE_PATH = "forgevm.agent.exe.path";
-    /** Set by the persistent agent on the new JVM's command line after relaunch.
-     *  Value is the agent's own PID - used to construct the handoff named pipe
-     *  path. When this property is present, launch() reuses the existing agent
-     *  instead of spawning a new one. */
+    /** JVM-global publication of the active agent PID. The agent places it on a
+     *  relaunched JVM's command line; the first ForgeVM classloader also sets it
+     *  after a successful gen-0 bootstrap. Other classloaders use the value to
+     *  open their own channel to the same agent instead of spawning another. */
     private static final String PROP_AGENT_HANDOFF_PID = "forgevm.agent.pid";
+    /** String literals are interned JVM-wide, so this monitor also serializes
+     * launch attempts made by distinct ForgeVM class definitions/loaders. */
+    private static final String AGENT_LAUNCH_LOCK = "forgevm.agent.launch.lock";
     /** Set by the agent on each relaunched JVM's command line: a monotonically
      *  increasing counter, incremented once per relaunch. Absence (or "0") means
      *  the current JVM has never been relaunched. Exposed via
@@ -62,6 +68,8 @@ public final class ForgeVM {
     private static volatile AgentSession agentSession;
     private static volatile JvmControl.ExitCommandSender agentExitSender;
     private static volatile JvmControl.AgentLockController agentLockController;
+    private static volatile InterceptionResult lastInterceptionResult =
+            new InterceptionResult(true, "", "not_run", "");
 
     private static volatile MemoryUtil FIELD_MEMORY;
     private static volatile ForgeManager FORGE_MANAGER;
@@ -140,7 +148,10 @@ public final class ForgeVM {
             return state;
         }
 
-        LaunchResult result = launchInternal();
+        LaunchResult result;
+        synchronized (AGENT_LAUNCH_LOCK) {
+            result = launchInternal();
+        }
         state = result;
         if (result.agentStatus() == AgentStatus.UNAVAILABLE) {
             FvmLog.error("ForgeVM launch failed: " + result.reason());
@@ -151,6 +162,11 @@ public final class ForgeVM {
     public static boolean isAgentActive() {
         AgentSession session = agentSession;
         return session != null && session.isAlive();
+    }
+
+    /** Most recent filter install/remove result observed by this ForgeVM loader. */
+    public static InterceptionResult lastInterceptionResult() {
+        return lastInterceptionResult;
     }
 
     // -- memory API --
@@ -230,8 +246,10 @@ public final class ForgeVM {
     private static boolean banJavaAgentInternal(AgentFilter filter) {
         String mode = filter == null ? null : filter.mode().name();
         List<String> patterns = filter == null ? null : filter.patterns();
-        boolean ok = sendFilterCommand("purge_matching_agents", mode, patterns);
-        ok &= sendFilterCommand("ban_java_agent", mode, patterns);
+        List<InterceptionRule> rules = filter == null ? null
+                : patterns.stream().map(InterceptionRule::Name).toList();
+        boolean ok = sendFilterCommand("purge_matching_agents", mode, patterns, rules);
+        ok &= sendFilterCommand("ban_java_agent", mode, patterns, rules);
         return ok;
     }
 
@@ -246,7 +264,8 @@ public final class ForgeVM {
     public static boolean banNativeLoad(NativeFilter filter) {
         return sendFilterCommand("ban_native_load",
                 filter == null ? null : filter.mode().name(),
-                filter == null ? null : filter.patterns());
+                filter == null ? null : filter.patterns(),
+                filter == null ? null : filter.rules());
     }
 
     public static boolean unbanNativeLoad() {
@@ -264,7 +283,8 @@ public final class ForgeVM {
     public static boolean banJvmti(JvmtiFilter filter) {
         return sendFilterCommand("ban_jvmti",
                 filter == null ? null : filter.mode().name(),
-                filter == null ? null : filter.patterns());
+                filter == null ? null : filter.patterns(),
+                filter == null ? null : filter.rules());
     }
 
     /** Remove the JVMTI acquisition filter. */
@@ -283,11 +303,36 @@ public final class ForgeVM {
     public static boolean banProcessCreate(ProcessFilter filter) {
         return sendFilterCommand("ban_process_create",
                 filter == null ? null : filter.mode().name(),
-                filter == null ? null : filter.patterns());
+                filter == null ? null : filter.patterns(),
+                filter == null ? null : filter.rules());
     }
 
     public static boolean unbanProcessCreate() {
         return sendFilterCommand("unban_process_create", null, null);
+    }
+
+    // -- Java platform-thread create guard (hooks jvm.dll!JVM_StartThread) --
+
+    /** Block all subsequent Java platform-thread starts. */
+    public static boolean banThreadCreate() {
+        return sendFilterCommand("ban_thread_create", null, null);
+    }
+
+    /**
+     * Block subsequent Java platform-thread starts according to the thread-name filter.
+     * A rejected {@link Thread#start()} returns silently without creating a native
+     * thread. Code that waits for work from the discarded thread may still wait.
+     */
+    public static boolean banThreadCreate(ThreadFilter filter) {
+        return sendFilterCommand("ban_thread_create",
+                filter == null ? null : filter.mode().name(),
+                filter == null ? null : filter.patterns(),
+                filter == null ? null : filter.rules());
+    }
+
+    /** Remove the Java platform-thread creation filter. */
+    public static boolean unbanThreadCreate() {
+        return sendFilterCommand("unban_thread_create", null, null);
     }
 
     // -- relaunch (kill + restart JVM with filtered command line) --
@@ -497,7 +542,7 @@ public final class ForgeVM {
         }
     }
 
-    private static String buildRelaunchV2Command(RelaunchSpec spec) {
+    static String buildRelaunchV2Command(RelaunchSpec spec) {
         StringBuilder sb = new StringBuilder();
         sb.append("{\"cmd\":\"relaunch_v2\",\"protocol\":2");
         sb.append(",\"pid\":").append(ProcessHandle.current().pid());
@@ -516,6 +561,7 @@ public final class ForgeVM {
         appendRelaunchFilter(sb, "native", spec.nativeFilter());
         appendRelaunchFilter(sb, "jvmti", spec.jvmtiFilter());
         appendRelaunchFilter(sb, "process", spec.processFilter());
+        appendRelaunchFilter(sb, "thread", spec.threadFilter());
         return sb.append('}').toString();
     }
 
@@ -542,6 +588,8 @@ public final class ForgeVM {
             mode = value.mode().name(); patterns = value.patterns();
         } else if (filter instanceof ProcessFilter value) {
             mode = value.mode().name(); patterns = value.patterns();
+        } else if (filter instanceof ThreadFilter value) {
+            mode = value.mode().name(); patterns = value.patterns();
         }
         String cap = Character.toUpperCase(prefix.charAt(0)) + prefix.substring(1);
         sb.append(",\"has").append(cap).append("Filter\":").append(filter != null);
@@ -554,6 +602,10 @@ public final class ForgeVM {
             sb.append('"').append(escapeJson(patterns.get(i))).append('"');
         }
         sb.append(']');
+        List<InterceptionRule> rules = filterRules(filter);
+        sb.append(",\"").append(prefix).append("Policy\":\"")
+                .append(escapeJson(InterceptionPolicyCodec.encode(mode, rules))).append('"');
+        appendRuleArray(sb, prefix + "Rules", rules);
     }
 
     private static String buildRelaunchCommand(AgentFilter agentFilter, NativeFilter nativeFilter,
@@ -562,69 +614,47 @@ public final class ForgeVM {
         sb.append("{\"cmd\":\"relaunch\"");
         sb.append(",\"pid\":").append(ProcessHandle.current().pid());
         sb.append(",\"nextGen\":").append(nextGen);
-        sb.append(",\"hasAgentFilter\":").append(agentFilter != null);
-        if (agentFilter != null) {
-            sb.append(",\"agentMode\":\"").append(escapeJson(agentFilter.mode().name().toLowerCase())).append("\"");
-            sb.append(",\"agentPatterns\":[");
-            List<String> ap = agentFilter.patterns();
-            for (int i = 0; i < ap.size(); i++) {
-                if (i > 0) sb.append(',');
-                sb.append('"').append(escapeJson(ap.get(i))).append('"');
-            }
-            sb.append(']');
-        }
-        sb.append(",\"hasNativeFilter\":").append(nativeFilter != null);
-        if (nativeFilter != null) {
-            sb.append(",\"nativeMode\":\"").append(escapeJson(nativeFilter.mode().name().toLowerCase())).append("\"");
-            sb.append(",\"nativePatterns\":[");
-            List<String> np = nativeFilter.patterns();
-            for (int i = 0; i < np.size(); i++) {
-                if (i > 0) sb.append(',');
-                sb.append('"').append(escapeJson(np.get(i))).append('"');
-            }
-            sb.append(']');
-        }
-        sb.append(",\"hasJvmtiFilter\":").append(jvmtiFilter != null);
-        if (jvmtiFilter != null) {
-            sb.append(",\"jvmtiMode\":\"").append(escapeJson(jvmtiFilter.mode().name().toLowerCase())).append("\"");
-            sb.append(",\"jvmtiPatterns\":[");
-            List<String> jp = jvmtiFilter.patterns();
-            for (int i = 0; i < jp.size(); i++) {
-                if (i > 0) sb.append(',');
-                sb.append('"').append(escapeJson(jp.get(i))).append('"');
-            }
-            sb.append(']');
-        }
-        sb.append(",\"hasProcessFilter\":").append(processFilter != null);
-        if (processFilter != null) {
-            sb.append(",\"processMode\":\"").append(escapeJson(processFilter.mode().name().toLowerCase())).append("\"");
-            sb.append(",\"processPatterns\":[");
-            List<String> pp = processFilter.patterns();
-            for (int i = 0; i < pp.size(); i++) {
-                if (i > 0) sb.append(',');
-                sb.append('"').append(escapeJson(pp.get(i))).append('"');
-            }
-            sb.append(']');
-        }
+        appendRelaunchFilter(sb, "agent", agentFilter);
+        appendRelaunchFilter(sb, "native", nativeFilter);
+        appendRelaunchFilter(sb, "jvmti", jvmtiFilter);
+        appendRelaunchFilter(sb, "process", processFilter);
         sb.append('}');
         return sb.toString();
     }
 
     private static boolean sendFilterCommand(String cmd, String mode, List<String> patterns) {
+        return sendFilterCommand(cmd, mode, patterns, null);
+    }
+
+    private static boolean sendFilterCommand(String cmd, String mode, List<String> patterns,
+                                             List<InterceptionRule> rules) {
         AgentSession session = agentSession;
         if (session == null || !session.isAlive()) {
+            lastInterceptionResult = new InterceptionResult(false, cmd, "agent_not_active", "");
+            FvmLog.error("FILTER " + cmd + " failed: agent_not_active");
             return false;
         }
         try {
-            String command = buildFilterCommand(cmd, mode, patterns);
+            String command = buildFilterCommand(cmd, mode, patterns, rules);
             String response = sendCommand(session, command);
-            return isOkResponse(response);
-        } catch (Throwable ignored) {
+            Map<String, String> fields = JsonUtils.parseFlatJsonObject(response);
+            boolean ok = isOkResponse(response);
+            String reason = normalizeReason(fields.getOrDefault("reason",
+                    response == null || response.isBlank() ? "empty_response" : "unknown"));
+            lastInterceptionResult = new InterceptionResult(ok, cmd, reason,
+                    response == null ? "" : response);
+            if (!ok) FvmLog.error("FILTER " + cmd + " failed: " + reason);
+            return ok;
+        } catch (Throwable failure) {
+            String reason = "command_exception:" + failure.getClass().getSimpleName();
+            lastInterceptionResult = new InterceptionResult(false, cmd, reason, "");
+            FvmLog.error("FILTER " + cmd + " failed: " + reason);
             return false;
         }
     }
 
-    private static String buildFilterCommand(String cmd, String mode, List<String> patterns) {
+    private static String buildFilterCommand(String cmd, String mode, List<String> patterns,
+                                             List<InterceptionRule> rules) {
         StringBuilder sb = new StringBuilder();
         sb.append("{\"cmd\":\"").append(escapeJson(cmd)).append("\"");
         if (mode != null) {
@@ -638,8 +668,44 @@ public final class ForgeVM {
             }
             sb.append(']');
         }
+        if (mode != null && rules != null && !rules.isEmpty()) {
+            sb.append(",\"policy\":\"")
+                    .append(escapeJson(InterceptionPolicyCodec.encode(mode, rules))).append('"');
+            appendRuleArray(sb, "rules", rules);
+        }
         sb.append('}');
         return sb.toString();
+    }
+
+    private static List<InterceptionRule> filterRules(Object filter) {
+        if (filter instanceof AgentFilter value) {
+            return value.patterns().stream().map(InterceptionRule::Name).toList();
+        }
+        if (filter instanceof NativeFilter value) return value.rules();
+        if (filter instanceof JvmtiFilter value) return value.rules();
+        if (filter instanceof ProcessFilter value) return value.rules();
+        if (filter instanceof ThreadFilter value) return value.rules();
+        throw new IllegalArgumentException("unsupported filter type");
+    }
+
+    private static void appendRuleArray(StringBuilder sb, String key, List<InterceptionRule> rules) {
+        sb.append(",\"").append(key).append("\":[");
+        for (int i = 0; i < rules.size(); i++) {
+            if (i > 0) sb.append(',');
+            InterceptionRule rule = rules.get(i);
+            sb.append('{');
+            boolean wrote = false;
+            if (rule.namePattern() != null) {
+                sb.append("\"name\":\"").append(escapeJson(rule.namePattern())).append('"');
+                wrote = true;
+            }
+            if (rule.sourcePattern() != null) {
+                if (wrote) sb.append(',');
+                sb.append("\"source\":\"").append(escapeJson(rule.sourcePattern())).append('"');
+            }
+            sb.append('}');
+        }
+        sb.append(']');
     }
 
     public static boolean rebindAgentToCurrentJvm() {
@@ -656,7 +722,20 @@ public final class ForgeVM {
          * this JVM while it was still SUSPENDED). */
         String handoffPid = System.getProperty(PROP_AGENT_HANDOFF_PID);
         if (handoffPid != null && !handoffPid.isBlank()) {
-            return launchViaHandoff(handoffPid.trim());
+            LaunchResult handoff = launchViaHandoff(handoffPid.trim());
+            if (handoff.agentStatus() != AgentStatus.UNAVAILABLE) {
+                return handoff;
+            }
+            /* A gen-0 property can outlive an agent that crashed. Clear only
+             * the value we observed, then create a replacement below. A
+             * relaunched JVM must never spawn a replacement supervisor because
+             * that would discard its retained pre-DACL process handle. */
+            if (relaunchGeneration() > 0) {
+                return handoff;
+            }
+            if (handoffPid.equals(System.getProperty(PROP_AGENT_HANDOFF_PID))) {
+                System.clearProperty(PROP_AGENT_HANDOFF_PID);
+            }
         }
         if (relaunchGeneration() > 0) {
             return agentUnavailable("handoff_pid_missing", "");
@@ -719,6 +798,11 @@ public final class ForgeVM {
                 agentSession = session;
                 registerAgentExitSender(session);
                 registerAgentLockController(session);
+                /* System properties belong to the JVM, not to a classloader.
+                 * Publishing only after bootstrap succeeds prevents another
+                 * loader from observing an agent that is not ready yet. */
+                System.setProperty(PROP_AGENT_HANDOFF_PID, Long.toString(process.pid()));
+                FvmLog.info("ForgeVM published shared agent pid=" + process.pid());
                 return result;
             }
 
@@ -1173,5 +1257,12 @@ public final class ForgeVM {
             boolean nativeDllActive,
             String nativeDllPath,
             String reason
+    ) {}
+
+    public record InterceptionResult(
+            boolean success,
+            String command,
+            String reason,
+            String rawResponse
     ) {}
 }

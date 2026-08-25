@@ -115,14 +115,16 @@ typedef int(__cdecl* ForceDeoptNowFn)();
 typedef int(__cdecl* PurgeAgentsMatchingFn)(int, const char* const*, int);
 typedef int(__cdecl* PutFieldPathFn)(const char*, const char*, const unsigned char*, unsigned long long);
 typedef int(__cdecl* PutObjectFieldPathFn)(const char*, const char*, const char*, const char*);
-typedef int(__cdecl* BanJavaAgentFn)(int, const char*);
+typedef int(__cdecl* BanJavaAgentFn)(int, const char*, const char*);
 typedef int(__cdecl* UnbanJavaAgentFn)();
-typedef int(__cdecl* BanNativeLoadFn)(int, const char*);
+typedef int(__cdecl* BanNativeLoadFn)(int, const char*, const char*);
 typedef int(__cdecl* UnbanNativeLoadFn)();
-typedef int(__cdecl* BanJvmtiFn)(int, const char*);
+typedef int(__cdecl* BanJvmtiFn)(int, const char*, const char*);
 typedef int(__cdecl* UnbanJvmtiFn)();
-typedef int(__cdecl* BanProcessCreateFn)(int, const char*);
+typedef int(__cdecl* BanProcessCreateFn)(int, const char*, const char*);
 typedef int(__cdecl* UnbanProcessCreateFn)();
+typedef int(__cdecl* BanThreadCreateFn)(int, const char*, const char*);
+typedef int(__cdecl* UnbanThreadCreateFn)();
 typedef unsigned long long(__cdecl* InstallHaltLockFn)();
 typedef int(__cdecl* UninstallHaltLockFn)();
 typedef int(__cdecl* HaltLockHeartbeatFn)();
@@ -163,6 +165,8 @@ struct NativeApi {
     UnbanJvmtiFn unbanJvmti = NULL;
     BanProcessCreateFn banProcessCreate = NULL;
     UnbanProcessCreateFn unbanProcessCreate = NULL;
+    BanThreadCreateFn banThreadCreate = NULL;
+    UnbanThreadCreateFn unbanThreadCreate = NULL;
     ForgeClassPlanFn forgeClassPlan = NULL;
     ForgeClassUnloadFn forgeClassUnload = NULL;
     InstallHaltLockFn installHaltLock = NULL;
@@ -186,10 +190,17 @@ static std::mutex g_jvmControlMutex;
 static HANDLE g_jvmControlHandle = NULL;
 static DWORD g_jvmControlPid = 0;
 
-/* PID of the target most recently bootstrapped by the post-relaunch or
- * recovery watcher. Lets handleBootstrap skip a redundant OpenProcess
- * call that would fail under the comprehensive DACL. */
-static std::atomic<DWORD> g_watchdogBootstrappedPid{0};
+/* PID of the target most recently bootstrapped with an already-authorized
+ * process handle (normally PROCESS_INFORMATION::hProcess from
+ * CREATE_SUSPENDED).  A later Java handoff bootstrap must reuse the native
+ * target unconditionally: reopening the same PID can be denied by the DACL,
+ * and tying reuse to guardMode created a relaunch self-lock when protection
+ * state and handoff state became temporarily out of sync. */
+/* PID whose native target state is already live in this agent. Every command
+ * channel belongs to the same supervised JVM, so a repeated bootstrap for this
+ * PID must reuse the retained handle instead of calling OpenProcess again after
+ * the target DACL has been hardened. */
+static std::atomic<DWORD> g_bootstrappedPid{0};
 
 
 /* Self-DACL hardening: deny the full set of dangerous access rights to
@@ -325,7 +336,7 @@ static void clearJvmControlHandle() {
     if (g_jvmControlHandle != NULL) CloseHandle(g_jvmControlHandle);
     g_jvmControlHandle = NULL;
     g_jvmControlPid = 0;
-    g_watchdogBootstrappedPid.store(0);
+    g_bootstrappedPid.store(0);
 }
 
 static bool retainAndLockJvm(HANDLE process, DWORD pid) {
@@ -866,6 +877,8 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->unbanJvmti      = reinterpret_cast<UnbanJvmtiFn>(GetProcAddress(module, "forgevm_unban_jvmti"));
     api->banProcessCreate   = reinterpret_cast<BanProcessCreateFn>(GetProcAddress(module, "forgevm_ban_process_create"));
     api->unbanProcessCreate = reinterpret_cast<UnbanProcessCreateFn>(GetProcAddress(module, "forgevm_unban_process_create"));
+    api->banThreadCreate    = reinterpret_cast<BanThreadCreateFn>(GetProcAddress(module, "forgevm_ban_thread_create"));
+    api->unbanThreadCreate  = reinterpret_cast<UnbanThreadCreateFn>(GetProcAddress(module, "forgevm_unban_thread_create"));
     api->forgeClassPlan   = reinterpret_cast<ForgeClassPlanFn>(GetProcAddress(module, "forgevm_forge_class_plan"));
     api->forgeClassUnload = reinterpret_cast<ForgeClassUnloadFn>(GetProcAddress(module, "forgevm_forge_class_unload"));
     api->installHaltLock    = reinterpret_cast<InstallHaltLockFn>(GetProcAddress(module, "forgevm_install_halt_lock"));
@@ -942,13 +955,14 @@ void handleBootstrap(const NativeApi& api,
         }
     }
     if (pid != 0ULL && api.bootstrapTarget != NULL) {
-        if (g_guardMode.load() && g_watchdogBootstrappedPid.load() == static_cast<DWORD>(pid)) {
+        if (g_bootstrappedPid.load() == static_cast<DWORD>(pid)) {
             structMapReady = true;
-            AGENT_LOG("bootstrap_target skipped: pid=%llu already bootstrapped by recovery watcher", pid);
+            AGENT_LOG("bootstrap_target reused: pid=%llu already active on another command channel", pid);
         } else {
             AGENT_LOG("bootstrap_target(pid=%llu)...", pid);
             if (api.bootstrapTarget(pid) == 1) {
                 structMapReady = true;
+                g_bootstrappedPid.store(static_cast<DWORD>(pid));
                 AGENT_LOG("bootstrap_target OK: structMap ready");
             } else {
                 std::string reason = copyReason(api, "bootstrap_target_failed");
@@ -1031,6 +1045,10 @@ void handleBootstrap(const NativeApi& api,
             AGENT_LOG("compressionInfo=%s", cinfo);
         }
     }
+    /* A successful bootstrap is the relaunch handoff acknowledgement. The
+     * always-on command-pipe server can now let the watchdog treat this JVM as
+     * the active generation. In gen-0 this is already false. */
+    g_persistAfterEOF.store(false);
     AGENT_LOG("bootstrap complete: %s", capFromCode(capability));
     printResultWithFields("ok", capFromCode(capability), dllPath, "ok", fields);
 }
@@ -1583,6 +1601,7 @@ enum class FilterMode { None, Blacklist, Whitelist };
 struct LoadFilter {
     FilterMode mode = FilterMode::None;
     std::vector<std::string> patterns;
+    std::string encodedPolicy;
     bool active = false;
 };
 
@@ -1590,6 +1609,7 @@ LoadFilter g_javaAgentFilter;
 LoadFilter g_nativeLoadFilter;
 LoadFilter g_jvmtiFilter;
 LoadFilter g_processCreateFilter;
+LoadFilter g_threadCreateFilter;
 std::mutex g_filterMutex;
 std::atomic<bool> g_filterPipeStarted{false};
 
@@ -1661,6 +1681,7 @@ std::vector<std::string> parseJsonStringArray(const std::string& line, const std
 void applyFilterFromJson(LoadFilter* filter, const std::string& line) {
     std::string mode = getJsonStringField(line, "mode");
     std::vector<std::string> patterns = parseJsonStringArray(line, "patterns");
+    filter->encodedPolicy = getJsonStringField(line, "policy");
 
     // Normalize to lowercase for comparison
     std::string modeLower = mode;
@@ -1763,7 +1784,7 @@ DWORD WINAPI filterPipeHandlerThread(LPVOID param) {
         buf.append(chunk, chunk + got);
     }
 
-    char decision = '1'; // default allow on malformed input — fail-open keeps JVM healthy
+    char decision = '0'; // malformed/unattributable requests must never bypass policy
     if (haveLine && !buf.empty()) {
         char kind = buf[0];
         std::string path = buf.substr(1);
@@ -2102,16 +2123,17 @@ void handleBanJavaAgent(const NativeApi& api, const std::string& line, const std
     }
     /* In-process match: DLL installs the hook on first call, refreshes the
      * resident pattern blob in place on later calls — no filter pipe. */
-    int r = api.banJavaAgent(mode, joined.c_str());
+    int r = api.banJavaAgent(mode, joined.c_str(), desired.encodedPolicy.c_str());
+    const std::string reason = api.lastError ? api.lastError() : "unknown";
     if (r) {
         std::lock_guard<std::mutex> g(g_filterMutex);
         g_javaAgentFilter = std::move(desired);
     }
-    AGENT_LOG("ban_java_agent: mode=%s patterns=%zu%s result=%d",
+    AGENT_LOG("ban_java_agent: mode=%s patterns=%zu%s result=%d reason=%s",
               filterModeName(static_cast<FilterMode>(mode)), patternCount,
-              wasActive ? " (updated)" : "", r);
+              wasActive ? " (updated)" : "", r, reason.c_str());
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
-                api.lastError ? api.lastError() : "unknown");
+                reason.c_str());
 }
 
 void handleUnbanJavaAgent(const NativeApi& api, const std::string& dllPath) {
@@ -2157,16 +2179,17 @@ void handleBanNativeLoad(const NativeApi& api, const std::string& line, const st
     /* The DLL installs the trampoline on first call and refreshes the resident
      * pattern blob in place on subsequent calls — both decided in-process, so
      * no filter pipe is involved. */
-    int r = api.banNativeLoad(mode, joined.c_str());
+    int r = api.banNativeLoad(mode, joined.c_str(), desired.encodedPolicy.c_str());
+    const std::string reason = api.lastError ? api.lastError() : "unknown";
     if (r) {
         std::lock_guard<std::mutex> g(g_filterMutex);
         g_nativeLoadFilter = std::move(desired);
     }
-    AGENT_LOG("ban_native_load: mode=%s patterns=%zu%s result=%d",
+    AGENT_LOG("ban_native_load: mode=%s patterns=%zu%s result=%d reason=%s",
               filterModeName(static_cast<FilterMode>(mode)), patternCount,
-              wasActive ? " (updated)" : "", r);
+              wasActive ? " (updated)" : "", r, reason.c_str());
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
-                api.lastError ? api.lastError() : "unknown");
+                reason.c_str());
 }
 
 void handleUnbanNativeLoad(const NativeApi& api, const std::string& dllPath) {
@@ -2199,17 +2222,22 @@ void handleBanJvmti(const NativeApi& api, const std::string& line, const std::st
     applyFilterFromJson(&desired, line);
     const int mode = static_cast<int>(desired.mode);
     const std::string joined = joinPatternsLF(desired);
+    const size_t patternCount = desired.patterns.size();
     if (api.banJvmti == NULL) {
         printResult("fallback", "UNAVAILABLE", dllPath, "ban_jvmti_not_exported");
         return;
     }
-    int r = api.banJvmti(mode, joined.c_str());
+    int r = api.banJvmti(mode, joined.c_str(), desired.encodedPolicy.c_str());
+    const std::string reason = api.lastError ? api.lastError() : "unknown";
     if (r) {
         std::lock_guard<std::mutex> g(g_filterMutex);
         g_jvmtiFilter = std::move(desired);
     }
+    AGENT_LOG("ban_jvmti: mode=%s patterns=%zu result=%d reason=%s",
+              filterModeName(static_cast<FilterMode>(mode)), patternCount,
+              r, reason.c_str());
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
-                api.lastError ? api.lastError() : "unknown");
+                reason.c_str());
 }
 
 void handleUnbanJvmti(const NativeApi& api, const std::string& dllPath) {
@@ -2250,16 +2278,17 @@ void handleBanProcessCreate(const NativeApi& api, const std::string& line, const
         printResult("fallback", "UNAVAILABLE", dllPath, "ban_process_create_not_exported");
         return;
     }
-    int r = api.banProcessCreate(mode, joined.c_str());
+    int r = api.banProcessCreate(mode, joined.c_str(), desired.encodedPolicy.c_str());
+    const std::string reason = api.lastError ? api.lastError() : "unknown";
     if (r) {
         std::lock_guard<std::mutex> g(g_filterMutex);
         g_processCreateFilter = std::move(desired);
     }
-    AGENT_LOG("ban_process_create: mode=%s patterns=%zu%s result=%d",
+    AGENT_LOG("ban_process_create: mode=%s patterns=%zu%s result=%d reason=%s",
               filterModeName(static_cast<FilterMode>(mode)), patternCount,
-              wasActive ? " (updated)" : "", r);
+              wasActive ? " (updated)" : "", r, reason.c_str());
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
-                api.lastError ? api.lastError() : "unknown");
+                reason.c_str());
 }
 
 void handleUnbanProcessCreate(const NativeApi& api, const std::string& dllPath) {
@@ -2282,6 +2311,57 @@ void handleUnbanProcessCreate(const NativeApi& api, const std::string& dllPath) 
     if (r) {
         std::lock_guard<std::mutex> g(g_filterMutex);
         g_processCreateFilter = LoadFilter{};
+    }
+    printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
+                api.lastError ? api.lastError() : "unknown");
+}
+
+void handleBanThreadCreate(const NativeApi& api, const std::string& line, const std::string& dllPath) {
+    LoadFilter desired;
+    applyFilterFromJson(&desired, line);
+    const int mode = static_cast<int>(desired.mode);
+    const std::string joined = joinPatternsLF(desired);
+    const size_t patternCount = desired.patterns.size();
+    bool wasActive;
+    {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        wasActive = g_threadCreateFilter.active;
+    }
+    if (api.banThreadCreate == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "ban_thread_create_not_exported");
+        return;
+    }
+    int r = api.banThreadCreate(mode, joined.c_str(), desired.encodedPolicy.c_str());
+    const std::string reason = api.lastError ? api.lastError() : "unknown";
+    if (r) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_threadCreateFilter = std::move(desired);
+    }
+    AGENT_LOG("ban_thread_create: mode=%s patterns=%zu%s result=%d reason=%s",
+              filterModeName(static_cast<FilterMode>(mode)), patternCount,
+              wasActive ? " (updated)" : "", r, reason.c_str());
+    printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
+                reason.c_str());
+}
+
+void handleUnbanThreadCreate(const NativeApi& api, const std::string& dllPath) {
+    bool wasActive;
+    {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        wasActive = g_threadCreateFilter.active;
+    }
+    if (!wasActive) {
+        printResult("ok", "FULL", dllPath, "already_unbanned");
+        return;
+    }
+    if (api.unbanThreadCreate == NULL) {
+        printResult("fallback", "UNAVAILABLE", dllPath, "unban_thread_create_not_exported");
+        return;
+    }
+    int r = api.unbanThreadCreate();
+    if (r) {
+        std::lock_guard<std::mutex> g(g_filterMutex);
+        g_threadCreateFilter = LoadFilter{};
     }
     printResult(r ? "ok" : "fallback", r ? "FULL" : "UNAVAILABLE", dllPath,
                 api.lastError ? api.lastError() : "unknown");
@@ -2632,22 +2712,25 @@ static bool waitForReadyPipe(HANDLE pipe, HANDLE process, OVERLAPPED* connect,
 
 static bool installRelaunchFilters(const NativeApi& api, HANDLE process, DWORD pid,
                                    bool installAgent, bool installNative,
-                                   bool installJvmti, bool installProcess) {
+                                   bool installJvmti, bool installProcess,
+                                   bool installThread) {
     if (api.bootstrapTargetWithHandle == NULL
             || api.bootstrapTargetWithHandle(static_cast<unsigned long long>(pid), process) != 1) {
         return false;
     }
-    g_watchdogBootstrappedPid.store(pid);
+    g_bootstrappedPid.store(pid);
     auto apply = [&](bool enabled, const LoadFilter& filter, auto fn) -> bool {
         if (!enabled) return true;
         if (fn == NULL) return false;
-        return fn(static_cast<int>(filter.mode), joinPatternsLF(filter).c_str()) == 1;
+        return fn(static_cast<int>(filter.mode), joinPatternsLF(filter).c_str(),
+                  filter.encodedPolicy.c_str()) == 1;
     };
     std::lock_guard<std::mutex> g(g_filterMutex);
     return apply(installNative, g_nativeLoadFilter, api.banNativeLoad)
         && apply(installAgent, g_javaAgentFilter, api.banJavaAgent)
         && apply(installJvmti, g_jvmtiFilter, api.banJvmti)
-        && apply(installProcess, g_processCreateFilter, api.banProcessCreate);
+        && apply(installProcess, g_processCreateFilter, api.banProcessCreate)
+        && apply(installThread, g_threadCreateFilter, api.banThreadCreate);
 }
 
 static void handleRelaunchV2(const NativeApi& api, const std::string& line,
@@ -2700,17 +2783,21 @@ static void handleRelaunchV2(const NativeApi& api, const std::string& line,
     bool hasNativeFilter = getJsonBoolField(line, "hasNativeFilter", false);
     bool hasJvmtiFilter = getJsonBoolField(line, "hasJvmtiFilter", false);
     bool hasProcessFilter = getJsonBoolField(line, "hasProcessFilter", false);
-    LoadFilter agentFlt, nativeFlt, jvmtiFlt, processFlt;
-    auto parseFilter = [&](LoadFilter& filter, const char* modeKey, const char* patternsKey) {
+    bool hasThreadFilter = getJsonBoolField(line, "hasThreadFilter", false);
+    LoadFilter agentFlt, nativeFlt, jvmtiFlt, processFlt, threadFlt;
+    auto parseFilter = [&](LoadFilter& filter, const char* modeKey, const char* patternsKey,
+                           const char* policyKey) {
         std::string mode = getJsonStringField(line, modeKey);
         filter.patterns = parseJsonStringArray(line, patternsKey);
         filter.mode = mode == "whitelist" ? FilterMode::Whitelist : FilterMode::Blacklist;
         filter.active = true;
+        filter.encodedPolicy = getJsonStringField(line, policyKey);
     };
-    if (hasAgentFilter) parseFilter(agentFlt, "agentMode", "agentPatterns");
-    if (hasNativeFilter) parseFilter(nativeFlt, "nativeMode", "nativePatterns");
-    if (hasJvmtiFilter) parseFilter(jvmtiFlt, "jvmtiMode", "jvmtiPatterns");
-    if (hasProcessFilter) parseFilter(processFlt, "processMode", "processPatterns");
+    if (hasAgentFilter) parseFilter(agentFlt, "agentMode", "agentPatterns", "agentPolicy");
+    if (hasNativeFilter) parseFilter(nativeFlt, "nativeMode", "nativePatterns", "nativePolicy");
+    if (hasJvmtiFilter) parseFilter(jvmtiFlt, "jvmtiMode", "jvmtiPatterns", "jvmtiPolicy");
+    if (hasProcessFilter) parseFilter(processFlt, "processMode", "processPatterns", "processPolicy");
+    if (hasThreadFilter) parseFilter(threadFlt, "threadMode", "threadPatterns", "threadPolicy");
 
     std::string existingPolicy = getJsonStringField(line, "existingAgents");
     bool dropAgents = existingPolicy == "drop_all";
@@ -2883,9 +2970,11 @@ static void handleRelaunchV2(const NativeApi& api, const std::string& line,
         if (hasNativeFilter) g_nativeLoadFilter = nativeFlt;
         if (hasJvmtiFilter) g_jvmtiFilter = jvmtiFlt;
         if (hasProcessFilter) g_processCreateFilter = processFlt;
+        if (hasThreadFilter) g_threadCreateFilter = threadFlt;
     }
     if (!installRelaunchFilters(api, child.hProcess, child.dwProcessId,
-                                hasAgentFilter, hasNativeFilter, hasJvmtiFilter, hasProcessFilter)) {
+                                hasAgentFilter, hasNativeFilter, hasJvmtiFilter,
+                                hasProcessFilter, hasThreadFilter)) {
         TerminateProcess(child.hProcess, 77);
         if (g_guardMode.load()) restoreJvmControlHandle(oldJvm, oldPid);
         CloseHandle(child.hProcess); CloseHandle(oldJvm);
@@ -2936,7 +3025,8 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
 
     LoadFilter agentFlt, nativeFlt, jvmtiFlt, processFlt;
 
-    auto buildFilter = [&](LoadFilter& f, const char* modeKey, const char* patsKey) {
+    auto buildFilter = [&](LoadFilter& f, const char* modeKey, const char* patsKey,
+                           const char* policyKey) {
         std::string mode = getJsonStringField(line, modeKey);
         std::vector<std::string> pats = parseJsonStringArray(line, patsKey);
         for (char& c : mode) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
@@ -2950,29 +3040,33 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
             f.mode = FilterMode::None;
         }
         f.active = true;
+        f.encodedPolicy = getJsonStringField(line, policyKey);
     };
 
-    if (hasAgentFilter)   buildFilter(agentFlt,   "agentMode",   "agentPatterns");
-    if (hasNativeFilter)  buildFilter(nativeFlt,  "nativeMode",  "nativePatterns");
-    if (hasJvmtiFilter)   buildFilter(jvmtiFlt,   "jvmtiMode",   "jvmtiPatterns");
-    if (hasProcessFilter) buildFilter(processFlt, "processMode", "processPatterns");
+    if (hasAgentFilter)   buildFilter(agentFlt,   "agentMode",   "agentPatterns", "agentPolicy");
+    if (hasNativeFilter)  buildFilter(nativeFlt,  "nativeMode",  "nativePatterns", "nativePolicy");
+    if (hasJvmtiFilter)   buildFilter(jvmtiFlt,   "jvmtiMode",   "jvmtiPatterns", "jvmtiPolicy");
+    if (hasProcessFilter) buildFilter(processFlt, "processMode", "processPatterns", "processPolicy");
 
     /* Snapshot pre-relaunch ban state. Trampolines in the old JVM die with it,
      * so the new JVM needs fresh installs whenever a ban was active OR the
      * caller passed a new filter. Without this, relaunch() with no filter
      * args silently drops active protection that was installed before the call. */
-    bool wasAgentBanActive, wasNativeBanActive, wasJvmtiBanActive, wasProcessBanActive;
+    bool wasAgentBanActive, wasNativeBanActive, wasJvmtiBanActive, wasProcessBanActive,
+         wasThreadBanActive;
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
         wasAgentBanActive   = g_javaAgentFilter.active;
         wasNativeBanActive  = g_nativeLoadFilter.active;
         wasJvmtiBanActive   = g_jvmtiFilter.active;
         wasProcessBanActive = g_processCreateFilter.active;
+        wasThreadBanActive  = g_threadCreateFilter.active;
     }
     bool installNativeBan  = hasNativeFilter  || wasNativeBanActive;
     bool installAgentBan   = hasAgentFilter   || wasAgentBanActive;
     bool installJvmtiBan   = hasJvmtiFilter || wasJvmtiBanActive;
     bool installProcessBan = hasProcessFilter || wasProcessBanActive;
+    bool installThreadBan  = wasThreadBanActive;
 
     AGENT_LOG("relaunch: pid=%llu hasAgentFilter=%d hasNativeFilter=%d hasJvmtiFilter=%d hasProcessFilter=%d "
               "wasAgentActive=%d wasNativeActive=%d wasJvmtiActive=%d wasProcessActive=%d",
@@ -3159,13 +3253,14 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         bool installNativeBan;
         bool installJvmtiBan;
         bool installProcessBan;
+        bool installThreadBan;
         const NativeApi* api;
         std::string dllPath;
         HANDLE abortEvent;
     };
     auto* ctx = new RelaunchPostResumeCtx{
         pi.hProcess, pi.dwProcessId, installAgentBan, installNativeBan, installJvmtiBan,
-        installProcessBan, &api, dllPath, abortEvent
+        installProcessBan, installThreadBan, &api, dllPath, abortEvent
     };
     HANDLE watcher = CreateThread(NULL, 0, [](LPVOID p) -> DWORD {
         auto* c = static_cast<RelaunchPostResumeCtx*>(p);
@@ -3175,6 +3270,7 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         bool installNativeBan = c->installNativeBan;
         bool installJvmtiBan = c->installJvmtiBan;
         bool installProcessBan = c->installProcessBan;
+        bool installThreadBan = c->installThreadBan;
         const NativeApi* api = c->api;
         HANDLE abortEvent = c->abortEvent;
         delete c;
@@ -3212,44 +3308,58 @@ void handleRelaunch(const NativeApi& api, const std::string& line, const std::st
         if (api->bootstrapTargetWithHandle != NULL) {
             if (api->bootstrapTargetWithHandle(static_cast<unsigned long long>(newPid), h) == 1) {
                 AGENT_LOG("post-relaunch watcher: bootstrap_target_with_handle(%lu) ok", newPid);
-                g_watchdogBootstrappedPid.store(newPid);
+                g_bootstrappedPid.store(newPid);
                 /* All three bans now match in-process against a resident pattern
                  * blob — no filter pipe. Snapshot each filter's mode + patterns
                  * and hand them to the DLL exports. */
                 if (installNativeBan && api->banNativeLoad != NULL) {
-                    int m; std::string j;
+                    int m; std::string j, p;
                     { std::lock_guard<std::mutex> g(g_filterMutex);
                       m = static_cast<int>(g_nativeLoadFilter.mode);
-                      j = joinPatternsLF(g_nativeLoadFilter); }
-                    int r = api->banNativeLoad(m, j.c_str());
+                      j = joinPatternsLF(g_nativeLoadFilter);
+                      p = g_nativeLoadFilter.encodedPolicy; }
+                    int r = api->banNativeLoad(m, j.c_str(), p.c_str());
                     AGENT_LOG("post-relaunch watcher: banNativeLoad r=%d reason=%s",
                               r, api->lastError ? api->lastError() : "");
                 }
                 if (installAgentBan && api->banJavaAgent != NULL) {
-                    int m; std::string j;
+                    int m; std::string j, p;
                     { std::lock_guard<std::mutex> g(g_filterMutex);
                       m = static_cast<int>(g_javaAgentFilter.mode);
-                      j = joinPatternsLF(g_javaAgentFilter); }
-                    int r = api->banJavaAgent(m, j.c_str());
+                      j = joinPatternsLF(g_javaAgentFilter);
+                      p = g_javaAgentFilter.encodedPolicy; }
+                    int r = api->banJavaAgent(m, j.c_str(), p.c_str());
                     AGENT_LOG("post-relaunch watcher: banJavaAgent r=%d reason=%s",
                               r, api->lastError ? api->lastError() : "");
                 }
                 if (installJvmtiBan && api->banJvmti != NULL) {
-                    int m; std::string j;
+                    int m; std::string j, p;
                     { std::lock_guard<std::mutex> g(g_filterMutex);
                       m = static_cast<int>(g_jvmtiFilter.mode);
-                      j = joinPatternsLF(g_jvmtiFilter); }
-                    int r = api->banJvmti(m, j.c_str());
+                      j = joinPatternsLF(g_jvmtiFilter);
+                      p = g_jvmtiFilter.encodedPolicy; }
+                    int r = api->banJvmti(m, j.c_str(), p.c_str());
                     AGENT_LOG("post-relaunch watcher: banJvmti r=%d reason=%s",
                               r, api->lastError ? api->lastError() : "");
                 }
                 if (installProcessBan && api->banProcessCreate != NULL) {
-                    int m; std::string j;
+                    int m; std::string j, p;
                     { std::lock_guard<std::mutex> g(g_filterMutex);
                       m = static_cast<int>(g_processCreateFilter.mode);
-                      j = joinPatternsLF(g_processCreateFilter); }
-                    int r = api->banProcessCreate(m, j.c_str());
+                      j = joinPatternsLF(g_processCreateFilter);
+                      p = g_processCreateFilter.encodedPolicy; }
+                    int r = api->banProcessCreate(m, j.c_str(), p.c_str());
                     AGENT_LOG("post-relaunch watcher: banProcessCreate r=%d reason=%s",
+                              r, api->lastError ? api->lastError() : "");
+                }
+                if (installThreadBan && api->banThreadCreate != NULL) {
+                    int m; std::string j, p;
+                    { std::lock_guard<std::mutex> g(g_filterMutex);
+                      m = static_cast<int>(g_threadCreateFilter.mode);
+                      j = joinPatternsLF(g_threadCreateFilter);
+                      p = g_threadCreateFilter.encodedPolicy; }
+                    int r = api->banThreadCreate(m, j.c_str(), p.c_str());
+                    AGENT_LOG("post-relaunch watcher: banThreadCreate r=%d reason=%s",
                               r, api->lastError ? api->lastError() : "");
                 }
             } else {
@@ -3306,17 +3416,19 @@ struct GuardPostResumeCtx {
 };
 
 static void guardReapplyActiveFilters(const NativeApi& api) {
-    LoadFilter javaAgent, nativeLoad, jvmti, process;
+    LoadFilter javaAgent, nativeLoad, jvmti, process, thread;
     {
         std::lock_guard<std::mutex> filters(g_filterMutex);
         javaAgent = g_javaAgentFilter;
         nativeLoad = g_nativeLoadFilter;
         jvmti = g_jvmtiFilter;
         process = g_processCreateFilter;
+        thread = g_threadCreateFilter;
     }
     auto apply = [&](const char* name, const LoadFilter& filter, auto fn) {
         if (!filter.active || fn == NULL) return;
-        int result = fn(static_cast<int>(filter.mode), joinPatternsLF(filter).c_str());
+        int result = fn(static_cast<int>(filter.mode), joinPatternsLF(filter).c_str(),
+                        filter.encodedPolicy.c_str());
         AGENT_LOG("guard: %s reinstalled result=%d reason=%s", name, result,
                   api.lastError ? api.lastError() : "");
     };
@@ -3324,6 +3436,7 @@ static void guardReapplyActiveFilters(const NativeApi& api) {
     apply("banJavaAgent", javaAgent, api.banJavaAgent);
     apply("banJvmti", jvmti, api.banJvmti);
     apply("banProcessCreate", process, api.banProcessCreate);
+    apply("banThreadCreate", thread, api.banThreadCreate);
 
     /* Re-install JVM_Halt lock after recovery. */
     if (g_guardMode.load() && api.installHaltLock != NULL) {
@@ -3390,7 +3503,7 @@ static DWORD WINAPI guardPostResumeWatcher(LPVOID param) {
     /* Hook installation only proves that bootstrap completed. Keep the crash
      * budget until this process survives the stable-recovery grace window. */
     g_guardRecoveryStableSinceTick.store(GetTickCount64());
-    g_watchdogBootstrappedPid.store(pid);
+    g_bootstrappedPid.store(pid);
     AGENT_LOG("guard: recovery bootstrap completed for pid=%lu; hooks reinstalled, filter decisions pending audit", pid);
     windowPublish("[GUARD] JVM restart bootstrapped; hooks reinstalled (pid " + std::to_string(pid) + ")");
     CloseHandle(process);
@@ -3595,6 +3708,10 @@ static bool dispatchCommand(const NativeApi& api, const std::string& dllPath,
         handleBanProcessCreate(api, line, dllPath);
     } else if (cmd == "unban_process_create") {
         handleUnbanProcessCreate(api, dllPath);
+    } else if (cmd == "ban_thread_create") {
+        handleBanThreadCreate(api, line, dllPath);
+    } else if (cmd == "unban_thread_create") {
+        handleUnbanThreadCreate(api, dllPath);
     } else if (cmd == "relaunch_v2") {
         handleRelaunchV2(api, line, dllPath);
     } else if (cmd == "relaunch") {
@@ -3706,6 +3823,23 @@ static void runCommandPipeServer(HANDLE firstPipe) {
             continue;
         }
         CloseHandle(th);
+    }
+}
+
+/* Keep the shared command endpoint live from gen-0 onward. Previously the
+ * agent created the pipe early but did not call ConnectNamedPipe until the
+ * spawning classloader's stdin reached EOF during relaunch. A second
+ * classloader in the same still-running JVM therefore saw the published pipe
+ * name but could not connect. */
+static DWORD WINAPI commandPipeServerThread(LPVOID) {
+    for (;;) {
+        HANDLE firstPipe = acceptCommandPipeClient(NULL);
+        if (firstPipe != NULL && firstPipe != INVALID_HANDLE_VALUE) {
+            AGENT_LOG("command pipe: first shared client connected — serving multi-client channels");
+            runCommandPipeServer(firstPipe);  // never returns
+            return 0;
+        }
+        Sleep(50);
     }
 }
 
@@ -4120,6 +4254,9 @@ static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
     bool protectedTerminationSeen = false;
     unsigned long long lastNativeAllow = 0, lastNativeBlock = 0;
     unsigned long long lastProcessAllow = 0, lastProcessBlock = 0;
+    unsigned long long lastThreadAllow = 0, lastThreadBlock = 0, lastThreadError = 0;
+    unsigned long long lastNativeSourceAllow = 0, lastNativeSourceBlock = 0, lastNativeSourceError = 0;
+    unsigned long long lastProcessSourceAllow = 0, lastProcessSourceBlock = 0, lastProcessSourceError = 0;
     unsigned long long lastHaltBlock = 0;
     unsigned long long lastTerminateBlock = 0;
 
@@ -4138,6 +4275,9 @@ static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
             protectedTerminationSeen = false;
             lastNativeAllow = lastNativeBlock = 0;
             lastProcessAllow = lastProcessBlock = 0;
+            lastThreadAllow = lastThreadBlock = lastThreadError = 0;
+            lastNativeSourceAllow = lastNativeSourceBlock = lastNativeSourceError = 0;
+            lastProcessSourceAllow = lastProcessSourceBlock = lastProcessSourceError = 0;
             lastHaltBlock = 0;
             lastTerminateBlock = 0;
             windowPublish("[JVM] tracking target pid=" + std::to_string(pid));
@@ -4151,12 +4291,17 @@ static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
         /* Verify all inline hooks are still in place. An in-process adversary
          * may attempt to restore original bytes at hook sites (unhooking).
          * This detects tampering and re-applies the patch automatically. */
-        if (g_guardMode.load() && g_api != nullptr && g_api->verifyHookIntegrity != NULL) {
+        /* Filter integrity is an enforcement property, not a --lock-jvm UI
+         * feature. Verify whenever native hooks are available. */
+        if (g_api != nullptr && g_api->verifyHookIntegrity != NULL) {
             int repaired = g_api->verifyHookIntegrity();
             if (repaired > 0) {
                 AGENT_LOG("guard: hook integrity check re-applied %d tampered hook(s)", repaired);
                 windowPublish("[FVM] hook integrity: " + std::to_string(repaired) +
                               " hook(s) re-applied after tamper detection");
+            } else if (repaired == -2) {
+                AGENT_LOG("guard: trampoline integrity violation; target terminated fail-closed");
+                windowPublish("[FVM] trampoline integrity violation; JVM terminated fail-closed");
             }
         }
 
@@ -4170,6 +4315,15 @@ static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
             unsigned long long processBlock = g_api->filterAudit(3);
             unsigned long long haltBlock = g_api->filterAudit(4);
             unsigned long long terminateBlock = g_api->filterAudit(5);
+            unsigned long long threadAllow = g_api->filterAudit(6);
+            unsigned long long threadBlock = g_api->filterAudit(7);
+            unsigned long long threadError = g_api->filterAudit(8);
+            unsigned long long nativeSourceAllow = g_api->filterAudit(9);
+            unsigned long long nativeSourceBlock = g_api->filterAudit(10);
+            unsigned long long nativeSourceError = g_api->filterAudit(11);
+            unsigned long long processSourceAllow = g_api->filterAudit(12);
+            unsigned long long processSourceBlock = g_api->filterAudit(13);
+            unsigned long long processSourceError = g_api->filterAudit(14);
             if (haltBlock > lastHaltBlock || terminateBlock > lastTerminateBlock) {
                 protectedTerminationSeen = true;
                 AGENT_LOG("guard: protected in-process termination attempt observed "
@@ -4179,18 +4333,54 @@ static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
             }
             if (nativeAllow != lastNativeAllow || nativeBlock != lastNativeBlock ||
                 processAllow != lastProcessAllow || processBlock != lastProcessBlock ||
+                threadAllow != lastThreadAllow || threadBlock != lastThreadBlock ||
+                threadError != lastThreadError ||
+                nativeSourceAllow != lastNativeSourceAllow ||
+                nativeSourceBlock != lastNativeSourceBlock ||
+                nativeSourceError != lastNativeSourceError ||
+                processSourceAllow != lastProcessSourceAllow ||
+                processSourceBlock != lastProcessSourceBlock ||
+                processSourceError != lastProcessSourceError ||
                 haltBlock != lastHaltBlock || terminateBlock != lastTerminateBlock) {
-                AGENT_LOG("filter-audit: native allow=%llu block=%llu; process allow=%llu block=%llu; halt block=%llu; terminate block=%llu",
-                          nativeAllow, nativeBlock, processAllow, processBlock, haltBlock, terminateBlock);
+                AGENT_LOG("filter-audit: native allow=%llu block=%llu source=%llu/%llu/%llu; process allow=%llu block=%llu source=%llu/%llu/%llu; thread allow=%llu block=%llu internal_error=%llu; halt block=%llu; terminate block=%llu",
+                          nativeAllow, nativeBlock, nativeSourceAllow, nativeSourceBlock, nativeSourceError,
+                          processAllow, processBlock, processSourceAllow, processSourceBlock, processSourceError,
+                          threadAllow, threadBlock, threadError, haltBlock, terminateBlock);
                 windowPublish("[FVM] filter audit | dll A/B " + std::to_string(nativeAllow) + "/" +
-                              std::to_string(nativeBlock) + " | process A/B " +
+                               std::to_string(nativeBlock) + " | process A/B " +
                               std::to_string(processAllow) + "/" + std::to_string(processBlock) +
+                               " | thread A/B " + std::to_string(threadAllow) + "/" +
+                               std::to_string(threadBlock) + " E " + std::to_string(threadError) +
                               " | halt B " + std::to_string(haltBlock) +
-                              " | terminate B " + std::to_string(terminateBlock));
+                               " | terminate B " + std::to_string(terminateBlock));
+                if (nativeSourceAllow != lastNativeSourceAllow ||
+                    nativeSourceBlock != lastNativeSourceBlock ||
+                    nativeSourceError != lastNativeSourceError ||
+                    processSourceAllow != lastProcessSourceAllow ||
+                    processSourceBlock != lastProcessSourceBlock ||
+                    processSourceError != lastProcessSourceError) {
+                    windowPublish("[FVM] source audit | native A/B/E " +
+                                  std::to_string(nativeSourceAllow) + "/" +
+                                  std::to_string(nativeSourceBlock) + "/" +
+                                  std::to_string(nativeSourceError) +
+                                  " | process A/B/E " +
+                                  std::to_string(processSourceAllow) + "/" +
+                                  std::to_string(processSourceBlock) + "/" +
+                                  std::to_string(processSourceError));
+                }
                 lastNativeAllow = nativeAllow;
                 lastNativeBlock = nativeBlock;
                 lastProcessAllow = processAllow;
                 lastProcessBlock = processBlock;
+                lastThreadAllow = threadAllow;
+                lastThreadBlock = threadBlock;
+                lastThreadError = threadError;
+                lastNativeSourceAllow = nativeSourceAllow;
+                lastNativeSourceBlock = nativeSourceBlock;
+                lastNativeSourceError = nativeSourceError;
+                lastProcessSourceAllow = processSourceAllow;
+                lastProcessSourceBlock = processSourceBlock;
+                lastProcessSourceError = processSourceError;
                 lastHaltBlock = haltBlock;
                 lastTerminateBlock = terminateBlock;
             }
@@ -4405,14 +4595,24 @@ int main(int argc, char** argv) {
     CreateThread(NULL, 0, parentWatchdogThread, NULL, 0, NULL);
     AGENT_LOG("serve mode: entering command loop");
 
-    /* Create handoff command pipe up-front. After relaunch, the new JVM's
-     * ForgeVM.launch() reads -Dforgevm.agent.pid and connects to this pipe;
-     * having it ready before relaunch removes any startup race. */
-    ensureCommandPipeCreated();
-
-    /* Publish dispatch context for the post-handoff command channels. */
+    /* Publish dispatch context before accepting shared command channels. */
     g_api = &api;
     g_cmdDllPath = dllPath;
+
+    /* Serve the named pipe concurrently with the spawning classloader's stdio
+     * channel. This is required even in gen-0 because Forge/ModLauncher can load
+     * ForgeVM through more than one classloader. */
+    bool sharedPipeServerStarted = false;
+    if (ensureCommandPipeCreated()) {
+        HANDLE pipeThread = CreateThread(NULL, 0, commandPipeServerThread, NULL, 0, NULL);
+        if (pipeThread != NULL) {
+            CloseHandle(pipeThread);
+            sharedPipeServerStarted = true;
+            AGENT_LOG("command pipe: shared server started for gen-0 classloaders");
+        } else {
+            AGENT_LOG("command pipe: failed to start shared server thread: %lu", GetLastError());
+        }
+    }
 
     /* Gen0 (parent-spawned) phase: commands arrive on inherited stdin, replies
      * go to stdout (tls_replySink stays null). Serialized via g_commandMutex for
@@ -4440,17 +4640,25 @@ int main(int argc, char** argv) {
     }
 
     if (g_persistAfterEOF.load()) {
-        AGENT_LOG("main: stdin EOF after relaunch — awaiting handoff on %s",
-                  g_commandPipeName.c_str());
         HANDLE hJvm = g_relaunchNewJvm.exchange(NULL);
-        HANDLE firstPipe = acceptCommandPipeClient(hJvm);
-        if (hJvm != NULL) CloseHandle(hJvm);
-        if (firstPipe != NULL && firstPipe != INVALID_HANDLE_VALUE) {
-            AGENT_LOG("main: handoff client connected — serving multi-client command channels");
-            g_persistAfterEOF.store(false);
-            runCommandPipeServer(firstPipe);   // never returns; watchdog reaps on JVM death
+        if (sharedPipeServerStarted) {
+            if (hJvm != NULL) CloseHandle(hJvm);
+            AGENT_LOG("main: stdin EOF after relaunch — shared command server remains active on %s",
+                      g_commandPipeName.c_str());
+            /* Command threads own all post-handoff traffic. The watchdog exits
+             * the process when the supervised JVM dies. */
+            for (;;) Sleep(1000);
         } else {
-            AGENT_LOG("main: handoff accept failed — exiting");
+            AGENT_LOG("main: stdin EOF after relaunch — awaiting fallback handoff on %s",
+                      g_commandPipeName.c_str());
+            HANDLE firstPipe = acceptCommandPipeClient(hJvm);
+            if (hJvm != NULL) CloseHandle(hJvm);
+            if (firstPipe != NULL && firstPipe != INVALID_HANDLE_VALUE) {
+                AGENT_LOG("main: fallback handoff client connected");
+                runCommandPipeServer(firstPipe);   // never returns
+            } else {
+                AGENT_LOG("main: fallback handoff accept failed — exiting");
+            }
         }
     }
 

@@ -12,27 +12,20 @@ import java.util.List;
  * {@code *} anchors the end. Unsupported internal
  * wildcards fail closed in the native guard instead of being silently ignored.
  *
- * <pre>{@code
- * // block any process whose path contains "processproxy":
- * ForgeVM.banProcessCreate(ProcessFilter.Blacklist("*processproxy*"));
- *
- * // allow only java and javaw, block everything else:
- * ForgeVM.banProcessCreate(ProcessFilter.Whitelist("*\\java.exe", "*\\javaw.exe"));
- *
- * // multiple patterns:
- * ForgeVM.banProcessCreate(ProcessFilter.Blacklist("*cheat*", "*inject*"));
- * }</pre>
+ * <p>Explicit source selectors match the first non-bootstrap Java caller as
+ * {@code class:...}, {@code module:...}, or {@code code:...}. A rule containing
+ * both selectors requires both the child command and caller source to match.</p>
  */
 public final class ProcessFilter {
 
     public enum Mode { BLACKLIST, WHITELIST }
 
     private final Mode mode;
-    private final List<String> patterns;
+    private final List<InterceptionRule> rules;
 
-    private ProcessFilter(Mode mode, List<String> patterns) {
+    private ProcessFilter(Mode mode, List<InterceptionRule> rules) {
         this.mode = mode;
-        this.patterns = patterns;
+        this.rules = rules;
     }
 
     /** Block processes whose image path matches any of the given patterns. Allow everything else. */
@@ -45,18 +38,19 @@ public final class ProcessFilter {
         return build(Mode.WHITELIST, patterns);
     }
 
+    public static ProcessFilter Blacklist(InterceptionRule first, InterceptionRule... rest) {
+        return new ProcessFilter(Mode.BLACKLIST, FilterRuleSupport.explicit(first, rest));
+    }
+
+    public static ProcessFilter Whitelist(InterceptionRule first, InterceptionRule... rest) {
+        return new ProcessFilter(Mode.WHITELIST, FilterRuleSupport.explicit(first, rest));
+    }
+
     public Mode mode() { return mode; }
-    public List<String> patterns() { return patterns; }
+    public List<InterceptionRule> rules() { return rules; }
+    public List<String> patterns() { return FilterRuleSupport.legacyPatterns(rules); }
 
     private static ProcessFilter build(Mode mode, String[] patterns) {
-        if (patterns == null || patterns.length == 0) {
-            throw new IllegalArgumentException("patterns must not be empty");
-        }
-        for (String p : patterns) {
-            if (p == null || p.isBlank()) {
-                throw new IllegalArgumentException("pattern must not be null or blank");
-            }
-        }
-        return new ProcessFilter(mode, List.of(patterns));
+        return new ProcessFilter(mode, FilterRuleSupport.names(patterns));
     }
 }

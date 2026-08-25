@@ -22,6 +22,10 @@ import java.util.List;
  * // multiple patterns:
  * ForgeVM.banJavaAgent(AgentFilter.Blacklist("*evil*", "*trojan*"));
  * }</pre>
+ *
+ * <p>This filter intentionally supports agent path/name matching only. The
+ * Windows attach entry does not expose an authenticated creator or source JAR
+ * identity, so ForgeVM does not publish a source-rule overload for agents.</p>
  */
 public final class AgentFilter {
 
@@ -49,14 +53,6 @@ public final class AgentFilter {
     public List<String> patterns() { return patterns; }
 
     private static AgentFilter build(Mode mode, String[] patterns) {
-        if (patterns == null || patterns.length == 0) {
-            throw new IllegalArgumentException("patterns must not be empty");
-        }
-        for (String p : patterns) {
-            if (p == null || p.isBlank()) {
-                throw new IllegalArgumentException("pattern must not be null or blank");
-            }
-        }
-        return new AgentFilter(mode, List.of(patterns));
+        return new AgentFilter(mode, FilterRuleSupport.patterns(patterns));
     }
 }
