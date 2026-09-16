@@ -9,6 +9,8 @@ package forgevm.forge;
  *
  * <h2>Control flow</h2>
  * <ul>
+ *   <li>{@link #getOriginalReturnValue()} -- inspect the value already computed
+ *       by the target method at a non-void {@code RETURN} injection.</li>
  *   <li>{@link #setReturnValue(Object)} -- skip the original method and return a
  *       specific value. For primitive return types, pass the boxed equivalent
  *       (e.g. {@code 20.0f} for a {@code float} method).</li>
@@ -34,6 +36,7 @@ public final class FvmCallback {
 
     private final Object instance;
     private final Object[] args;
+    private final Object originalReturnValue;
     private Object returnValue;
     private boolean cancelled;
 
@@ -44,8 +47,7 @@ public final class FvmCallback {
      * @param instance the target method's {@code this}, or {@code null} for static methods
      */
     public FvmCallback(Object instance) {
-        this.instance = instance;
-        this.args = null;
+        this(instance, null, null);
     }
 
     /**
@@ -56,8 +58,54 @@ public final class FvmCallback {
      * @param args the target method's arguments (reference types only; primitives are boxed)
      */
     public FvmCallback(Object instance, Object[] args) {
+        this(instance, args, null);
+    }
+
+    private FvmCallback(Object instance, Object[] args, Object originalReturnValue) {
         this.instance = instance;
         this.args = args;
+        this.originalReturnValue = originalReturnValue;
+    }
+
+    /**
+     * Creates the callback used by injected {@code RETURN} bytecode.
+     * This transformer entry point is public only because hooks may target a
+     * class in any package; user hooks should not call it directly.
+     */
+    public static FvmCallback forReturn(Object value, Object instance, Object[] args) {
+        return new FvmCallback(instance, args, value);
+    }
+
+    public static FvmCallback forReturn(boolean value, Object instance, Object[] args) {
+        return forReturn(Boolean.valueOf(value), instance, args);
+    }
+
+    public static FvmCallback forReturn(byte value, Object instance, Object[] args) {
+        return forReturn(Byte.valueOf(value), instance, args);
+    }
+
+    public static FvmCallback forReturn(char value, Object instance, Object[] args) {
+        return forReturn(Character.valueOf(value), instance, args);
+    }
+
+    public static FvmCallback forReturn(short value, Object instance, Object[] args) {
+        return forReturn(Short.valueOf(value), instance, args);
+    }
+
+    public static FvmCallback forReturn(int value, Object instance, Object[] args) {
+        return forReturn(Integer.valueOf(value), instance, args);
+    }
+
+    public static FvmCallback forReturn(float value, Object instance, Object[] args) {
+        return forReturn(Float.valueOf(value), instance, args);
+    }
+
+    public static FvmCallback forReturn(long value, Object instance, Object[] args) {
+        return forReturn(Long.valueOf(value), instance, args);
+    }
+
+    public static FvmCallback forReturn(double value, Object instance, Object[] args) {
+        return forReturn(Double.valueOf(value), instance, args);
     }
 
     /**
@@ -104,6 +152,21 @@ public final class FvmCallback {
     /** Returns the value set by {@link #setReturnValue(Object)}, or {@code null} if not set. */
     public Object getReturnValue() {
         return returnValue;
+    }
+
+    /**
+     * Returns the value computed by the target method before a {@code RETURN}
+     * hook runs.
+     *
+     * <p>Primitive results are boxed. This value is independent of the
+     * replacement supplied to {@link #setReturnValue(Object)}. For injection
+     * points other than {@code RETURN}, and for {@code void} methods, this
+     * method returns {@code null}.
+     *
+     * @return the target method's original return value, or {@code null}
+     */
+    public Object getOriginalReturnValue() {
+        return originalReturnValue;
     }
 
     /**

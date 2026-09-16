@@ -305,7 +305,16 @@ boolean removed = ForgeVM.forge().unload(LoginAudit.class);
 | `FIELD_PUT("health:F")` | 指定字段写入前。 |
 | `NEW("java.util.ArrayList")` | 指定对象创建前。 |
 
-回调不设置返回值时，原方法继续执行；`callback.cancel()` 用于取消 void 方法；`callback.setReturnValue(value)` 用于跳过原方法并返回值。注入方法必须是 `public static void method(FvmCallback)`。
+回调不设置返回值时，原方法继续执行；`callback.cancel()` 用于取消 void 方法；`callback.setReturnValue(value)` 用于跳过原方法并返回值。在非 void 方法的 `RETURN` 注入中，`callback.getOriginalReturnValue()` 可读取目标方法已经计算出的原始返回值（基本类型会装箱），且不受后续 `setReturnValue(...)` 影响。其他注入点及 void 方法返回 `null`。注入方法必须是 `public static void method(FvmCallback)`。
+
+```java
+public static void afterTooltip(FvmCallback callback) {
+    @SuppressWarnings("unchecked")
+    List<Component> tooltip =
+        (List<Component>) callback.getOriginalReturnValue();
+    tooltip.add(...);
+}
+```
 
 同一目标类的卸载以类级别回滚进行。若多个 ingot 作用于该类，ForgeVM 会先回滚类计划，再重新应用仍应保留的 ingot。批量 `load(...)` 优先以一个计划提交，减少重复挂起与去优化。
 
@@ -679,7 +688,16 @@ boolean removed = ForgeVM.forge().unload(LoginAudit.class);
 | `FIELD_PUT("health:F")` | Before a matching field write. |
 | `NEW("java.util.ArrayList")` | Before a matching object allocation. |
 
-If a callback leaves its return value untouched, the original method continues. `callback.cancel()` skips a void method; `callback.setReturnValue(value)` skips the original method and supplies its return value. An ingot must expose `public static void method(FvmCallback)`.
+If a callback leaves its return value untouched, the original method continues. `callback.cancel()` skips a void method; `callback.setReturnValue(value)` skips the original method and supplies its return value. In a `RETURN` injection on a non-void method, `callback.getOriginalReturnValue()` exposes the value already computed by the target method (boxed for primitive returns) and remains unchanged by `setReturnValue(...)`. It returns `null` at other injection points and for void methods. An ingot must expose `public static void method(FvmCallback)`.
+
+```java
+public static void afterTooltip(FvmCallback callback) {
+    @SuppressWarnings("unchecked")
+    List<Component> tooltip =
+        (List<Component>) callback.getOriginalReturnValue();
+    tooltip.add(...);
+}
+```
 
 Unloading is class-plan based. If multiple ingots target a class, ForgeVM restores that class plan and reapplies the surviving ingots. Batch `load(...)` uses a shared plan where possible to avoid repeated suspension and deoptimization.
 

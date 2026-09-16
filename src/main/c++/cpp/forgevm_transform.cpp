@@ -1505,13 +1505,14 @@ struct HookData {
     /* Resolved Klass / Method addresses */
     uint64_t hookKlassAddr = 0, cbKlassAddr = 0;
     uint64_t objectKlassAddr = 0, unboxKlassAddr = 0;
-    uint64_t hookMethodAddr = 0, cbInitAddr = 0;
+    uint64_t hookMethodAddr = 0, cbInitAddr = 0, cbReturnFactoryAddr = 0;
     uint64_t cbIsCancelledAddr = 0, cbGetReturnAddr = 0;
     uint64_t unboxMethodAddr = 0;
 
     /* Interned symbols */
     uint64_t symHookClass = 0, symHookMethod = 0, symHookDesc = 0;
     uint64_t symCbClass = 0, symInit = 0, symInitDesc = 0;
+    uint64_t symReturnFactory = 0, symReturnFactoryDesc = 0;
     uint64_t symIsCancelled = 0, symIsCancelledD = 0;
     uint64_t symGetRetVal = 0, symGetRetValD = 0;
     uint64_t symObjectClass = 0;
@@ -1520,7 +1521,8 @@ struct HookData {
     /* Assigned layout (filled by assignPoolLayout) */
     uint32_t cpBase           = 0;
     int      hookCacheIdx     = 0, initCacheIdx   = 0;
-    int      cancelCacheIdx   = 0, retValCacheIdx = 0, unboxCacheIdx = 0;
+    int      cancelCacheIdx   = 0, retValCacheIdx = 0;
+    int      returnFactoryCacheIdx = 0, unboxCacheIdx = 0;
     int      hookClassRKIdx   = 0, cbClassRKIdx   = 0;
     int      objectClassRKIdx = 0, unboxClassRKIdx = 0;
     uint16_t cbClassCpIdx     = 0, objClassCpIdx  = 0;
@@ -1559,14 +1561,21 @@ struct HookData {
     bool wantObjectCpEntry() const {
         return (hasArgCapture && !targetParams.empty()) || needObjectCp;
     }
+    bool hasReturnFactory() const {
+        return injectAt == "RETURN" && !targetReturnDesc.empty() &&
+               targetReturnDesc[0] != 'V';
+    }
     uint32_t numCPEntries() const {
         uint32_t n = 20;
+        if (hasReturnFactory()) n += 4;
         if (wantObjectCpEntry()) n += 2;
         if (needsUnbox) n += 6;
         n += (uint32_t)extraClasses.size() * 2;
         return n;
     }
-    uint32_t numCacheEntries() const { return needsUnbox ? 5u : 4u; }
+    uint32_t numCacheEntries() const {
+        return 4u + (hasReturnFactory() ? 1u : 0u) + (needsUnbox ? 1u : 0u);
+    }
     uint32_t numRKEntries()    const {
         uint32_t n = 2;
         if (wantObjectCpEntry()) n++;
@@ -1701,6 +1710,16 @@ static bool resolveHookData(uint64_t klassAddr,
     if (!findMethodInKlass(out.cbKlassAddr, "isCancelled",     "()Z",                                      &out.cbIsCancelledAddr)) return false;
     if (!findMethodInKlass(out.cbKlassAddr, "getReturnValue",  "()Ljava/lang/Object;",                     &out.cbGetReturnAddr))   return false;
 
+    if (out.hasReturnFactory()) {
+        char c = out.targetReturnDesc[0];
+        std::string valueDesc = (c == 'L' || c == '[') ? "Ljava/lang/Object;"
+                                                       : out.targetReturnDesc.substr(0, 1);
+        std::string factoryDesc = "(" + valueDesc +
+            "Ljava/lang/Object;[Ljava/lang/Object;)Lforgevm/forge/FvmCallback;";
+        if (!findMethodInKlass(out.cbKlassAddr, "forReturn", factoryDesc.c_str(),
+                               &out.cbReturnFactoryAddr)) return false;
+    }
+
     /* java/lang/Object — needed for anewarray (arg capture) and/or as the
        supertype for ITEM_Object verification types in the rebuilt
        StackMapTable. */
@@ -1724,6 +1743,9 @@ static bool resolveHookData(uint64_t klassAddr,
     if (!readMethodSymbols(out.cbInitAddr,        &out.symInit,         &out.symInitDesc))   return false;
     if (!readMethodSymbols(out.cbIsCancelledAddr, &out.symIsCancelled,  &out.symIsCancelledD)) return false;
     if (!readMethodSymbols(out.cbGetReturnAddr,   &out.symGetRetVal,    &out.symGetRetValD)) return false;
+    if (out.hasReturnFactory() &&
+        !readMethodSymbols(out.cbReturnFactoryAddr, &out.symReturnFactory,
+                           &out.symReturnFactoryDesc)) return false;
     if (out.hasArgCapture || out.needObjectCp) {
         out.symObjectClass = readKlassNameSymbol(out.objectKlassAddr);
         if (!out.symObjectClass) { out.hasArgCapture = false; out.needObjectCp = false; }
@@ -1736,7 +1758,9 @@ static bool resolveHookData(uint64_t klassAddr,
     if (!out.symHookClass || !out.symHookMethod || !out.symHookDesc ||
         !out.symCbClass   || !out.symInit       || !out.symInitDesc  ||
         !out.symIsCancelled || !out.symIsCancelledD ||
-        !out.symGetRetVal   || !out.symGetRetValD) {
+        !out.symGetRetVal   || !out.symGetRetValD ||
+        (out.hasReturnFactory() &&
+         (!out.symReturnFactory || !out.symReturnFactoryDesc))) {
         setError("failed_to_read_interned_symbols"); return false;
     }
 
@@ -1789,12 +1813,14 @@ static void assignPoolLayout(uint32_t oldPoolLen, int32_t origRKLen, int origCac
         h.initCacheIdx   = cacheCur++;
         h.cancelCacheIdx = cacheCur++;
         h.retValCacheIdx = cacheCur++;
+        if (h.hasReturnFactory()) h.returnFactoryCacheIdx = cacheCur++;
         if (h.needsUnbox) h.unboxCacheIdx = cacheCur++;
 
         uint32_t P = h.cpBase;
         h.cbClassCpIdx = (uint16_t)(P + 11);
 
         uint32_t E = 20;
+        if (h.hasReturnFactory()) E += 4;
         if (h.wantObjectCpEntry()) {
             h.objClassCpIdx = (uint16_t)(P + E + 1);
             E += 2;
@@ -1938,6 +1964,14 @@ static std::vector<uint8_t> buildPoolBytes(
         slots[P+18] = (uint64_t)(((uint32_t)(P+14) << 16) | (uint32_t)(P+11));
         slots[P+19] = (uint64_t)(((uint32_t)(P+15) << 16) | (uint32_t)(P+11));
 
+        if (h.hasReturnFactory()) {
+            slots[P+20] = h.symReturnFactory;
+            slots[P+21] = h.symReturnFactoryDesc;
+            slots[P+22] = (uint64_t)(((uint32_t)(P+21) << 16) | (uint32_t)(P+20));
+            slots[P+23] = (uint64_t)(((uint32_t)(P+22) << 16) | (uint32_t)(P+11));
+            E += 4;
+        }
+
         if (h.wantObjectCpEntry()) {
             slots[P+E]   = h.symObjectClass;
             slots[P+E+1] = (uint64_t)(((uint32_t)(P+E) << 16) | (uint32_t)h.objectClassRKIdx);
@@ -1989,6 +2023,9 @@ static std::vector<uint8_t> buildPoolTagsBytes(
         td[P+10]=7; td[P+11]=7;
         td[P+12]=12; td[P+13]=12; td[P+14]=12; td[P+15]=12;
         td[P+16]=10; td[P+17]=10; td[P+18]=10; td[P+19]=10;
+        if (h.hasReturnFactory()) {
+            td[P+20]=1; td[P+21]=1; td[P+22]=12; td[P+23]=10; E+=4;
+        }
         if (h.wantObjectCpEntry()) { td[P+E]=1; td[P+E+1]=7; E+=2; }
         if (h.needsUnbox) { td[P+E]=1; td[P+E+1]=1; td[P+E+2]=1; td[P+E+3]=7; td[P+E+4]=12; td[P+E+5]=10; E+=6; }
         for (auto& ex : h.extraClasses) {
@@ -2029,14 +2066,15 @@ static void fillPoolCacheTail(
 
     for (auto& hk : hooks) {
         int numEnt = (int)hk.numCacheEntries();
-        int cpIdxTable[5] = {
+        std::vector<int> cpIdxTable = {
             (int)(hk.cpBase + 16), (int)(hk.cpBase + 17),
             (int)(hk.cpBase + 18), (int)(hk.cpBase + 19),
-            hk.needsUnbox ? (int)(hk.cpBase + hk.unboxMethodrefCpOff) : 0,
         };
-        uint8_t  bcTable[5]     = { 0xB8, 0xB7, 0xB7, 0xB7, 0xB7 };
-        uint64_t methodTable[5] = { hk.hookMethodAddr, hk.cbInitAddr,
-                                    hk.cbIsCancelledAddr, hk.cbGetReturnAddr, hk.unboxMethodAddr };
+        std::vector<uint8_t> bcTable = { 0xB8, 0xB7, 0xB7, 0xB7 };
+        std::vector<uint64_t> methodTable = {
+            hk.hookMethodAddr, hk.cbInitAddr,
+            hk.cbIsCancelledAddr, hk.cbGetReturnAddr,
+        };
 
         int unboxTos = 4;
         if (hk.needsUnbox) {
@@ -2046,11 +2084,25 @@ static void fillPoolCacheTail(
                 case 0xB0: unboxTos=8; break; default: unboxTos=9; break;
             }
         }
-        int64_t flagsTable[5] = {
+        std::vector<int64_t> flagsTable = {
             ((int64_t)9<<28)|1, ((int64_t)9<<28)|3,
             ((int64_t)4<<28)|1, ((int64_t)8<<28)|1,
-            hk.needsUnbox ? (((int64_t)unboxTos<<28)|1) : 0LL,
         };
+
+        if (hk.hasReturnFactory()) {
+            cpIdxTable.push_back((int)(hk.cpBase + 23));
+            bcTable.push_back(0xB8);
+            methodTable.push_back(hk.cbReturnFactoryAddr);
+            char c = hk.targetReturnDesc.empty() ? 'V' : hk.targetReturnDesc[0];
+            int parameterSlots = (c == 'J' || c == 'D') ? 4 : 3;
+            flagsTable.push_back(((int64_t)8<<28) | parameterSlots);
+        }
+        if (hk.needsUnbox) {
+            cpIdxTable.push_back((int)(hk.cpBase + hk.unboxMethodrefCpOff));
+            bcTable.push_back(0xB7);
+            methodTable.push_back(hk.unboxMethodAddr);
+            flagsTable.push_back(((int64_t)unboxTos<<28)|1);
+        }
 
         for (int i = 0; i < numEnt; i++) {
             size_t eOff = (size_t)cacheHdrSize + (size_t)(hk.hookCacheIdx + i) * (size_t)cacheEntrySize;
@@ -3297,6 +3349,8 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
     uint16_t initCI16   = (uint16_t)h.initCacheIdx;
     uint16_t cancelCI16 = (uint16_t)h.cancelCacheIdx;
     uint16_t retValCI16 = (uint16_t)h.retValCacheIdx;
+    uint16_t factoryCI16 = h.hasReturnFactory()
+                         ? (uint16_t)h.returnFactoryCacheIdx : 0;
     uint16_t unboxCI16  = h.needsUnbox ? (uint16_t)h.unboxCacheIdx : 0;
 
     /* cancelReturn sequence */
@@ -3313,10 +3367,7 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
     }
     int16_t ifeqOff = (int16_t)(3 + (int)cancelReturn.size());
 
-    /* emitCallbackPrologue inline helper */
-    auto emitPrologue = [&](std::vector<uint8_t>& bc) {
-        bc.push_back(0xBB); emitIdx(bc, h.cbClassCpIdx);
-        bc.push_back(0x59);
+    auto emitCallbackContext = [&](std::vector<uint8_t>& bc) {
         if (h.targetIsStatic) bc.push_back(0x01); else bc.push_back(0x2A);
         if (!h.hasArgCapture || h.targetParams.empty()) {
             bc.push_back(0x01);
@@ -3334,13 +3385,36 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
                 bc.push_back(0x53);
             }
         }
-        bc.push_back(0xB7); emitNI(bc, initCI16);
+    };
+
+    auto emitCallbackDispatch = [&](std::vector<uint8_t>& bc) {
+        /* Stack on entry: [..., callback]. Keep one callback for either the
+           replacement-return path or the fall-through pop. */
         bc.push_back(0x59); bc.push_back(0x59);
         bc.push_back(0xB8); emitNI(bc, hookCI16);
         bc.push_back(0xB7); emitNI(bc, cancelCI16);
         bc.push_back(0x99); bc.push_back((uint8_t)(ifeqOff>>8)); bc.push_back((uint8_t)(ifeqOff&0xFF));
         bc.insert(bc.end(), cancelReturn.begin(), cancelReturn.end());
         bc.push_back(0x57);
+    };
+
+    /* Callback prologue for HEAD and instruction injection points. */
+    auto emitPrologue = [&](std::vector<uint8_t>& bc) {
+        bc.push_back(0xBB); emitIdx(bc, h.cbClassCpIdx);
+        bc.push_back(0x59);
+        emitCallbackContext(bc);
+        bc.push_back(0xB7); emitNI(bc, initCI16);
+        emitCallbackDispatch(bc);
+    };
+
+    /* RETURN keeps the raw result for the eventual *return, duplicates it for
+       FvmCallback.forReturn(...), and lets Java perform primitive boxing. */
+    auto emitReturnPrologue = [&](std::vector<uint8_t>& bc) {
+        char c = h.targetReturnDesc.empty() ? 'V' : h.targetReturnDesc[0];
+        bc.push_back((c == 'J' || c == 'D') ? 0x5C : 0x59); /* dup2 / dup */
+        emitCallbackContext(bc);
+        bc.push_back(0xB8); emitNI(bc, factoryCI16);
+        emitCallbackDispatch(bc);
     };
 
     /* buildTrampoline inline helper */
@@ -3656,7 +3730,8 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
         }
 
         size_t tailBCI = newBytecode.size();
-        emitPrologue(newBytecode);
+        if (h.hasReturnFactory()) emitReturnPrologue(newBytecode);
+        else emitPrologue(newBytecode);                  /* void RETURN */
         size_t popBCI = newBytecode.size() - 1;          /* the trailing `pop` (0x57) */
         newBytecode.push_back(retOp);
         for (size_t r=0; r<retFi.size(); r++) patchGW(newBytecode, retFi[r], retBCI[r], tailBCI);
@@ -4092,7 +4167,10 @@ static bool buildHookCM(HookData& h, uint64_t newPoolRemoteAddr) {
     int64_t maxStkOff = structOffset("ConstMethod", "_max_stack");
     if (maxStkOff >= 0) {
         uint16_t origMS=0; memcpy(&origMS, h.newCMBytes.data()+maxStkOff, 2);
-        uint16_t need=(uint16_t)((h.hasArgCapture&&!h.targetParams.empty()?7:4) + h.extraMaxStack);
+        /* RETURN duplicates the original value before creating the callback;
+           long/double therefore need two additional slots. Keep the slightly
+           conservative bound for all injection kinds. */
+        uint16_t need=(uint16_t)((h.hasArgCapture&&!h.targetParams.empty()?9:6) + h.extraMaxStack);
         if (origMS < need) memcpy(h.newCMBytes.data()+maxStkOff, &need, 2);
     }
 

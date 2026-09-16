@@ -30,6 +30,9 @@ package forgevm.forge;
  *
  * <h2>Hook method behavior</h2>
  * <ul>
+ *   <li>At a non-void {@link #RETURN} injection, call
+ *       {@link FvmCallback#getOriginalReturnValue()} to inspect the value
+ *       computed by the target method.</li>
  *   <li>Call {@link FvmCallback#setReturnValue(Object)} -- skip the original method
  *       and return the given value (boxed primitives for primitive return types).</li>
  *   <li>Call {@link FvmCallback#cancel()} -- skip the original method (void methods).</li>
