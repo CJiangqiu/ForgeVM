@@ -1,0 +1,13 @@
+arguments=--init-script C\:\\Users\\17787\\.local\\share\\opencode\\bin\\jdtls\\config_win\\org.eclipse.osgi\\57\\0\\.cp\\gradle\\init\\init.gradle
+auto.sync=false
+build.scans.enabled=false
+connection.gradle.distribution=GRADLE_DISTRIBUTION(WRAPPER)
+connection.project.dir=
+eclipse.preferences.version=1
+gradle.user.home=C\:/Users/17787/scoop/apps/gradle/current/.gradle
+java.home=C\:/Program Files/Java/jdk-21.0.10
+jvm.arguments=
+offline.mode=false
+override.workspace.settings=true
+show.console.view=true
+show.executions.view=true

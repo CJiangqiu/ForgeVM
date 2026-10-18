@@ -96,9 +96,9 @@ ForgeVM.launch(ForgeVMOptions.builder()
 | 选项 | 默认值 | 作用 |
 | --- | --- | --- |
 | `window` | `false` | 打开 agent 的状态与命令窗口。非 FVM relaunch 导致 JVM 消失时，agent 记录日志后干净退出。 |
-| `lockJvm` | `false` | 开启 JVM 生命周期守护，强制打开窗口。包含 DACL 终止权限锁、`Shutdown.halt()` 内进程拦截、以及崩溃后最多 4 次连续复活。 |
+| `lockJvm` | `false` | 开启 JVM 生命周期守护，强制打开窗口。包含 Java 退出入口、`JVM_Halt`、`NtTerminateProcess`、DACL 四层终止保护，以及崩溃后最多 4 次连续复活。 |
 
-开启 `lockJvm` 后，agent 会先保留一个仅供 FVM 使用的终止句柄，再拒绝后续句柄请求 `PROCESS_TERMINATE` 权限；同时 hook `jvm.dll!JVM_Halt` 阻断 Java 层 `Shutdown.halt()` 自尽路径。FVM 授权退出通过保留句柄的 `TerminateProcess`，不经过 `JVM_Halt`，不受影响。
+开启 `lockJvm` 后，agent 会先把 `System.exit`、`Runtime.exit/halt` 和已加载的 `Shutdown.exit/halt` 改为在进入 shutdown 状态、运行关闭钩子之前直接返回；随后以 `jvm.dll!JVM_Halt` 和进程内 `NtTerminateProcess` hook 覆盖绕过 Java 入口的路径，并通过 DACL 阻止外部进程重新打开终止句柄。FVM 授权退出使用预留句柄执行 `TerminateProcess`，不经过上述进程内链路。
 
 若 JVM 仍因崩溃、已有终止句柄、管理员权限或内核级手段而结束，watchdog 会重新创建 JVM，重新绑定 agent，并在 `jvm.dll` 可用后恢复已启用的 hook。每次成功 bootstrap 后重置连续死亡计数器；连续 4 次复活失败则 agent 放行 halt hook、记录日志后退出。
 
@@ -452,9 +452,9 @@ ForgeVM.launch(ForgeVMOptions.builder()
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `window` | `false` | Opens the agent status and command window. Agent exits cleanly (with a log entry) when the JVM disappears without a relaunch handoff. |
-| `lockJvm` | `false` | Protects the JVM lifecycle, forces the window on. Includes DACL termination lock, `Shutdown.halt()` interception, and up to 4 consecutive crash-recovery attempts. |
+| `lockJvm` | `false` | Protects the JVM lifecycle and forces the window on. Includes layered Java exit-entry, `JVM_Halt`, `NtTerminateProcess`, and DACL guards, plus up to 4 consecutive crash-recovery attempts. |
 
-With `lockJvm`, the agent retains an FVM-only termination handle, then denies `PROCESS_TERMINATE` to subsequently opened handles; it also hooks `jvm.dll!JVM_Halt` to block in-process `Shutdown.halt()`. FVM-authorized exits go through `TerminateProcess` on the retained handle, never touching `JVM_Halt`.
+With `lockJvm`, the agent makes `System.exit`, `Runtime.exit/halt`, and loaded `Shutdown.exit/halt` return before shutdown state or hooks are entered. `jvm.dll!JVM_Halt` and in-process `NtTerminateProcess` hooks cover bypasses below Java, while the DACL denies newly opened external termination handles. FVM-authorized exits use `TerminateProcess` on the retained handle and do not traverse the in-process shutdown chain.
 
 If the JVM still exits through a crash, an existing handle, administrator privileges, or kernel-level code, the watchdog recreates it, rebinds the agent, and restores hooks once `jvm.dll` is available. Each successful bootstrap resets the consecutive-death counter. After 4 consecutive failed recoveries the agent releases the halt hook, logs the event, and exits.
 

@@ -37,9 +37,10 @@ public final class ForgeVMOptions {
     }
 
     /**
-     * Whether the agent protects the JVM lifecycle: DACL termination lock,
-     * {@code Shutdown.halt()} interception, and guard recovery (up to 4
-     * consecutive attempts). Implies {@link #window()}. */
+     * Whether the agent protects the JVM lifecycle through layered Java exit
+     * entry, {@code JVM_Halt}, {@code NtTerminateProcess}, and DACL guards,
+     * plus guard recovery (up to 4 consecutive attempts). Implies
+     * {@link #window()}. */
     public boolean lockJvm() {
         return lockJvm;
     }

@@ -62,6 +62,20 @@ static uint64_t g_klassCacheMisses = 0;
 static uint64_t g_methodCacheHits = 0;
 static uint64_t g_methodCacheMisses = 0;
 
+/* The agent survives relaunches, but every metadata address above belongs to
+ * one target address space.  Clear it transactionally whenever native
+ * bootstrap switches PID. */
+void resetTransformStateForNewTarget() {
+    std::lock_guard<std::mutex> guard(g_transformLock);
+    g_plans.clear();
+    g_pendingTransforms.clear();
+    g_klassNameCache.clear();
+    g_methodCache.clear();
+    g_klassMethodsScanned.clear();
+    g_klassCacheHits = g_klassCacheMisses = 0;
+    g_methodCacheHits = g_methodCacheMisses = 0;
+}
+
 static std::string methodCacheKey(uint64_t klassAddr, const char* methodName, const char* paramDesc) {
     char buf[32];
     snprintf(buf, sizeof(buf), "%llX#", (unsigned long long)klassAddr);
@@ -887,6 +901,213 @@ static bool clearMethodBody(uint64_t klassAddr, const char* methodName) {
     FVM_LOG("purge_agent: cleared method '%s' bytecode (%u bytes) at 0x%llX",
             methodName, codeSize, bytecodeStart);
     return true;
+}
+
+/* ============================================================
+ * Java exit guard
+ *
+ * JVM_Halt is the final native step of System.exit(), after Shutdown.exit has
+ * already run hooks and transitioned JVM-global shutdown state.  Blocking only
+ * there can preserve the process while leaving the application half-dead.
+ * Patch the Java entry layers to a bare return, keeping JVM_Halt and
+ * NtTerminateProcess as bypass-resistant lower-level fallbacks.
+ * ============================================================ */
+struct JavaExitMethodPatch {
+    std::string className;
+    std::string methodName;
+    std::string descriptor;
+    uint64_t bytecodeStart = 0;
+    std::vector<uint8_t> original;
+    std::vector<uint8_t> guarded;
+};
+
+static std::vector<JavaExitMethodPatch> g_javaExitPatches;
+static DWORD g_javaExitPatchPid = 0;
+
+static bool javaExitMethodAlreadyPatched(const char* className, const char* methodName) {
+    for (const JavaExitMethodPatch& patch : g_javaExitPatches) {
+        if (patch.className == className && patch.methodName == methodName) return true;
+    }
+    return false;
+}
+
+static bool patchJavaExitMethod(const char* className, const char* methodName,
+                                const char* descriptor, bool required) {
+    if (javaExitMethodAlreadyPatched(className, methodName)) return true;
+
+    uint64_t klassAddr = 0;
+    if (!findInstanceKlassByName(className, &klassAddr)) {
+        FVM_LOG("java_exit_guard: %s.%s not loaded%s", className, methodName,
+                required ? " (required)" : " (will retry)");
+        return !required;
+    }
+    uint64_t methodAddr = 0;
+    if (!findMethodInKlass(klassAddr, methodName, descriptor, &methodAddr) || methodAddr == 0) {
+        FVM_LOG("java_exit_guard: %s.%s%s not found", className, methodName, descriptor);
+        return !required;
+    }
+
+    int64_t constMethodOff = structOffset("Method", "_constMethod");
+    if (constMethodOff < 0) constMethodOff = 8;
+    uint64_t constMethodAddr = 0;
+    if (!readRemotePointer(g_target.handle, methodAddr + (uint64_t)constMethodOff,
+                           &constMethodAddr) || constMethodAddr == 0) return false;
+
+    JavaExitMethodPatch patch;
+    patch.className = className;
+    patch.methodName = methodName;
+    patch.descriptor = descriptor;
+    uint32_t codeSize = 0;
+    if (!readConstMethodBytecode(constMethodAddr, &patch.original,
+                                 &patch.bytecodeStart, &codeSize)
+            || codeSize == 0 || patch.bytecodeStart == 0) return false;
+    patch.guarded.assign(codeSize, 0x00);
+    patch.guarded[0] = 0xB1; // return void before Shutdown state/hooks are touched
+    if (!writeRemoteMem(g_target.handle, patch.bytecodeStart,
+                        patch.guarded.data(), patch.guarded.size())) return false;
+
+    FVM_LOG("java_exit_guard: patched %s.%s%s (%u bytes) at 0x%llX",
+            className, methodName, descriptor, codeSize,
+            (unsigned long long)patch.bytecodeStart);
+    g_javaExitPatches.push_back(std::move(patch));
+    return true;
+}
+
+extern "C" __declspec(dllexport) int forgevm_install_java_exit_guard() {
+    if (g_target.handle == NULL || !g_target.structMapReady) {
+        setError("not_bootstrapped");
+        return 0;
+    }
+    std::lock_guard<std::mutex> guard(g_transformLock);
+    if (g_javaExitPatchPid != g_target.pid) {
+        g_javaExitPatches.clear();
+        g_javaExitPatchPid = g_target.pid;
+    }
+
+    // Additional classloaders bootstrap the same agent. Do not suspend and
+    // deoptimize an already protected JVM on every attachment. The integrity
+    // patrol also picks up Shutdown if that class is loaded later.
+    if (javaExitMethodAlreadyPatched("java/lang/System", "exit")
+            && javaExitMethodAlreadyPatched("java/lang/Runtime", "exit")
+            && javaExitMethodAlreadyPatched("java/lang/Runtime", "halt")) {
+        setError("ok");
+        return 1;
+    }
+
+    std::vector<DWORD> threads;
+    if (!suspendTargetThreads(g_target.pid, threads)) {
+        setError("java_exit_guard_suspend_failed");
+        return 0;
+    }
+
+    /* System and Runtime are the public/high-level boundary and must exist.
+     * Shutdown is normally already loaded (shutdown-hook registration loads it),
+     * but remains optional here and is picked up by subsequent integrity ticks
+     * if a minimal JVM has not loaded it yet. */
+    bool ok = patchJavaExitMethod("java/lang/System", "exit", "(I)V", true)
+           && patchJavaExitMethod("java/lang/Runtime", "exit", "(I)V", true)
+           && patchJavaExitMethod("java/lang/Runtime", "halt", "(I)V", true);
+    if (ok) {
+        patchJavaExitMethod("java/lang/Shutdown", "exit", "(I)V", false);
+        patchJavaExitMethod("java/lang/Shutdown", "halt", "(I)V", false);
+    }
+    if (!ok) {
+        for (const JavaExitMethodPatch& patch : g_javaExitPatches) {
+            writeRemoteMem(g_target.handle, patch.bytecodeStart,
+                           patch.original.data(), patch.original.size());
+        }
+        g_javaExitPatches.clear();
+    }
+    resumeTargetThreads(threads);
+    if (!ok) {
+        setError("java_exit_guard_install_failed");
+        return 0;
+    }
+    forceDeoptimizeAll();
+    setError("ok");
+    return 1;
+}
+
+extern "C" __declspec(dllexport) int forgevm_verify_java_exit_guard() {
+    if (g_target.handle == NULL || g_javaExitPatchPid != g_target.pid) {
+        setError("java_exit_guard_not_installed");
+        return -1;
+    }
+    std::lock_guard<std::mutex> guard(g_transformLock);
+    std::vector<size_t> damaged;
+    for (size_t i = 0; i < g_javaExitPatches.size(); ++i) {
+        const JavaExitMethodPatch& patch = g_javaExitPatches[i];
+        std::vector<uint8_t> current(patch.guarded.size());
+        if (!readRemoteMem(g_target.handle, patch.bytecodeStart,
+                           current.data(), current.size())) {
+            setError("java_exit_guard_unreadable");
+            return -1;
+        }
+        if (current != patch.guarded) damaged.push_back(i);
+    }
+
+    /* Pick up java/lang/Shutdown if it was loaded after initial bootstrap,
+     * without suspending the JVM on every healthy 1.5-second patrol tick. */
+    bool shutdownMissing = !javaExitMethodAlreadyPatched("java/lang/Shutdown", "exit")
+                        || !javaExitMethodAlreadyPatched("java/lang/Shutdown", "halt");
+    uint64_t shutdownKlass = 0;
+    bool shutdownNowLoaded = shutdownMissing
+                          && findInstanceKlassByName("java/lang/Shutdown", &shutdownKlass);
+    if (damaged.empty() && !shutdownNowLoaded) {
+        setError("ok");
+        return 0;
+    }
+
+    std::vector<DWORD> threads;
+    if (!suspendTargetThreads(g_target.pid, threads)) {
+        setError("java_exit_guard_suspend_failed");
+        return -1;
+    }
+    int repaired = 0;
+    for (size_t index : damaged) {
+        const JavaExitMethodPatch& patch = g_javaExitPatches[index];
+        if (!writeRemoteMem(g_target.handle, patch.bytecodeStart,
+                            patch.guarded.data(), patch.guarded.size())) {
+            resumeTargetThreads(threads);
+            setError("java_exit_guard_repair_failed");
+            return -1;
+        }
+        ++repaired;
+    }
+    size_t before = g_javaExitPatches.size();
+    if (shutdownNowLoaded) {
+        patchJavaExitMethod("java/lang/Shutdown", "exit", "(I)V", false);
+        patchJavaExitMethod("java/lang/Shutdown", "halt", "(I)V", false);
+    }
+    resumeTargetThreads(threads);
+    if (g_javaExitPatches.size() != before || repaired > 0) forceDeoptimizeAll();
+    setError("ok");
+    return repaired;
+}
+
+extern "C" __declspec(dllexport) int forgevm_uninstall_java_exit_guard() {
+    if (g_target.handle == NULL || g_javaExitPatchPid != g_target.pid) return 1;
+    std::lock_guard<std::mutex> guard(g_transformLock);
+    std::vector<DWORD> threads;
+    if (!suspendTargetThreads(g_target.pid, threads)) {
+        setError("java_exit_guard_suspend_failed");
+        return 0;
+    }
+    bool ok = true;
+    for (const JavaExitMethodPatch& patch : g_javaExitPatches) {
+        if (!writeRemoteMem(g_target.handle, patch.bytecodeStart,
+                            patch.original.data(), patch.original.size())) ok = false;
+    }
+    resumeTargetThreads(threads);
+    if (!ok) {
+        setError("java_exit_guard_restore_failed");
+        return 0;
+    }
+    g_javaExitPatches.clear();
+    g_javaExitPatchPid = 0;
+    forceDeoptimizeAll();
+    setError("ok");
+    return 1;
 }
 
 /* Glob match: '*' any run, '?' single char. Case-insensitive, '\\' == '/'.

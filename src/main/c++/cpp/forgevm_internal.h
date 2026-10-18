@@ -174,6 +174,7 @@ bool resolveObjectAndKlassFromRawOop(uint64_t rawOop, DecodedObjectInfo* out);
 
 bool suspendTargetThreads(DWORD pid, std::vector<DWORD>& threadIds);
 void resumeTargetThreads(const std::vector<DWORD>& threadIds);
+void resetTransformStateForNewTarget();
 
 /* ============================================================
  * Field resolution

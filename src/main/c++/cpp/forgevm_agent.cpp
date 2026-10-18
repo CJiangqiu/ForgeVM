@@ -132,6 +132,7 @@ typedef int(__cdecl* HaltLockAllowFn)();
 typedef unsigned long long(__cdecl* FilterAuditFn)(int);
 typedef int(__cdecl* InstallSelfTerminateGuardFn)();
 typedef int(__cdecl* VerifyHookIntegrityFn)();
+typedef int(__cdecl* JavaExitGuardFn)();
 typedef int(__cdecl* ForgeClassPlanFn)(const char*, const char*, int, int, char*, int);
 typedef int(__cdecl* ForgeClassUnloadFn)(const char*, int);
 
@@ -176,6 +177,9 @@ struct NativeApi {
     FilterAuditFn filterAudit = NULL;
     InstallSelfTerminateGuardFn installSelfTerminateGuard = NULL;
     VerifyHookIntegrityFn verifyHookIntegrity = NULL;
+    JavaExitGuardFn installJavaExitGuard = NULL;
+    JavaExitGuardFn verifyJavaExitGuard = NULL;
+    JavaExitGuardFn uninstallJavaExitGuard = NULL;
 };
 
 struct AgentLockState {
@@ -888,6 +892,9 @@ bool loadNativeApi(const std::wstring& wideDllPath, const std::string& dllPathUt
     api->filterAudit        = reinterpret_cast<FilterAuditFn>(GetProcAddress(module, "forgevm_filter_audit"));
     api->installSelfTerminateGuard = reinterpret_cast<InstallSelfTerminateGuardFn>(GetProcAddress(module, "forgevm_install_self_terminate_guard"));
     api->verifyHookIntegrity      = reinterpret_cast<VerifyHookIntegrityFn>(GetProcAddress(module, "forgevm_verify_hook_integrity"));
+    api->installJavaExitGuard     = reinterpret_cast<JavaExitGuardFn>(GetProcAddress(module, "forgevm_install_java_exit_guard"));
+    api->verifyJavaExitGuard      = reinterpret_cast<JavaExitGuardFn>(GetProcAddress(module, "forgevm_verify_java_exit_guard"));
+    api->uninstallJavaExitGuard   = reinterpret_cast<JavaExitGuardFn>(GetProcAddress(module, "forgevm_uninstall_java_exit_guard"));
 
     if (api->probe == NULL || api->init == NULL) { *reason = "missing_export"; return false; }
     return true;
@@ -998,9 +1005,18 @@ void handleBootstrap(const NativeApi& api,
         }
     }
 
-    /* Install JVM_Halt hook so Shutdown.halt() cannot bypass the DACL lock.
+    /* Stop public Java exit entry points before they can enter Shutdown and run
+     * destructive hooks. JVM_Halt remains the lower-level bypass fallback.
      * FVM-authorized termination uses TerminateProcess on the retained handle
      * and never touches JVM_Halt. */
+    bool javaExitGuardInstalled = false;
+    if (jvmLockActive && api.installJavaExitGuard != NULL) {
+        javaExitGuardInstalled = api.installJavaExitGuard() == 1;
+        AGENT_LOG("guard: Java exit guard %s%s",
+                  javaExitGuardInstalled ? "installed" : "install failed: ",
+                  javaExitGuardInstalled ? "" : (api.lastError ? api.lastError() : "unknown"));
+    }
+
     bool haltLockInstalled = false;
     if (jvmLockActive && api.installHaltLock != NULL) {
         unsigned long long addr = api.installHaltLock();
@@ -1026,6 +1042,7 @@ void handleBootstrap(const NativeApi& api,
     std::vector<std::pair<std::string, std::string>> fields;
     fields.push_back({"structMapReady", structMapReady ? "true" : "false"});
     fields.push_back({"jvmLockActive", jvmLockActive ? "true" : "false"});
+    fields.push_back({"javaExitGuardInstalled", javaExitGuardInstalled ? "true" : "false"});
     fields.push_back({"haltLockInstalled", haltLockInstalled ? "true" : "false"});
     fields.push_back({"selfTerminateGuardInstalled", selfTerminateGuardInstalled ? "true" : "false"});
     if (structMapReady && api.structMapCount != NULL) {
@@ -2710,6 +2727,21 @@ static bool waitForReadyPipe(HANDLE pipe, HANDLE process, OVERLAPPED* connect,
     return false;
 }
 
+/* jvm.dll cannot be patched while the replacement is still in its initial
+ * CREATE_SUSPENDED state because it has not been mapped yet.  Once the trusted
+ * ready signal arrives, freeze the now-initialized process while the native
+ * target and all fail-closed hooks are installed. */
+typedef LONG (NTAPI* NtSuspendOrResumeProcessFn)(HANDLE);
+
+static bool setProcessSuspended(HANDLE process, bool suspended) {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == NULL) return false;
+    const char* exportName = suspended ? "NtSuspendProcess" : "NtResumeProcess";
+    auto fn = reinterpret_cast<NtSuspendOrResumeProcessFn>(GetProcAddress(ntdll, exportName));
+    if (fn == NULL) return false;
+    return fn(process) >= 0;
+}
+
 static bool installRelaunchFilters(const NativeApi& api, HANDLE process, DWORD pid,
                                    bool installAgent, bool installNative,
                                    bool installJvmti, bool installProcess,
@@ -2719,6 +2751,49 @@ static bool installRelaunchFilters(const NativeApi& api, HANDLE process, DWORD p
         return false;
     }
     g_bootstrappedPid.store(pid);
+
+    /* bootstrapTargetWithHandle clears every per-PID PatchState.  lockJvm is
+     * therefore part of the relaunch transaction, not merely initial bootstrap
+     * state: both in-process termination paths must be reinstalled before the
+     * replacement is allowed to continue or the handoff is committed. */
+    if (g_guardMode.load()) {
+        if (api.installJavaExitGuard == NULL || api.installSelfTerminateGuard == NULL
+                || api.installHaltLock == NULL) {
+            AGENT_LOG("relaunch-v2: replacement termination guard exports unavailable");
+            return false;
+        }
+        if (api.installJavaExitGuard() != 1) {
+            AGENT_LOG("relaunch-v2: Java exit guard install failed for pid=%lu: %s",
+                      pid, api.lastError ? api.lastError() : "unknown");
+            return false;
+        }
+        AGENT_LOG("guard: Java exit guard installed for replacement pid=%lu", pid);
+
+        int terminateInstalled = api.installSelfTerminateGuard();
+        if (terminateInstalled != 1) {
+            AGENT_LOG("relaunch-v2: NtTerminateProcess guard install failed for pid=%lu: %s",
+                      pid, api.lastError ? api.lastError() : "unknown");
+            return false;
+        }
+        AGENT_LOG("guard: NtTerminateProcess in-target guard installed for replacement pid=%lu", pid);
+
+        unsigned long long haltAddr = api.installHaltLock();
+        if (haltAddr == 0ULL) {
+            AGENT_LOG("relaunch-v2: JVM_Halt lock install failed for pid=%lu: %s",
+                      pid, api.lastError ? api.lastError() : "unknown");
+            return false;
+        }
+        g_haltLockTrampolineAddr.store(haltAddr);
+        AGENT_LOG("guard: JVM_Halt lock installed for replacement pid=%lu @ 0x%llX", pid, haltAddr);
+
+        if (api.verifyJavaExitGuard == NULL || api.verifyJavaExitGuard() < 0
+                || api.verifyHookIntegrity == NULL || api.verifyHookIntegrity() < 0) {
+            AGENT_LOG("relaunch-v2: replacement termination guard verification failed for pid=%lu: %s",
+                      pid, api.lastError ? api.lastError() : "unknown");
+            return false;
+        }
+    }
+
     auto apply = [&](bool enabled, const LoadFilter& filter, auto fn) -> bool {
         if (!enabled) return true;
         if (fn == NULL) return false;
@@ -2964,6 +3039,22 @@ static void handleRelaunchV2(const NativeApi& api, const std::string& line,
         return;
     }
 
+    bool replacementSuspended = false;
+    if (g_guardMode.load()) {
+        replacementSuspended = setProcessSuspended(child.hProcess, true);
+        if (!replacementSuspended) {
+            AGENT_LOG("relaunch-v2: failed to suspend replacement pid=%lu for guard installation",
+                      child.dwProcessId);
+            TerminateProcess(child.hProcess, 77);
+            restoreJvmControlHandle(oldJvm, oldPid);
+            CloseHandle(child.hProcess); CloseHandle(oldJvm);
+            printResult("fallback", "UNAVAILABLE", dllPath, "replacement_guard_suspend_failed");
+            return;
+        }
+        AGENT_LOG("relaunch-v2: replacement pid=%lu suspended for fail-closed guard installation",
+                  child.dwProcessId);
+    }
+
     {
         std::lock_guard<std::mutex> g(g_filterMutex);
         if (hasAgentFilter) g_javaAgentFilter = agentFlt;
@@ -2980,6 +3071,19 @@ static void handleRelaunchV2(const NativeApi& api, const std::string& line,
         CloseHandle(child.hProcess); CloseHandle(oldJvm);
         printResult("fallback", "UNAVAILABLE", dllPath, "replacement_guard_install_failed");
         return;
+    }
+
+    if (replacementSuspended && !setProcessSuspended(child.hProcess, false)) {
+        AGENT_LOG("relaunch-v2: failed to resume guarded replacement pid=%lu", child.dwProcessId);
+        TerminateProcess(child.hProcess, 78);
+        restoreJvmControlHandle(oldJvm, oldPid);
+        CloseHandle(child.hProcess); CloseHandle(oldJvm);
+        printResult("fallback", "UNAVAILABLE", dllPath, "replacement_guard_resume_failed");
+        return;
+    }
+    if (replacementSuspended) {
+        AGENT_LOG("relaunch-v2: replacement pid=%lu resumed after guard verification",
+                  child.dwProcessId);
     }
 
     g_secureRelaunchGeneration.store(generation);
@@ -3415,7 +3519,8 @@ struct GuardPostResumeCtx {
     const NativeApi* api;
 };
 
-static void guardReapplyActiveFilters(const NativeApi& api) {
+static bool guardReapplyActiveFilters(const NativeApi& api) {
+    bool allInstalled = true;
     LoadFilter javaAgent, nativeLoad, jvmti, process, thread;
     {
         std::lock_guard<std::mutex> filters(g_filterMutex);
@@ -3430,7 +3535,8 @@ static void guardReapplyActiveFilters(const NativeApi& api) {
         int result = fn(static_cast<int>(filter.mode), joinPatternsLF(filter).c_str(),
                         filter.encodedPolicy.c_str());
         AGENT_LOG("guard: %s reinstalled result=%d reason=%s", name, result,
-                  api.lastError ? api.lastError() : "");
+                   api.lastError ? api.lastError() : "");
+        if (result != 1) allInstalled = false;
     };
     apply("banNativeLoad", nativeLoad, api.banNativeLoad);
     apply("banJavaAgent", javaAgent, api.banJavaAgent);
@@ -3438,7 +3544,15 @@ static void guardReapplyActiveFilters(const NativeApi& api) {
     apply("banProcessCreate", process, api.banProcessCreate);
     apply("banThreadCreate", thread, api.banThreadCreate);
 
-    /* Re-install JVM_Halt lock after recovery. */
+    /* Re-install the complete Java-to-native termination chain after recovery. */
+    if (g_guardMode.load() && api.installJavaExitGuard != NULL) {
+        int result = api.installJavaExitGuard();
+        AGENT_LOG("guard: Java exit guard reinstall result=%d reason=%s", result,
+                  api.lastError ? api.lastError() : "");
+        if (result != 1) allInstalled = false;
+    } else if (g_guardMode.load()) {
+        allInstalled = false;
+    }
     if (g_guardMode.load() && api.installHaltLock != NULL) {
         unsigned long long addr = api.installHaltLock();
         if (addr != 0ULL) {
@@ -3447,13 +3561,16 @@ static void guardReapplyActiveFilters(const NativeApi& api) {
         } else {
             AGENT_LOG("guard: JVM_Halt lock re-install failed: %s",
                       api.lastError ? api.lastError() : "unknown");
+            allInstalled = false;
         }
-    }
+    } else if (g_guardMode.load()) allInstalled = false;
     if (g_guardMode.load() && api.installSelfTerminateGuard != NULL) {
         int result = api.installSelfTerminateGuard();
         AGENT_LOG("guard: NtTerminateProcess in-target guard reinstall result=%d reason=%s", result,
                   api.lastError ? api.lastError() : "");
-    }
+        if (result != 1) allInstalled = false;
+    } else if (g_guardMode.load()) allInstalled = false;
+    return allInstalled;
 }
 
 static DWORD WINAPI guardPostResumeWatcher(LPVOID param) {
@@ -3499,7 +3616,12 @@ static DWORD WINAPI guardPostResumeWatcher(LPVOID param) {
         CloseHandle(process);
         return 0;
     }
-    guardReapplyActiveFilters(*api);
+    if (!guardReapplyActiveFilters(*api)) {
+        AGENT_LOG("guard: recovery protection chain incomplete for pid=%lu; terminating fail-closed", pid);
+        TerminateProcess(process, ERROR_ACCESS_DENIED);
+        CloseHandle(process);
+        return 0;
+    }
     /* Hook installation only proves that bootstrap completed. Keep the crash
      * budget until this process survives the stable-recovery grace window. */
     g_guardRecoveryStableSinceTick.store(GetTickCount64());
@@ -3769,7 +3891,11 @@ static DWORD WINAPI commandConnectionThread(LPVOID param) {
         }
         if (shutdownReq) {
             AGENT_LOG("command channel: shutdown received — exiting agent");
-            /* Release JVM_Halt lock so the JVM can self-terminate after agent exit. */
+            /* Restore the high-level entry points before releasing the native
+             * fallback, so an intentional guard shutdown leaves a normal JVM. */
+            if (g_api != nullptr && g_api->uninstallJavaExitGuard != NULL) {
+                g_api->uninstallJavaExitGuard();
+            }
             if (g_api != nullptr && g_api->haltLockAllow != NULL) {
                 g_api->haltLockAllow();
             }
@@ -4252,6 +4378,7 @@ static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
     int deadlockTicks = 0;
     bool spinWarned = false, stallWarned = false, deadlockWarned = false;
     bool protectedTerminationSeen = false;
+    bool integrityTargetGone = false;
     unsigned long long lastNativeAllow = 0, lastNativeBlock = 0;
     unsigned long long lastProcessAllow = 0, lastProcessBlock = 0;
     unsigned long long lastThreadAllow = 0, lastThreadBlock = 0, lastThreadError = 0;
@@ -4273,6 +4400,7 @@ static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
             spinTicks = stallTicks = deadlockTicks = 0;
             spinWarned = stallWarned = deadlockWarned = false;
             protectedTerminationSeen = false;
+            integrityTargetGone = false;
             lastNativeAllow = lastNativeBlock = 0;
             lastProcessAllow = lastProcessBlock = 0;
             lastThreadAllow = lastThreadBlock = lastThreadError = 0;
@@ -4282,6 +4410,7 @@ static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
             lastTerminateBlock = 0;
             windowPublish("[JVM] tracking target pid=" + std::to_string(pid));
         }
+        if (integrityTargetGone) continue;
 
         /* Write JVM_Halt lock heartbeat so the trampoline knows the agent is alive. */
         if (g_guardMode.load() && g_api != nullptr && g_api->haltLockHeartbeat != NULL) {
@@ -4302,6 +4431,23 @@ static DWORD WINAPI jvmHealthPollerThread(LPVOID) {
             } else if (repaired == -2) {
                 AGENT_LOG("guard: trampoline integrity violation; target terminated fail-closed");
                 windowPublish("[FVM] trampoline integrity violation; JVM terminated fail-closed");
+            } else if (repaired == -3) {
+                /* Normal process teardown makes every remote address unreadable.
+                 * Stop this PID's patrol and let the lifecycle watchdog handle
+                 * exit/recovery instead of reporting a trampoline violation. */
+                integrityTargetGone = true;
+                continue;
+            }
+        }
+        if (g_guardMode.load() && g_api != nullptr && g_api->verifyJavaExitGuard != NULL) {
+            int repaired = g_api->verifyJavaExitGuard();
+            if (repaired > 0) {
+                AGENT_LOG("guard: Java exit guard re-applied %d tampered method(s)", repaired);
+                windowPublish("[FVM] Java exit guard: " + std::to_string(repaired) +
+                              " method(s) re-applied after tamper detection");
+            } else if (repaired < 0) {
+                AGENT_LOG("guard: Java exit guard verification failed: %s",
+                          g_api->lastError ? g_api->lastError() : "unknown");
             }
         }
 
@@ -4618,9 +4764,22 @@ int main(int argc, char** argv) {
      * go to stdout (tls_replySink stays null). Serialized via g_commandMutex for
      * symmetry with the post-handoff channels. */
     std::string line;
+    bool shutdownRequested = false;
     while (std::getline(std::cin, line)) {
         std::lock_guard<std::mutex> g(g_commandMutex);
-        if (dispatchCommand(api, dllPath, g_lockState, line)) break;
+        if (dispatchCommand(api, dllPath, g_lockState, line)) {
+            shutdownRequested = true;
+            break;
+        }
+    }
+
+    /* A classloader losing its original stdio channel is not a JVM exit.
+     * Other clients still use the shared command pipe and native trampolines.
+     * Keep the agent/DLL alive; the watchdog owns JVM-death handling and pipe
+     * shutdown remains an explicit, separate operation. */
+    if (!shutdownRequested && sharedPipeServerStarted && g_parentPid.load() != 0) {
+        AGENT_LOG("main: stdio client disconnected; shared agent remains active");
+        for (;;) Sleep(1000);
     }
 
     while (g_lockState.locked && !lockExpired(g_lockState)) {

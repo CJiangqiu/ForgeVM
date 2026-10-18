@@ -721,6 +721,7 @@ extern "C" __declspec(dllexport) int forgevm_bootstrap_target(unsigned long long
     FVM_LOG("forgevm_bootstrap_target(pid=%llu)", targetPid);
     DWORD oldPid = g_target.pid;
     DWORD newPid = static_cast<DWORD>(targetPid);
+    if (oldPid != newPid) resetTransformStateForNewTarget();
     if (g_target.handle != NULL) {
         CloseHandle(g_target.handle);
         g_target = TargetProcess{};
@@ -776,6 +777,7 @@ extern "C" __declspec(dllexport) int forgevm_bootstrap_target_with_handle(unsign
     FVM_LOG("forgevm_bootstrap_target_with_handle(pid=%llu)", targetPid);
     DWORD oldPid = g_target.pid;
     DWORD newPid = static_cast<DWORD>(targetPid);
+    if (oldPid != newPid) resetTransformStateForNewTarget();
     if (g_target.handle != NULL) {
         CloseHandle(g_target.handle);
         g_target = TargetProcess{};
@@ -4328,6 +4330,20 @@ extern "C" __declspec(dllexport) unsigned long long forgevm_filter_audit(int kin
  * ============================================================ */
 extern "C" __declspec(dllexport) int forgevm_verify_hook_integrity() {
     if (g_target.handle == NULL) { setError("no_target_handle"); return -1; }
+
+    /* A signalled process has no readable hook or trampoline pages.  Treat that
+     * as lifecycle completion, not tampering; otherwise the health poller turns
+     * an ordinary exit into a repeating fail-closed integrity report. */
+    DWORD exitCode = STILL_ACTIVE;
+    if (!GetExitCodeProcess(g_target.handle, &exitCode)) {
+        setError("target_liveness_query_failed");
+        return -1;
+    }
+    if (exitCode != STILL_ACTIVE) {
+        setError("target_not_alive");
+        return -3;
+    }
+
     std::lock_guard<std::mutex> integrityGuard(g_patchIntegrityMutex);
 
     PatchState* patches[] = {

@@ -33,9 +33,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.StringJoiner;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.ReentrantLock;
 
 public final class ForgeVM {
     private static final String ENV_AGENT_EXE_PATH = "FORGEVM_AGENT_EXE_PATH";
@@ -726,16 +724,11 @@ public final class ForgeVM {
             if (handoff.agentStatus() != AgentStatus.UNAVAILABLE) {
                 return handoff;
             }
-            /* A gen-0 property can outlive an agent that crashed. Clear only
-             * the value we observed, then create a replacement below. A
-             * relaunched JVM must never spawn a replacement supervisor because
-             * that would discard its retained pre-DACL process handle. */
-            if (relaunchGeneration() > 0) {
-                return handoff;
-            }
-            if (handoffPid.equals(System.getProperty(PROP_AGENT_HANDOFF_PID))) {
-                System.clearProperty(PROP_AGENT_HANDOFF_PID);
-            }
+            /* Connection failure is not proof that the agent is gone. Even a
+             * dead agent can have left live trampolines in this JVM. A second
+             * agent has no original-byte backups and must not patch over them.
+             * Keep the JVM-wide registration and fail this client only. */
+            return handoff;
         }
         if (relaunchGeneration() > 0) {
             return agentUnavailable("handoff_pid_missing", "");
@@ -781,7 +774,8 @@ public final class ForgeVM {
             AgentSession session = new AgentSession(
                     process,
                     new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8)),
-                    new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8))
+                    new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8)),
+                    null
             );
 
             String responseLine = sendCommand(session,
@@ -795,6 +789,7 @@ public final class ForgeVM {
 
             LaunchResult result = parseAgentResponse(responseLine, dllPath);
             if (result.agentStatus() != AgentStatus.UNAVAILABLE) {
+                session.publish();
                 agentSession = session;
                 registerAgentExitSender(session);
                 registerAgentLockController(session);
@@ -822,6 +817,11 @@ public final class ForgeVM {
      *  {@code \\.\pipe\forgevm_cmd_<agent_pid>}. The short server-publication
      *  race is retried; a relaunched JVM never spawns a second supervisor. */
     private static LaunchResult launchViaHandoff(String agentPid) {
+        try {
+            if (Long.parseLong(agentPid) <= 0) throw new NumberFormatException();
+        } catch (NumberFormatException ex) {
+            return agentUnavailable("handoff_pid_invalid", "");
+        }
         String pipePath = "\\\\.\\pipe\\forgevm_cmd_" + agentPid;
         Throwable lastFailure = null;
         for (int attempt = 0; attempt < 100; attempt++) {
@@ -847,7 +847,7 @@ public final class ForgeVM {
              * the kernel handles the pipe protocol transparently. We use
              * RandomAccessFile because it supports full-duplex on a single
              * handle (FileInputStream + FileOutputStream would open two
-             * separate handles, exceeding the agent's maxInstances=1). */
+             * separate handles, which would connect to different pipe instances). */
             RandomAccessFile raf = new RandomAccessFile(pipePath, "rw");
             FileChannel ch = raf.getChannel();
             BufferedReader reader = new BufferedReader(
@@ -855,10 +855,9 @@ public final class ForgeVM {
             BufferedWriter writer = new BufferedWriter(
                     new OutputStreamWriter(Channels.newOutputStream(ch), StandardCharsets.UTF_8));
 
-            /* process=null marks this as a handoff session - isAlive() returns
-             * true until an IPC error, and closeAgentSession skips waitFor. */
-            AgentSession session = new AgentSession(null, reader, writer);
+            AgentSession session = new AgentSession(null, reader, writer, raf);
 
+            try {
             String responseLine = sendCommand(session,
                     "{\"cmd\":\"bootstrap\",\"pid\":" + ProcessHandle.current().pid() + "}");
             if (responseLine == null || responseLine.isBlank()) {
@@ -875,11 +874,16 @@ public final class ForgeVM {
                 closeAgentSession(session);
                 return result;
             }
+            session.publish();
             agentSession = session;
             registerAgentExitSender(session);
             registerAgentLockController(session);
             FvmLog.info("ForgeVM connected to persistent agent via " + pipePath);
             return result;
+            } catch (Exception ex) {
+                closeAgentSession(session);
+                throw ex;
+            }
     }
 
     private static Process startProcessReflectively(List<String> command) throws Exception {
@@ -934,7 +938,7 @@ public final class ForgeVM {
                 long pid = ProcessHandle.current().pid();
                 String command = "{\"cmd\":\"exit_jvm\",\"pid\":" + pid + ",\"code\":" + exitCode + "}";
                 sendCommand(session, command);
-                session.process().waitFor(500, TimeUnit.MILLISECONDS);
+                if (session.process() != null) session.process().waitFor(500, TimeUnit.MILLISECONDS);
             }
         };
 
@@ -1037,26 +1041,7 @@ public final class ForgeVM {
     }
 
     private static String sendCommand(AgentSession session, String commandJson) throws Exception {
-        session.ioLock().lock();
-        try {
-            session.writer().write(commandJson);
-            /* Use explicit '\n' rather than BufferedWriter.newLine() (which is
-             * \r\n on Windows). After handoff the agent's stdin is in binary
-             * mode and an embedded \r would corrupt the trailing JSON field. */
-            session.writer().write('\n');
-            session.writer().flush();
-
-            CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
-                try {
-                    return session.reader().readLine();
-                } catch (IOException e) {
-                    return null;
-                }
-            });
-            return future.get(AGENT_IO_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } finally {
-            session.ioLock().unlock();
-        }
+        return session.exchange(commandJson, AGENT_IO_TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
     // -- agent response parsing --
@@ -1201,46 +1186,7 @@ public final class ForgeVM {
     // -- agent session close --
 
     private static void closeAgentSession(AgentSession session) {
-        try {
-            try {
-                session.ioLock().lock();
-                try {
-                    session.writer().write("{\"cmd\":\"shutdown\"}");
-                    session.writer().write('\n');
-                    session.writer().flush();
-                } finally {
-                    session.ioLock().unlock();
-                }
-            } catch (Throwable ignored) {
-            }
-            if (session.process() != null) {
-                try { session.process().waitFor(1500, TimeUnit.MILLISECONDS); } catch (Throwable ignored) {}
-            }
-            try { session.writer().close(); } catch (Throwable ignored) {}
-            try { session.reader().close(); } catch (Throwable ignored) {}
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /** Agent IPC session. {@code process} is non-null when we spawned the agent
-     *  ourselves (initial launch) and null when we connected to a pre-existing
-     *  agent via the handoff named pipe (post-relaunch). */
-    private record AgentSession(
-            Process process,
-            BufferedReader reader,
-            BufferedWriter writer,
-            ReentrantLock ioLock
-    ) {
-        private AgentSession(Process process, BufferedReader reader, BufferedWriter writer) {
-            this(process, reader, writer, new ReentrantLock());
-        }
-
-        /** Conservative liveness check: when we own the agent process, ask the OS.
-         *  In handoff mode we don't own the process, so we trust the IPC until a
-         *  read/write fails. */
-        boolean isAlive() {
-            return process == null || process.isAlive();
-        }
+        session.close();
     }
 
     public enum AgentStatus {
